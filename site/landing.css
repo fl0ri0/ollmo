@@ -454,6 +454,10 @@ h1 {
     gap: 1.7rem;
 }
 
+.principles-grid--today {
+    gap: 1.7rem;
+}
+
 .principle-card {
     padding: clamp(1.35rem, 3vw, 2rem);
     border: 1px solid var(--line);
@@ -784,7 +788,7 @@ h1 {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     align-self: start;
-    gap: 0.75rem;
+    gap: 1.5rem;
 }
 
 .setup-step {
