@@ -1,0 +1,8 @@
+{
+  "case_id": "plain_chat_simple",
+  "prompt": "Explain the difference between OCR and speech to text.",
+  "expected_capability": "chat",
+  "expected_route_metadata": {
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  }
+}

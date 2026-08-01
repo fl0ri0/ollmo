@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ollmo"
+  short_description: "Local runtime truth, routing, artifacts, multimodal work"
+  default_prompt: "Use $ollmo to inspect runtime truth and, when useful, employ already-running local capabilities for bounded text, image, vision, speech, or multimodal work. Keep Codex as supervisor and report outputs or artifacts only from response-frame truth."

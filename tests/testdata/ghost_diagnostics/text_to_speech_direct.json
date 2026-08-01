@@ -1,0 +1,11 @@
+{
+  "case_id": "text_to_speech_direct",
+  "prompt": "Read this aloud in English as mp3: \"Hello from Ollmo diagnostics.\"",
+  "expected_capability": "text_to_speech",
+  "expected_route_metadata": {
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  },
+  "expected_control_hints": {
+    "response_format": "mp3"
+  }
+}

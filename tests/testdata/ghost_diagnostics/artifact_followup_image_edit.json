@@ -1,0 +1,18 @@
+{
+  "case_id": "artifact_followup_image_edit",
+  "prompt": "Keep the same character but change the jacket to gold.",
+  "attachments": [
+    {
+      "type": "image",
+      "path": "/tmp/generated.png",
+      "image_state": {
+        "summary": "A humanoid robot in a rocky archway.",
+        "subject": "A humanoid robot with glowing yellow eyes."
+      }
+    }
+  ],
+  "expected_capability": "image_generation",
+  "expected_route_metadata": {
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  }
+}

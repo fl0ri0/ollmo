@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_script_dir() {
+  local source_path="${BASH_SOURCE[0]}"
+  while [ -L "$source_path" ]; do
+    local source_dir
+    source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+    source_path="$(readlink "$source_path")"
+    [[ "$source_path" != /* ]] && source_path="$source_dir/$source_path"
+  done
+  cd -P "$(dirname "$source_path")" && pwd
+}
+
+ROOT_DIR="$(resolve_script_dir)"
+START_SCRIPT="$ROOT_DIR/start_multi_models.sh"
+STOP_SCRIPT="$ROOT_DIR/stop_multi_models.sh"
+RESTART_SCRIPT="$ROOT_DIR/restart.sh"
+CLEAN_SCRIPT="$ROOT_DIR/clean_repo_state.sh"
+SYNC_SCRIPT="$ROOT_DIR/scripts/sync_model_providers.py"
+OLLMOCTL_SCRIPT="$ROOT_DIR/scripts/ollmoctl.py"
+DASHBOARD_URL_DEFAULT="http://127.0.0.1:5001/"
+
+quiet_lsof() {
+  lsof -w "$@"
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: ollmo <command>
+
+Commands:
+  start        Start the OLLMO stack
+  shutdown     Stop the OLLMO stack (alias: stop, down)
+  restart      Restart the OLLMO stack
+  clean        Stop local Ollmo listeners and clean repo-local generated state (alias: reset-state)
+  archiv       Archive useful runtime/generated ballast into .ollmo_archiv and then clean live paths
+  archive      Alias for `archiv`
+  dashboard    Open OLLMO dashboard in browser (aliases: ui, browser)
+  version      Show the Ollmo version (alias: --version)
+  sync         Manually sync supported external-client provider config
+  ctl          Pass through to scripts/ollmoctl.py
+  send         Shorthand for: ollmo ctl send <instance_id> "<prompt>"
+  status       Show quick local stack status
+  help         Show this help message
+
+Examples:
+  ollmo ctl instances list --json
+  ollmo send x/flux2-klein:latest-1 "a giraffe and a T-rex taking a selfie" --json
+  ollmo archive --full --dry-run
+  ollmo archive --full
+  ollmo clean --full
+  ollmo clean --forget-ghost --dry-run
+
+Reset/archive flags belong after `clean`, `archiv`, or `archive`; they are not top-level commands.
+USAGE
+}
+
+require_file() {
+  local target="$1"
+  if [[ ! -f "$target" ]]; then
+    echo "Error: required file not found: $target" >&2
+    exit 1
+  fi
+}
+
+run_sync() {
+  require_file "$SYNC_SCRIPT"
+  if [[ -x "$ROOT_DIR/.venv/bin/python3" ]]; then
+    exec "$ROOT_DIR/.venv/bin/python3" "$SYNC_SCRIPT"
+  fi
+  exec python3 "$SYNC_SCRIPT"
+}
+
+run_ollmoctl() {
+  require_file "$OLLMOCTL_SCRIPT"
+  if [[ -x "$ROOT_DIR/.venv/bin/python3" ]]; then
+    exec "$ROOT_DIR/.venv/bin/python3" "$OLLMOCTL_SCRIPT" "$@"
+  fi
+  exec python3 "$OLLMOCTL_SCRIPT" "$@"
+}
+
+print_version() {
+  local python_bin="python3"
+  if [[ -x "$ROOT_DIR/.venv/bin/python3" ]]; then
+    python_bin="$ROOT_DIR/.venv/bin/python3"
+  fi
+
+  "$python_bin" - "$ROOT_DIR" <<'PY'
+import sys
+
+root_dir = sys.argv[1]
+sys.path.insert(0, root_dir)
+
+try:
+    from ollmo_core.version import __version__
+except (ImportError, ModuleNotFoundError):
+    print("Error: Ollmo version source is unavailable.", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"Ollmo {__version__}")
+PY
+}
+
+open_dashboard() {
+  local target_url="${OLLMO_DASHBOARD_URL:-$DASHBOARD_URL_DEFAULT}"
+
+  if [[ "${OLLMO_DRY_RUN_OPEN:-0}" == "1" ]]; then
+    echo "DRY RUN: would open dashboard at $target_url"
+    return 0
+  fi
+
+  if ! quiet_lsof -nP -iTCP:5001 -sTCP:LISTEN -t >/dev/null 2>&1; then
+    echo "Warning: nothing is listening on port 5001; opening URL anyway: $target_url" >&2
+  fi
+
+  if command -v open >/dev/null 2>&1; then
+    open "$target_url" >/dev/null 2>&1 &
+    echo "Opened dashboard: $target_url"
+    return 0
+  fi
+
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$target_url" >/dev/null 2>&1 &
+    echo "Opened dashboard: $target_url"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -m webbrowser "$target_url" >/dev/null 2>&1; then
+      echo "Opened dashboard: $target_url"
+      return 0
+    fi
+  fi
+
+  echo "Error: no browser opener found. Open manually: $target_url" >&2
+  return 1
+}
+
+print_status() {
+  local web_pid default_pid
+
+  web_pid="$(quiet_lsof -nP -iTCP:5001 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
+  default_pid="$(quiet_lsof -nP -iTCP:11434 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
+
+  echo "OLLMO status"
+  echo "- root: $ROOT_DIR"
+
+  if [[ -n "$web_pid" ]]; then
+    echo "- webserver (5001): running (pid $web_pid)"
+  else
+    echo "- webserver (5001): not running"
+  fi
+
+  if [[ -n "$default_pid" ]]; then
+    echo "- ollama default (11434): running (pid $default_pid)"
+  else
+    echo "- ollama default (11434): not running"
+  fi
+
+  if [[ -f "$ROOT_DIR/model_ports.json" ]]; then
+    python3 - "$ROOT_DIR/model_ports.json" "$ROOT_DIR/state/runtime_status.json" <<'PY'
+import json, socket, sys
+from pathlib import Path
+
+cfg = Path(sys.argv[1])
+status_cfg = Path(sys.argv[2])
+try:
+    data = json.loads(cfg.read_text(encoding='utf-8'))
+except Exception as exc:
+    print(f"- model_ports.json: unreadable ({exc})")
+    raise SystemExit(0)
+
+if not isinstance(data, list):
+    print("- model_ports.json: unexpected format")
+    raise SystemExit(0)
+
+instances = [x for x in data if isinstance(x, dict) and not x.get('agent')]
+print(f"- configured model instances: {len(instances)}")
+
+runtime_status = {}
+if status_cfg.exists():
+    try:
+        status_payload = json.loads(status_cfg.read_text(encoding='utf-8'))
+    except Exception:
+        status_payload = {}
+    if isinstance(status_payload, dict) and isinstance(status_payload.get('instances'), dict):
+        runtime_status = {
+            str(key): value
+            for key, value in status_payload.get('instances', {}).items()
+            if isinstance(value, dict)
+        }
+
+def listening(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.2)
+        return sock.connect_ex(('127.0.0.1', int(port))) == 0
+    finally:
+        sock.close()
+
+def runtime_status_says_listening(inst):
+    instance_id = str(inst.get('instance_id') or '').strip()
+    status = runtime_status.get(instance_id)
+    if not status:
+        return None
+    if status.get('port_listening') is True:
+        return True
+    if status.get('port_listening') is False:
+        return False
+    readiness = str(status.get('readiness') or '').strip().lower()
+    process_alive = status.get('process_alive')
+    if readiness in {'ready', 'started', 'idle'} and process_alive is not False:
+        return True
+    return None
+
+running = 0
+status_backed = 0
+for inst in instances:
+    port = inst.get('port')
+    if port is None:
+        continue
+    status_truth = runtime_status_says_listening(inst)
+    if status_truth is True:
+        running += 1
+        status_backed += 1
+        continue
+    if status_truth is False:
+        status_backed += 1
+        continue
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        continue
+    if listening(p):
+        running += 1
+
+print(f"- listening configured instances: {running}")
+if status_backed:
+    print(f"- runtime-status-backed instances: {status_backed}")
+PY
+  else
+    echo "- model_ports.json: not found"
+  fi
+}
+
+command="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  shutdown|stop|down)
+    require_file "$STOP_SCRIPT"
+    exec bash "$STOP_SCRIPT" "$@"
+    ;;
+  start|up)
+    require_file "$START_SCRIPT"
+    exec bash "$START_SCRIPT" "$@"
+    ;;
+  restart)
+    require_file "$RESTART_SCRIPT"
+    exec bash "$RESTART_SCRIPT" "$@"
+    ;;
+  clean|reset-state)
+    require_file "$CLEAN_SCRIPT"
+    exec bash "$CLEAN_SCRIPT" "$@"
+    ;;
+  archiv|archive)
+    require_file "$CLEAN_SCRIPT"
+    exec bash "$CLEAN_SCRIPT" --archive "$@"
+    ;;
+  dashboard|ui|browser)
+    open_dashboard "$@"
+    ;;
+  version|-V|--version)
+    print_version
+    ;;
+  sync)
+    run_sync
+    ;;
+  ctl)
+    run_ollmoctl "$@"
+    ;;
+  send)
+    run_ollmoctl send "$@"
+    ;;
+  status)
+    print_status
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Error: unknown command '$command'" >&2
+    usage
+    exit 2
+    ;;
+esac

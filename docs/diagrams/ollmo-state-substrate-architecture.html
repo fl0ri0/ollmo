@@ -1,0 +1,2460 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ollmo State Substrate Architecture</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --panel-2: #f1f5f9;
+      --text: #172033;
+      --muted: #66748a;
+      --faint: #91a0b4;
+      --cyan: #1689a6;
+      --emerald: #238b68;
+      --violet: #7357c7;
+      --amber: #b7791f;
+      --rose: #be4b63;
+      --orange: #c66f2f;
+      --blue: #3f78b5;
+      --teal: #0f766e;
+      --slate: #64748b;
+      --border: rgba(71, 85, 105, 0.20);
+      --shadow: 0 18px 48px rgba(15, 23, 42, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      min-height: 100%;
+      margin: 0;
+      background: linear-gradient(180deg, #ffffff 0%, #f6f8fb 42%, #eef3f8 100%);
+      color: var(--text);
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    body {
+      padding: 10px 10px 16px;
+      overflow-x: auto;
+    }
+
+    .shell {
+      width: 100%;
+      max-width: none;
+      margin: 0;
+    }
+
+    .header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: end;
+      margin-bottom: 8px;
+    }
+
+    .eyebrow {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .pulse {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--emerald);
+      box-shadow: 0 0 0 rgba(35, 139, 104, 0.55);
+      animation: pulse 1.8s infinite;
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(35, 139, 104, 0.42); }
+      70% { box-shadow: 0 0 0 12px rgba(35, 139, 104, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(35, 139, 104, 0); }
+    }
+
+    h1 {
+      margin: 8px 0 6px;
+      font-size: clamp(26px, 3vw, 44px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 0;
+      max-width: 1540px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .badge {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 7px 10px;
+      background: rgba(255, 255, 255, 0.74);
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr) 360px;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .panel,
+    .diagram-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow: var(--shadow);
+    }
+
+    .panel {
+      padding: 14px;
+      max-height: none;
+      overflow: auto;
+    }
+
+    .workspace > .panel:not(.right-panel) {
+      grid-column: 1;
+      grid-row: 1;
+    }
+
+    .right-panel {
+      grid-column: 3;
+      grid-row: 1;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.25;
+    }
+
+    .panel p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .control-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .control {
+      --layer-color: var(--faint);
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 9px;
+      align-items: start;
+      padding: 9px;
+      border: 1px solid rgba(71, 85, 105, 0.16);
+      border-left: 4px solid var(--layer-color);
+      border-radius: 9px;
+      background: rgba(248, 250, 252, 0.86);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .control input {
+      margin: 1px 0 0;
+      accent-color: var(--layer-color);
+    }
+
+    .control strong {
+      display: block;
+      color: var(--text);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .control span span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 1.35;
+    }
+
+    .control-external { --layer-color: var(--cyan); }
+    .control-service { --layer-color: var(--orange); }
+    .control-ghost { --layer-color: var(--violet); }
+    .control-mutable { --layer-color: var(--amber); }
+    .control-runtime { --layer-color: var(--emerald); }
+    .control-evidence { --layer-color: var(--teal); }
+    .control-closure { --layer-color: var(--rose); }
+    .control-durable { --layer-color: var(--blue); }
+    .control-compat { --layer-color: var(--slate); }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .actions.actions-single {
+      grid-template-columns: 1fr;
+    }
+
+    .canvas-controls {
+      display: grid;
+      grid-template-columns: auto auto auto;
+      gap: 8px;
+      margin-top: 8px;
+      align-items: center;
+    }
+
+    .canvas-controls label {
+      color: var(--muted);
+      font-size: 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+    }
+
+    .canvas-controls input[type=\"number\"] {
+      width: 96px;
+      padding: 7px 7px;
+      border-radius: 7px;
+      border: 1px solid rgba(71, 85, 105, 0.24);
+      background: rgba(248, 250, 252, 0.9);
+      color: var(--text);
+      font-size: 10px;
+      font-family: inherit;
+    }
+
+    button {
+      border: 1px solid rgba(22, 137, 166, 0.36);
+      border-radius: 8px;
+      padding: 9px 8px;
+      background: rgba(224, 242, 254, 0.76);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 10px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--cyan);
+      background: rgba(186, 230, 253, 0.85);
+    }
+
+    .layout-box {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .layout-box textarea {
+      width: 100%;
+      min-height: 90px;
+      resize: vertical;
+      border: 1px solid rgba(71, 85, 105, 0.18);
+      border-radius: 8px;
+      padding: 8px;
+      background: rgba(248, 250, 252, 0.9);
+      color: var(--muted);
+      font-family: inherit;
+      font-size: 9px;
+      line-height: 1.4;
+    }
+
+    .diagram-card {
+      grid-column: 2;
+      grid-row: 1;
+      overflow: visible;
+    }
+
+    .diagram-toolbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 12px;
+      border-bottom: 1px solid rgba(71, 85, 105, 0.14);
+      background: rgba(248, 250, 252, 0.90);
+    }
+
+    .diagram-toolbar .caption {
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.35;
+    }
+
+    .diagram-wrap {
+      overflow: auto;
+    }
+
+    svg {
+      display: block;
+      width: 2900px;
+      min-width: 0;
+      height: 2760px;
+      min-height: 2400px;
+      background: var(--bg);
+      touch-action: none;
+    }
+
+    .region.is-hidden {
+      display: none;
+    }
+
+    .region-body {
+      pointer-events: none;
+    }
+
+    .region-label {
+      pointer-events: none;
+      fill: currentColor;
+    }
+
+    .region-size {
+      font-size: 8px;
+      opacity: 0.78;
+    }
+
+    .region-move-handle,
+    .region-resize-handle {
+      pointer-events: all;
+      fill: rgba(255, 255, 255, 0.82);
+      stroke: #334155;
+      stroke-width: 1;
+    }
+
+    .region-move-handle {
+      cursor: grab;
+    }
+
+    .region-resize-handle {
+      cursor: nwse-resize;
+    }
+
+    .region-move-handle:active,
+    .region-resize-handle:active {
+      cursor: grabbing;
+    }
+
+    .is-hidden {
+      display: none;
+    }
+
+    .edge-path {
+      fill: none;
+      stroke-width: 1.65;
+      marker-end: url(#arrowhead);
+    }
+
+    .edge-path.compat-edge {
+      stroke-dasharray: 5 5;
+      opacity: 0.72;
+    }
+
+    .edge-label {
+      font-size: 8px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: rgba(255, 255, 255, 0.86);
+      stroke-width: 4px;
+      stroke-linejoin: round;
+      pointer-events: none;
+    }
+
+    .edge-label.edge-dim {
+      opacity: 0.2;
+    }
+
+    .edge-path.edge-dim {
+      opacity: 0.18;
+    }
+
+    .edge-path.edge-active {
+      opacity: 0.98;
+      stroke-width: 1.95;
+      filter: drop-shadow(0 0 1.5px rgba(23, 32, 51, 0.35));
+    }
+
+    .node {
+      cursor: grab;
+      transition: opacity 160ms ease, filter 160ms ease;
+    }
+
+    .node.dragging {
+      cursor: grabbing;
+    }
+
+    .node:hover .node-rect {
+      filter: url(#glow);
+      stroke-width: 2.2;
+    }
+
+    .node.selected .node-rect {
+      stroke: #172033;
+      stroke-width: 2.6;
+      filter: url(#strongGlow);
+    }
+
+    .node.dim {
+      opacity: 0.25;
+    }
+
+    .node.dim .node-rect {
+      filter: none;
+      stroke-opacity: 0.65;
+    }
+
+    .node.compat-node.dim {
+      opacity: 0.2;
+    }
+
+    .node.compat-node {
+      opacity: 0.86;
+    }
+
+    .details {
+      display: grid;
+      gap: 12px;
+    }
+
+    .detail-kicker {
+      color: var(--cyan);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .detail-title {
+      margin: 0;
+      color: var(--text);
+      font-size: 18px;
+      line-height: 1.25;
+    }
+
+    .detail-body {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.55;
+      white-space: pre-line;
+    }
+
+    .detail-meta {
+      display: grid;
+      gap: 7px;
+    }
+
+    .meta-row {
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(71, 85, 105, 0.14);
+      background: rgba(248, 250, 252, 0.78);
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+
+    .meta-row b {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .side-summary {
+      display: grid;
+      gap: 8px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(71, 85, 105, 0.14);
+    }
+
+    .summary-block {
+      padding-left: 9px;
+      border-left: 3px solid var(--summary-color, var(--faint));
+    }
+
+    .summary-block h3 {
+      margin: 0 0 5px;
+      font-size: 11px;
+    }
+
+    .summary-block ul {
+      margin: 0;
+      padding-left: 14px;
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 1.45;
+    }
+
+    .footer {
+      margin: 14px 0 0;
+      color: var(--faint);
+      font-size: 10px;
+      text-align: center;
+    }
+
+    @media (max-width: 1380px) {
+      .workspace {
+        grid-template-columns: minmax(0, 1fr) 340px;
+      }
+
+      .diagram-card {
+        grid-column: 1;
+        grid-row: 1;
+      }
+
+      .workspace > .panel:not(.right-panel) {
+        grid-column: 1 / -1;
+        grid-row: 2;
+      }
+
+      .right-panel {
+        grid-column: 2;
+        grid-row: 1;
+      }
+
+      .control-list {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 900px) {
+      body {
+        padding: 8px;
+      }
+
+      .header,
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+
+      .badge-row {
+        justify-content: flex-start;
+      }
+
+      .diagram-card {
+        grid-column: 1;
+        grid-row: 1;
+      }
+
+      .workspace > .panel:not(.right-panel) {
+        grid-column: 1;
+        grid-row: 2;
+      }
+
+      .right-panel {
+        grid-column: 1;
+        grid-row: 3;
+      }
+
+      .control-list {
+        grid-template-columns: 1fr;
+      }
+
+      svg {
+        width: 100%;
+        height: 1600px;
+        min-height: 1600px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div>
+        <div class="eyebrow"><span class="pulse"></span> Ollmo architecture map</div>
+        <h1>Current state substrate architecture</h1>
+        <p class="subtitle">
+          Ollmo as nested shells: canonical Responses ingress opens a mutable working_frame, Ghost shapes advisory semantics,
+          contracts promote only proven work, runtime truth is reviewed before freeze, and durable frames/artifacts carry continuity.
+        </p>
+      </div>
+      <div class="badge-row" aria-label="Architecture tags">
+        <span class="badge">current contract map</span>
+        <span class="badge">Shift/Ctrl/Cmd-click multi-select</span>
+        <span class="badge">draggable nodes</span>
+        <span class="badge">compat hidden by default</span>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <aside class="panel">
+        <h2>Layers</h2>
+        <p>Toggle layers to inspect the state substrate. Compatibility is off by default because it is not canonical authority.</p>
+        <div class="control-list" id="layerControls">
+          <label class="control control-durable">
+            <input type="checkbox" data-layer="durable" checked>
+            <span><strong>Frozen durable truth</strong><span>Response frames, outputs[], ledgers, artifact dossiers, registry.</span></span>
+          </label>
+          <label class="control control-runtime">
+            <input type="checkbox" data-layer="runtime" checked>
+            <span><strong>Runtime providers</strong><span>Backend fabric, transport runtime, model_ports, runtime_status.</span></span>
+          </label>
+          <label class="control control-service">
+            <input type="checkbox" data-layer="service" checked>
+            <span><strong>Canonical API/service</strong><span>Responses ingress, intake, resolver, continuation owners.</span></span>
+          </label>
+          <label class="control control-ghost">
+            <input type="checkbox" data-layer="ghost" checked>
+            <span><strong>Ghost intelligence</strong><span>Phase graph, Request IR, decision contract, semantic roles.</span></span>
+          </label>
+          <label class="control control-mutable">
+            <input type="checkbox" data-layer="mutable" checked>
+            <span><strong>Mutable substrate</strong><span>working_frame, artifact_flow, work_tree, workload and slots.</span></span>
+          </label>
+          <label class="control control-evidence">
+            <input type="checkbox" data-layer="evidence" checked>
+            <span><strong>Evidence/artifacts</strong><span>Generated outputs, vision/STT branches, artifact identities.</span></span>
+          </label>
+          <label class="control control-closure">
+            <input type="checkbox" data-layer="closure" checked>
+            <span><strong>Closure/review</strong><span>Graph closure, semantic review, surface_state, freeze decision.</span></span>
+          </label>
+          <label class="control control-external">
+            <input type="checkbox" data-layer="external" checked>
+            <span><strong>External callers</strong><span>UI, ollmoctl, Codex, and Responses clients.</span></span>
+          </label>
+          <label class="control control-compat">
+            <input type="checkbox" data-layer="compat">
+            <span><strong>Compatibility only</strong><span>Legacy routes, aliases, projections, retired public role surfaces.</span></span>
+          </label>
+        </div>
+      <div class="actions actions-single">
+          <label class="control">
+            <input id="focusModeToggle" type="checkbox" checked>
+            <span><strong>Focus selected circuits</strong><span>Highlight nearby workflow context (2-hop neighborhood) and dim unrelated components.</span></span>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" id="showAll">Show all</button>
+          <button type="button" id="focusCore">Focus core</button>
+          <button type="button" id="resetLayout">Reset layout</button>
+          <button type="button" id="fitToView">Fit to view</button>
+          <button type="button" id="exportLayout">Export layout JSON</button>
+          <button type="button" id="importLayout">Import layout JSON</button>
+          <button type="button" id="saveLayoutFile">Save layout JSON</button>
+        </div>
+        <div class="canvas-controls">
+          <label>Sheet width<input id="canvasWidthInput" type="number" min="900" max="5000" step="20" value="2900" /></label>
+          <button type="button" id="setCanvasWidth">Apply width</button>
+          <button type="button" id="autoCanvasWidth">Auto width</button>
+        </div>
+        <div class="layout-box">
+          <textarea id="layoutJson" spellcheck="false" aria-label="Layout JSON import and export"></textarea>
+        </div>
+        <input id="layoutFileInput" type="file" accept=".json,application/json" style="display:none;">
+      </aside>
+
+      <section class="diagram-card" aria-label="Ollmo architecture diagram">
+        <div class="diagram-toolbar">
+          <div class="caption">Shell order: external call -> canonical Responses -> working_frame -> Ghost advisory semantics -> runtime truth -> Closure -> response_frame.</div>
+          <div class="caption">Drag nodes to inspect dependencies. Arrows attach to node sides and compatibility is secondary by default.</div>
+        </div>
+        <div class="diagram-wrap">
+          <svg id="architectureSvg" viewBox="0 0 2900 2760" preserveAspectRatio="xMinYMin meet" role="img" aria-labelledby="diagramTitle diagramDesc">
+            <title id="diagramTitle">Current Ollmo State Substrate Architecture</title>
+            <desc id="diagramDesc">Current Ollmo architecture diagram with draggable nodes, attached arrows, canonical layers, advisory Ghost surfaces, runtime truth, closure review, durable outputs, and hidden compatibility paths.</desc>
+
+            <defs>
+              <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#dde5ef" stroke-width="0.7"/>
+              </pattern>
+              <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+              </marker>
+              <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+                <feDropShadow dx="0" dy="0" stdDeviation="4" flood-color="#1689a6" flood-opacity="0.38"/>
+              </filter>
+              <filter id="strongGlow" x="-50%" y="-50%" width="200%" height="200%">
+                <feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#172033" flood-opacity="0.28"/>
+              </filter>
+            </defs>
+
+            <rect id="diagramBackground" width="2900" height="2760" fill="#f8fafc"/>
+            <rect id="diagramGrid" width="2900" height="2760" fill="url(#grid)" opacity="0.82"/>
+            <g id="regionsLayer"></g>
+            <g id="edgesLayer"></g>
+            <g id="edgeLabelsLayer"></g>
+            <g id="nodesLayer"></g>
+          </svg>
+        </div>
+      </section>
+
+      <aside class="panel right-panel">
+        <div class="details">
+          <div class="detail-kicker" id="detailKind">Architecture</div>
+          <h2 class="detail-title" id="detailTitle">Click a component</h2>
+          <div class="detail-body" id="detailBody">Select any box to see its role, authority boundary, files, and canonical or compatibility status.</div>
+          <div class="detail-meta">
+            <div class="meta-row" id="detailStatus"><b>Status:</b> canonical current surface unless the selected node says otherwise.</div>
+            <div class="meta-row" id="detailAuthority"><b>Authority:</b> runtime/substrate truth and Closure decide what freezes.</div>
+            <div class="meta-row" id="detailPaths"><b>Files:</b> click a node for source paths.</div>
+            <div class="meta-row"><b>Cadence:</b> intent -> possibility -> relevance -> promoted contracts -> runtime truth -> review -> freeze.</div>
+            <div class="meta-row"><b>Readback:</b> history, context, artifacts, and memory re-enter as candidates, then promotion decisions, not hidden authority.</div>
+          </div>
+          <div class="side-summary" aria-label="Architecture summary">
+            <div class="summary-block" style="--summary-color: var(--blue)">
+              <h3>Truth</h3>
+              <ul>
+                <li>outputs[] and response_frame are durable truth surfaces.</li>
+                <li>Artifact dossiers are keyed by artifact_ref.</li>
+                <li>Assistant text alone is not canonical payload truth.</li>
+              </ul>
+            </div>
+            <div class="summary-block" style="--summary-color: var(--violet)">
+              <h3>Ghost</h3>
+              <ul>
+                <li>Ghost derives and orients current-turn semantics.</li>
+                <li>decision_contract and semantic roles are advisory.</li>
+                <li>No Deliberation subsystem is current architecture.</li>
+              </ul>
+            </div>
+            <div class="summary-block" style="--summary-color: var(--amber)">
+              <h3>Work</h3>
+              <ul>
+                <li>working_frame is mutable live request state.</li>
+                <li>work_tree is internal work truth.</li>
+                <li>output_slots are projections of work truth.</li>
+              </ul>
+            </div>
+            <div class="summary-block" style="--summary-color: var(--rose)">
+              <h3>Closure</h3>
+              <ul>
+                <li>Closure Review is the pre-freeze authority.</li>
+                <li>Late fill continues anchored promoted obligations.</li>
+                <li>Repair must not invent fresh user intent.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+  <p class="footer">Ollmo Current State Substrate Architecture | generated from current docs and source on 2026-07-23 | standalone interactive HTML/SVG</p>
+  </main>
+
+  <script>
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const STORAGE_KEY = 'ollmo-state-substrate-current-layout-v1';
+    const BASE_VIEWBOX = { x: 0, y: 0, w: 2900, h: 2760 };
+    const MIN_CANVAS_WIDTH = 1200;
+
+    const layerStyles = {
+      external: { fill: '#ecfeff', stroke: '#1689a6', text: '#172033', sub: '#1689a6' },
+      service: { fill: '#fff4e8', stroke: '#c66f2f', text: '#172033', sub: '#9a5a22' },
+      ghost: { fill: '#f5f3ff', stroke: '#7357c7', text: '#172033', sub: '#715ab1' },
+      mutable: { fill: '#fff7ed', stroke: '#b7791f', text: '#172033', sub: '#9a651c' },
+      runtime: { fill: '#ecfdf5', stroke: '#238b68', text: '#172033', sub: '#4b7d68' },
+      evidence: { fill: '#f0fdfa', stroke: '#0f766e', text: '#172033', sub: '#0f766e' },
+      closure: { fill: '#fff1f4', stroke: '#be4b63', text: '#172033', sub: '#9a4a5a' },
+      durable: { fill: '#eff6ff', stroke: '#3f78b5', text: '#172033', sub: '#58779b' },
+      compat: { fill: '#f8fafc', stroke: '#64748b', text: '#334155', sub: '#64748b' },
+    };
+
+    const defaultRegions = [
+      { id: 'outerTruth', layer: 'durable', x: 70, y: 120, w: 2375, h: 2392, rx: 38, fill: '#eff6ff', stroke: '#3f78b5', minW: 900, minH: 700, title: 'Outermost shell: durable truth / continuity', sub: 'Time boundary: response frames, outputs[], artifact dossiers, history, settings, registry, and docks survive the turn.' },
+      { id: 'runtimeShell', layer: 'runtime', x: 128, y: 232, w: 2237, h: 2020, rx: 32, fill: '#ecfdf5', stroke: '#238b68', minW: 760, minH: 520, title: 'Runnable shell: local backend fabric / substrate', sub: 'Typed local instances, ports, live status, backend transport, session controls, and provider metadata.' },
+      { id: 'serviceShell', layer: 'service', x: 170, y: 330, w: 1817, h: 1884, rx: 30, fill: '#fff4e8', stroke: '#c66f2f', minW: 760, minH: 500, title: 'Service shell: canonical API, resolver, continuation, and freeze owners', sub: 'Responses orchestration owns intake, working_frame mutation, branch execution, late fill, closure review attachment, and response_frame freeze.' },
+      { id: 'workingFrameShell', layer: 'mutable', x: 220, y: 560, w: 1735, h: 1629, rx: 24, fill: '#fffaf4', stroke: '#b7791f', minW: 640, minH: 500, title: 'working_frame: mutable live request substrate', sub: 'Contracts, candidate/promotion state, artifact_flow, work_tree, workload tasks, evidence, closure, and freeze source.' },
+      { id: 'semanticShell', layer: 'ghost', x: 242, y: 713, w: 1672, h: 385, rx: 20, fill: '#f5f3ff', stroke: '#7357c7', minW: 540, minH: 240, title: 'Semantic contracts on the frame', sub: 'Ghost interprets current-turn intent; phase graph, Request IR, decision_contract, context gate, candidates, and promotions are semantic/advisory boundaries.' },
+      { id: 'cadenceShell', layer: 'closure', x: 244, y: 1423, w: 1678, h: 740, rx: 20, fill: '#fff1f4', stroke: '#be4b63', minW: 700, minH: 420, title: 'Closure cadence: concrete review plus invariant contract machine', sub: 'Closure Review, semantic review, repair, runtime truth, and freeze are the concrete Review -> Freeze part of the cadence.' },
+      { id: 'compatShell', layer: 'compat', x: 2544, y: 276, w: 250, h: 440, rx: 18, fill: '#f8fafc', stroke: '#64748b', dashed: true, minW: 190, minH: 260, title: 'Compatibility shelf: hidden by default', sub: 'Real replay/API surfaces, but not canonical architecture authority.' },
+    ];
+
+    const defaultNodes = [
+      {
+        id: 'externalCallers', layer: 'external', x: 287, y: 26, w: 640, h: 52,
+        title: 'External Callers', label: 'External callers', sub: 'UI / ollmoctl / clients',
+        kind: 'External call surface', status: 'canonical',
+        body: 'Any caller enters Ollmo through a service surface: local UI, ollmoctl, Codex, IDEs, scripts, or canonical Responses clients.',
+        paths: 'static/ui/; scripts/ollmoctl.py; ollmo_integrations/',
+        authority: 'May request work. Does not own orchestration, runtime truth, or freeze.'
+      },
+      {
+        id: 'integrationDock', layer: 'external', x: 1050, y: 20, w: 205, h: 72,
+        title: 'External Integration Tunnel', label: 'ollmo_integrations/', sub: 'adapter manifests + sync',
+        kind: 'External dock/tunnel', status: 'canonical boundary',
+        body: 'External-client orchestration docks here through adapter manifests, provider sync/unsync, downstream sync, and Codex integration helpers.',
+        paths: 'ollmo_integrations/; ollmo_integrations/adapter_manifest.py',
+        authority: 'Connects external consumers without widening core runtime contracts.'
+      },
+      {
+        id: 'responsesApi', layer: 'service', x: 218, y: 411, w: 470, h: 60,
+        title: 'Canonical Responses API', label: '/api/responses', sub: 'canonical ingress contract',
+        kind: 'Canonical API/service', status: 'canonical',
+        body: '/api/responses is the current first-party ingress. It owns canonical orchestration, route selection, graph closure review attachment, and final payload freeze.',
+        paths: 'ollmo_server/responses_request_runtime.py; docs/RESPONSES_CONTRACT.md; docs/CANONICAL_STACK.md',
+        authority: 'Canonical call boundary. It opens and freezes the request state image but still relies on runtime/Closure truth.'
+      },
+      {
+        id: 'v1Responses', layer: 'service', x: 1196, y: 369, w: 180, h: 60,
+        title: 'OpenAI-Compatible Responses API', label: '/v1/responses', sub: 'canonical alias',
+        kind: 'Canonical API/service', status: 'canonical',
+        body: '/v1/responses is the OpenAI-compatible canonical ingress contract for external clients that expect that path.',
+        paths: 'ollmo_server/responses_request_runtime.py; docs/RESPONSES_CONTRACT.md',
+        authority: 'Canonical ingress alias. It does not bypass Responses orchestration.'
+      },
+      {
+        id: 'requestIntake', layer: 'service', x: 927, y: 472, w: 210, h: 60,
+        title: 'Request Intake and Normalization', label: 'request intake', sub: 'normalize current turn',
+        kind: 'Service owner', status: 'canonical',
+        body: 'Request intake extracts selected references, keeps current-turn-only context hygiene, normalizes compatibility hints, and coerces Ghost preferences at the API edge.',
+        paths: 'ollmo_server/request_intake_runtime.py; ollmo_services/responses.py; static/ui/request-transport.js',
+        authority: 'Normalizes request shape. It must not silently promote history, memory, or artifacts into active context.'
+      },
+      {
+        id: 'selectedRefs', layer: 'service', x: 1301, y: 469, w: 210, h: 58,
+        title: 'Selected Reference Extraction', label: 'selected refs', sub: 'artifact_ref handles',
+        kind: 'Intake sub-surface', status: 'canonical',
+        body: 'Selected references are extracted as explicit artifact/message/frame handles, then offered to context candidate and promotion gates.',
+        paths: 'ollmo_server/request_intake_runtime.py; ollmo_services/file_inputs.py; static/ui/message-state.js',
+        authority: 'May expose reference candidates. Does not make references binding without promotion.'
+      },
+      {
+        id: 'workingFrame', layer: 'mutable', x: 257, y: 635, w: 320, h: 64,
+        title: 'working_frame', label: 'working_frame', sub: 'mutable live request image',
+        kind: 'Mutable substrate', status: 'canonical',
+        body: 'working_frame is the service-owned mutable request state. It carries goal stack, artifact_flow, bounded loop metadata, candidate_graph, promotion_review, workload state, closure, journal, controls, and freeze source.',
+        paths: 'ollmo_orchestration/working_frame.py; ollmo_services/response_frames.py; OLLMO_FOR_AGENTS.md',
+        authority: 'Mutable state vessel. Ghost can shape advisory semantics; service/runtime own mutation and freeze.'
+      },
+      {
+        id: 'ghost', layer: 'ghost', x: 1096, y: 821, w: 135, h: 64,
+        title: 'Ghost / Ollmo_G', label: 'Ghost', sub: 'current-turn intelligence',
+        kind: 'Runtime intelligence', status: 'canonical advisory',
+        body: 'Ghost is embedded runtime intelligence for current-turn interpretation, phase graph derivation, candidate/proposal shaping, semantic role orientation, and route support.',
+        paths: 'GHOST.md; ollmo_g/router.py; ollmo_server/ghost_route_runtime.py',
+        authority: 'Advisory semantic intelligence. It is not the whole orchestration layer and does not execute, promote, waive, supersede, fulfill, or freeze.'
+      },
+      {
+        id: 'phaseGraph', layer: 'ghost', x: 725, y: 825, w: 150, h: 64,
+        title: 'Request Phase Graph', label: 'Phase Graph', sub: 'intent phases',
+        kind: 'Semantic graph', status: 'canonical advisory',
+        body: 'The request phase graph derives current-turn phases and dependencies from intent so downstream contracts can be shaped.',
+        paths: 'ollmo_g/request_phase_graph.py; docs/GHOST_ROUTER.md',
+        authority: 'Shapes graph candidates. Runtime and promotion review decide what becomes owed work.'
+      },
+      {
+        id: 'requestIr', layer: 'ghost', x: 694, y: 941, w: 150, h: 64,
+        title: 'Request IR', label: 'Request IR', sub: 'contract projection',
+        kind: 'Semantic contract', status: 'canonical advisory',
+        body: 'Request IR projects phases into output candidates, candidate_graph, promotion_review, output obligations, workload_graph, workload_proposal_review, and decision_contract.',
+        paths: 'ollmo_g/request_ir.py; ollmo_g/candidate_contracts.py',
+        authority: 'Shapes possible contracts. It does not prove runtime truth or freeze payloads.'
+      },
+      {
+        id: 'contextGate', layer: 'ghost', x: 291, y: 827, w: 165, h: 64,
+        title: 'Context Gate Review', label: 'Context Gate', sub: 'promoted context only',
+        kind: 'Context contract', status: 'canonical advisory',
+        body: 'History, context, references, memory, frames, and artifacts enter live turns only as candidates that pass relevance and promotion gates.',
+        paths: 'ollmo_g/context_ir.py; ollmo_services/context_scan.py; GHOST.md',
+        authority: 'Prevents recency-only hidden context. Does not make memory or artifacts automatic authority.'
+      },
+      {
+        id: 'candidateGraph', layer: 'ghost', x: 950, y: 947, w: 170, h: 64,
+        title: 'candidate_graph', label: 'candidate_graph', sub: 'possibility space',
+        kind: 'Possibility boundary', status: 'canonical',
+        body: 'candidate_graph records possible outputs, workload tasks, context, references, evidence, repairs, continuations, learning hints, reserved options, and rejected options.',
+        paths: 'ollmo_g/candidate_contracts.py; ollmo_g/request_ir.py; ollmo_orchestration/working_frame.py',
+        authority: 'A candidate is visible possibility state, not owed work.'
+      },
+      {
+        id: 'promotionReview', layer: 'ghost', x: 1298, y: 1000, w: 170, h: 64,
+        title: 'promotion_review', label: 'promotion_review', sub: 'possibility -> contract',
+        kind: 'Promotion boundary', status: 'canonical',
+        body: 'promotion_review decides whether candidates become promoted contracts or remain reserved, omitted, stale, waived, superseded, or rejected.',
+        paths: 'ollmo_g/candidate_contracts.py; ollmo_g/request_ir.py; docs/CORE_CONTRACTS.md',
+        authority: 'Only promotion creates obligations, active context/reference, repair contracts, evidence branches, or continuations.'
+      },
+      {
+        id: 'decisionContract', layer: 'ghost', x: 1592, y: 891, w: 205, h: 64,
+        title: 'decision_contract', label: 'decision_contract', sub: 'read-only advisory',
+        kind: 'Advisory read model', status: 'canonical advisory',
+        body: 'decision_contract joins candidates, promotions, obligations, reconsideration, waiver candidates, repair paths, semantic review candidates, workload proposal coverage, controlled_attention_review, semantic_decision_review, and accepted-learning orientation into Ghosts read model.',
+        paths: 'ollmo_g/decision_contracts.py; docs/CONTROL_KNOBS.md; GHOST.md',
+        authority: 'Read-only advisory surface. It cannot execute, promote, waive, supersede, fulfill, or freeze.'
+      },
+      {
+        id: 'redrawScopeLadderReview', layer: 'closure', x: 1500, y: 1516, w: 220, h: 64,
+        title: 'Redraw Scope Ladder Review', label: 'redraw_scope_ladder_review', sub: 'scope ladder / policy gate',
+        kind: 'Intent alignment diagnostic', status: 'canonical',
+        body: 'redraw_scope_ladder_review derives the allowed repair scope ladder (including full_successor_rebase) from closure evidence, accepted_learning hints, and runtime intent posture.',
+        paths: 'ollmo_server/responses_request_runtime.py; ollmo_services/redraw_scope.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Read-only scope diagnostic. It does not apply graph changes directly.'
+      },
+      {
+        id: 'acceptedLearningHints', layer: 'ghost', x: 1600, y: 749, w: 205, h: 64,
+        title: 'accepted_learning', label: 'accepted_learning', sub: 'soft policy hints',
+        kind: 'Advisory learning surface', status: 'canonical advisory',
+        body: 'accepted_learning carries reviewed, bounded hints from offline self-learning snapshots. It can orient proposal direction only and must not satisfy promotion, routing, repair, Closure, or freeze authority by itself.',
+        paths: 'OLLMO_FOR_AGENTS.md; docs/KNOBS_CHEATSHEET.md; ollmo_server/responses_request_runtime.py; state/self_learning/accepted_policy_snapshot.json',
+        authority: 'Advisory only. It cannot execute, override user intent, or become runtime truth.'
+      },
+      {
+        id: 'semanticRoles', layer: 'ghost', x: 1674, y: 1020, w: 230, h: 64,
+        title: 'Semantic Roles and Review Lenses', label: 'semantic roles', sub: 'orientation only',
+        kind: 'Advisory role/lens surface', status: 'canonical advisory',
+        body: 'semantic_role_profile, semantic_role_orientation_review, and semantic_review_lens_review project file-backed roles from ollmo_g/semantic_roles/ into bounded orientation and review posture.',
+        paths: 'ollmo_g/semantic_role_profile.py; ollmo_g/semantic_roles/; docs/CONTROL_KNOBS.md',
+        authority: 'Advisory only. Not public role routing, not Deliberation, not authority over topology, payloads, promotion, execution, or freeze.'
+      },
+      {
+        id: 'artifactFlow', layer: 'mutable', x: 1626, y: 1337, w: 180, h: 64,
+        title: 'planning.artifact_flow', label: 'artifact_flow', sub: 'artifact plan surface',
+        kind: 'Mutable substrate', status: 'canonical',
+        body: 'planning.artifact_flow carries multi-artifact input routing, output placeholders, work_tree, output slots, and branch/output planning surfaces.',
+        paths: 'ollmo_services/frame_planning.py; ollmo_orchestration/working_frame.py; docs/CORE_CONTRACTS.md',
+        authority: 'Mutable planning surface. Runtime-owned work_tree is deeper truth than derived projections.'
+      },
+      {
+        id: 'workTree', layer: 'mutable', x: 1625, y: 1215, w: 180, h: 64,
+        title: 'planning.artifact_flow.work_tree', label: 'work_tree', sub: 'internal work truth',
+        kind: 'Mutable substrate', status: 'canonical',
+        body: 'work_tree is the canonical internal work tree when runtime_owned and authoritative. It records branch/task/work truth underneath public projections.',
+        paths: 'docs/CORE_CONTRACTS.md; ollmo_services/frame_planning.py; ollmo_orchestration/working_frame.py',
+        authority: 'Deepest internal work truth. output_slots are projections, not the source of authority.'
+      },
+      {
+        id: 'workloadGraph', layer: 'mutable', x: 254, y: 1135, w: 205, h: 64,
+        title: 'workload_graph', label: 'workload_graph', sub: 'task contract graph',
+        kind: 'Task contract layer', status: 'canonical',
+        body: 'workload_graph projects promoted work into tasks with declared inputs, dependencies, lifecycle stages, output contracts, visibility, review criteria, workload_task_proposals, and workload_proposal_review.',
+        paths: 'ollmo_g/request_ir.py; ollmo_g/request_phase_graph.py; docs/CONTROL_KNOBS.md',
+        authority: 'Defines workload contracts. Runtime still decides execution and evidence.'
+      },
+      {
+        id: 'workloadTasks', layer: 'mutable', x: 252, y: 1321, w: 205, h: 64,
+        title: 'Workload Tasks', label: 'workload tasks', sub: 'promoted task contracts',
+        kind: 'Mutable work state', status: 'canonical',
+        body: 'Workload tasks are promoted task contracts derived from Request IR and promotion review. They may carry dependencies, review criteria, semantic lenses, and execution contract hints.',
+        paths: 'ollmo_g/request_ir.py; ollmo_services/frame_planning.py; ollmo_orchestration/working_frame.py',
+        authority: 'Owed work only when promoted. Advisory proposal fields must pass workload_proposal_review.'
+      },
+      {
+        id: 'outputObligations', layer: 'mutable', x: 1266, y: 1221, w: 190, h: 64,
+        title: 'Output Obligations', label: 'output obligations', sub: 'owed visible outputs',
+        kind: 'Mutable work state', status: 'canonical',
+        body: 'Output obligations are promoted contracts for visible outputs. Closure audits them against runtime truth before freeze.',
+        paths: 'ollmo_g/request_ir.py; docs/CORE_CONTRACTS.md; ollmo_server/response_semantics_runtime.py',
+        authority: 'Creates owed output checks but does not prove fulfillment by itself.'
+      },
+      {
+        id: 'outputSlots', layer: 'mutable', x: 1270, y: 1323, w: 190, h: 64,
+        title: 'output_slots Projection', label: 'output_slots', sub: 'projection of work truth',
+        kind: 'Projection surface', status: 'canonical projection',
+        body: 'output_slots expose branch/slot-aware state for clients and frames, but they are projections of work_tree/runtime truth rather than deepest truth.',
+        paths: 'ollmo_services/frame_planning.py; ollmo_orchestration/working_frame.py; docs/CORE_CONTRACTS.md',
+        authority: 'Projection only. Do not treat stale slots or assistant text as canonical payload truth.'
+      },
+      {
+        id: 'resolver', layer: 'service', x: 670, y: 1172, w: 190, h: 64,
+        title: 'Resolver', label: 'Resolver', sub: 'contracts -> runnable lanes',
+        kind: 'Service resolver', status: 'canonical name',
+        body: 'Resolver advances already-planned promoted work into runnable lanes. The compatibility-named module is ollmo_g/execution_planner.py and persisted metadata may still use runtime.execution_planner.',
+        paths: 'ollmo_g/execution_planner.py; docs/PUBLIC_NAMING_PATCH_SET.md; docs/INTERNAL_RENAME_MIGRATION_DESIGN.md',
+        authority: 'Routes promoted contracts. It must not create public architecture authority under the old execution_planner name.'
+      },
+      {
+        id: 'executionContracts', layer: 'service', x: 1621, y: 1126, w: 190, h: 64,
+        title: 'Execution Contracts', label: 'execution contracts', sub: 'branch-local payloads',
+        kind: 'Service contract handoff', status: 'canonical',
+        body: 'Execution contracts preserve branch-local payloads such as content_payload, artifact_prompt, stage_direction, dependency evidence, artifact refs, workload_task_ref, and output_obligation_ref.',
+        paths: 'ollmo_server/response_semantics_runtime.py; ollmo_server/late_fill_runtime.py; docs/CONTROL_KNOBS.md',
+        authority: 'Handoff to execution. Must carry local branch identity instead of replaying root prompt.'
+      },
+      {
+        id: 'lateFill', layer: 'service', x: 802, y: 1292, w: 190, h: 78,
+        title: 'Late Fill / Continuation', label: 'late fill', sub: 'pending / failed / blocked',
+        kind: 'Continuation state', status: 'canonical',
+        body: 'Late fill continues promoted obligations through pending, completed, failed, blocked, cancelled, waived, superseded, or stale branch states. It must execute branch-local contracts.',
+        paths: 'ollmo_server/late_fill_runtime.py; ollmo_server/responses_request_runtime.py; docs/RESPONSES_CONTRACT.md',
+        authority: 'Continuation only. It cannot invent fresh user intent or replay the root prompt as new owed work.'
+      },
+      {
+        id: 'repairActions', layer: 'closure', x: 1117, y: 2054, w: 205, h: 76,
+        title: 'Closure Repair Actions', label: 'repair actions', sub: 'anchored only',
+        kind: 'Closure repair contract', status: 'canonical',
+        body: 'Repair actions classify open checks: retry_same_branch, retry_excluding_instance, start_compatible_instance, repair_dependency_chain, repair_branch_contract, rebuild_from_promoted_obligations, or semantic_review.',
+        paths: 'docs/CONTROL_KNOBS.md; ollmo_server/responses_request_runtime.py; ollmo_server/recovery_contract.py',
+        authority: 'Repair must be anchored in promoted obligations and runtime truth. It must not create fresh intent.'
+      },
+      {
+        id: 'backendFabric', layer: 'runtime', x: 2087, y: 1089, w: 190, h: 64,
+        title: 'Backend Fabric', label: 'backend fabric', sub: 'source vs runnable',
+        kind: 'Runtime substrate', status: 'canonical',
+        body: 'Backend fabric normalizes runnable local capability while keeping source ecosystem and runnable backend truth distinct.',
+        paths: 'docs/BACKEND_FABRIC.md; ollmo_server/backend_transport_runtime.py; model_ports.json',
+        authority: 'Runtime capability truth. Model prose cannot invent available capabilities.'
+      },
+      {
+        id: 'backendTransport', layer: 'runtime', x: 2088, y: 922, w: 190, h: 64,
+        title: 'Backend Transport Runtime', label: 'transport runtime', sub: 'provider adapters',
+        kind: 'Runtime owner', status: 'canonical',
+        body: 'backend_transport_runtime owns provider request execution, provider stream open/iterate adapters, media transport wrappers, and transport-adjacent parsing helpers.',
+        paths: 'ollmo_server/backend_transport_runtime.py; OLLMO_FOR_AGENTS.md',
+        authority: 'Executes provider transport. Does not decide semantic fulfillment.'
+      },
+      {
+        id: 'runtimeRegistry', layer: 'runtime', x: 2076, y: 776, w: 190, h: 72,
+        title: 'Runtime Registry / Status', label: 'model_ports + status', sub: 'live instance truth',
+        kind: 'Runtime substrate', status: 'canonical',
+        body: 'model_ports.json is stable instance registry and state/runtime_status.json is the live status layer for typed local instances.',
+        paths: 'model_ports.json; state/runtime_status.json; ollmo_runtime/status.py',
+        authority: 'Source of runnable instance identity and liveliness.'
+      },
+      {
+        id: 'ollama', layer: 'runtime', x: 2177, y: 476, w: 150, h: 54,
+        title: 'Ollama Instances', label: 'Ollama', sub: 'chat / image / embed',
+        kind: 'Runtime provider', status: 'canonical runtime',
+        body: 'Ollama-backed local model instances expose capabilities such as chat, vision, embeddings, or image generation through the registry and backend transport.',
+        paths: 'model_ports.json; ollmo_server/backend_transport_runtime.py',
+        authority: 'Can execute compatible promoted branches. Cannot define user intent or closure success.'
+      },
+      {
+        id: 'mlx', layer: 'runtime', x: 2149, y: 379, w: 150, h: 54,
+        title: 'MLX Instances', label: 'MLX', sub: 'TTS / STT / local models',
+        kind: 'Runtime provider', status: 'canonical runtime',
+        body: 'MLX-backed local instances provide typed capabilities such as text-to-speech or speech-to-text according to live runtime metadata.',
+        paths: 'model_ports.json; ollmo_server/backend_transport_runtime.py',
+        authority: 'Can execute compatible promoted branches. Cannot replace contract or closure truth.'
+      },
+      {
+        id: 'llamacpp', layer: 'runtime', x: 2183, y: 286, w: 150, h: 54,
+        title: 'llama.cpp Runners', label: 'llama.cpp', sub: 'backend family',
+        kind: 'Runtime provider', status: 'canonical runtime',
+        body: 'Additional backend families can join when backend fabric exposes compatible live capability and transport contracts.',
+        paths: 'docs/BACKEND_FABRIC.md; model_ports.json',
+        authority: 'Provider family, not semantic authority.'
+      },
+      {
+        id: 'generatedOutputs', layer: 'evidence', x: 2092, y: 1276, w: 190, h: 64,
+        title: 'Generated Outputs', label: 'generated outputs', sub: 'real runtime results',
+        kind: 'Evidence/artifact surface', status: 'canonical evidence',
+        body: 'Generated outputs are runtime-created text, image, audio, document, or file results with branch identity and artifact references where applicable.',
+        paths: 'ollmo_server/infer_runtime.py; ollmo_server/chat_runtime.py; ollmo_server/infer_postprocess.py',
+        authority: 'Evidence of work only when connected to branch contracts and registry/frame truth.'
+      },
+      {
+        id: 'evidenceBranches', layer: 'evidence', x: 2073, y: 1509, w: 205, h: 70,
+        title: 'Evidence Branches', label: 'evidence branches', sub: 'vision_analysis + STT',
+        kind: 'Evidence branch layer', status: 'canonical',
+        body: 'Generated media may produce evidence branches such as vision_analysis and speech_to_text. Final chat joins depend on declared evidence rather than root prompt replay.',
+        paths: 'ollmo_server/late_fill_runtime.py; ollmo_g/request_phase_graph.py; docs/CONTROL_KNOBS.md',
+        authority: 'Produces dependency evidence. Does not auto-satisfy semantic quality without review.'
+      },
+      {
+        id: 'artifactIdentity', layer: 'evidence', x: 2101, y: 2030, w: 205, h: 70,
+        title: 'Artifact Identity', label: 'artifact_ref', sub: 'registry + provenance',
+        kind: 'Artifact evidence', status: 'canonical',
+        body: 'Artifacts are durable identities keyed by artifact_ref, not accidental paths. Registry records provenance, metadata, enrichments, linked response/message IDs, and dossier reads.',
+        paths: 'ollmo_services/artifact_registry.py; ollmo_services/artifact_dossiers.py; docs/CORE_CONTRACTS.md',
+        authority: 'Artifact identity and evidence source. Raw assistant text cannot claim an artifact exists without registry truth.'
+      },
+      {
+        id: 'graphClosure', layer: 'closure', x: 1089, y: 1528, w: 200, h: 70,
+        title: 'Graph Closure Review', label: 'Closure Review', sub: 'pre-freeze authority',
+        kind: 'Closure/review authority', status: 'canonical authority',
+        body: 'Graph Closure Review audits runtime evidence against current intent, request phase graph, promoted contracts, work_tree, output slots, artifacts, late fill, recovery state, semantic review, and surface_state before freeze.',
+        paths: 'ollmo_server/response_semantics_runtime.py; ollmo_server/responses_request_runtime.py; docs/CORE_CONTRACTS.md',
+        authority: 'Pre-freeze authority over runtime truth. It may continue, block, repair, waive, supersede, or allow truthful freeze without inventing fresh intent.'
+      },
+      {
+        id: 'graphRepairProposals', layer: 'closure', x: 1401, y: 1667, w: 190, h: 64,
+        title: 'Graph Repair Proposals', label: 'graph_repair_proposals', sub: 'candidate repair set',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'graph_repair_proposals collects bounded graph-level repair candidates when closure detects missing intent coverage, duplicate refs, unmet obligations, or blocked obligations.',
+        paths: 'ollmo_services/graph_repair.py; ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Proposal surface only. Runtime validation is required before any graph patch lifecycle step.'
+      },
+      {
+        id: 'graphRepairReviews', layer: 'closure', x: 1404, y: 1755, w: 190, h: 64,
+        title: 'Graph Repair Reviews', label: 'graph_repair_reviews', sub: 'validated repair candidates',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'graph_repair_reviews validates proposal shape, safety, and obligation compatibility before a repair can enter lifecycle application.',
+        paths: 'ollmo_services/graph_repair.py; ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Read/validation surface. It does not mutate graph itself.'
+      },
+      {
+        id: 'graphPatchLifecycle', layer: 'closure', x: 1399, y: 1848, w: 190, h: 72,
+        title: 'Graph Patch Lifecycle', label: 'graph_patch_lifecycle', sub: 'apply_safe / apply_enforced',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'graph_patch_lifecycle records each reviewed patch decision, application attempt, risk level, and terminal-frame handling for validated graph repair proposals.',
+        paths: 'ollmo_services/graph_repair.py; ollmo_server/responses_request_runtime.py; ollmo_server/response_semantics_runtime.py',
+        authority: 'Lifecycle evidence. Executable mutation stays guarded by runtime autonomy policy and terminal-frame rules.'
+      },
+      {
+        id: 'successorReopenRequests', layer: 'closure', x: 1400, y: 1963, w: 190, h: 68,
+        title: 'Successor Reopen Requests', label: 'successor_reopen_requests', sub: 'terminal repair continuation',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'successor_reopen_requests carries successor work obligations when terminal/frozen parent frames block direct patch application and continuation must proceed on successor lineage.',
+        paths: 'ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md; ollmo_services/self_learning.py',
+        authority: 'Successor-only continuation surface. Not direct current-frame mutator.'
+      },
+      {
+        id: 'graphRebaseProposals', layer: 'closure', x: 1654, y: 1671, w: 205, h: 64,
+        title: 'Graph Rebase Proposals', label: 'graph_rebase_proposals', sub: 'rebase candidate set',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'graph_rebase_proposals captures reviewed structural rebase options when intent alignment or graph shape drift requests a successor-compatible redraft pathway.',
+        paths: 'ollmo_services/graph_rebase.py; ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Proposal surface. Proposal acceptance depends on explicit runtime authorization and lifecycle outcomes.'
+      },
+      {
+        id: 'graphRebaseReviews', layer: 'closure', x: 1656, y: 1757, w: 205, h: 64,
+        title: 'Graph Rebase Reviews', label: 'graph_rebase_reviews', sub: 'reviewed rebase candidates',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'graph_rebase_reviews validates rebase feasibility and preservation requirements before staged/applied rebase lifecycle transitions.',
+        paths: 'ollmo_services/graph_rebase.py; ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Validation surface. Cannot itself replace current graph truth.'
+      },
+      {
+        id: 'graphRebaseLifecycle', layer: 'closure', x: 1652, y: 1851, w: 205, h: 72,
+        title: 'Graph Rebase Lifecycle', label: 'graph_rebase_lifecycle', sub: 'reviewed / staged / applied',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'graph_rebase_lifecycle records staged/audited/approved rebase decisions, enforcement reviews, and whether rebase results stay local or become successor scope.',
+        paths: 'ollmo_services/graph_rebase.py; ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Lifecycle evidence for governance of rebase motion. Not the active contract executor.'
+      },
+      {
+        id: 'successorRebaseRequests', layer: 'closure', x: 1656, y: 1966, w: 205, h: 68,
+        title: 'Successor Rebase Requests', label: 'successor_rebase_requests', sub: 'successor scope transition',
+        kind: 'Closure diagnostic', status: 'canonical',
+        body: 'successor_rebase_requests carries successor lineage and preserved obligations when reviewed rebase enters successor-graph execution paths.',
+        paths: 'ollmo_services/graph_rebase.py; ollmo_server/responses_request_runtime.py; docs/KNOBS_CHEATSHEET.md',
+        authority: 'Successor continuity surface. Canonical continuation for reviewed successor movement, not mutation of the closed parent graph.'
+      },
+      {
+        id: 'branchSemanticReview', layer: 'closure', x: 643, y: 1538, w: 200, h: 70,
+        title: 'Branch Semantic Review', label: 'branch semantic review', sub: 'local quality gate',
+        kind: 'Semantic review', status: 'canonical advisory evidence',
+        body: 'Branch semantic review runs when a fulfilled-looking branch has qualitative review criteria. It returns semantic_review_verdict for that branch.',
+        paths: 'ollmo_server/response_semantics_runtime.py; ollmo_services/semantic_review_verdict.py; docs/CONTROL_KNOBS.md',
+        authority: 'Review evidence only. Runtime/Closure decide whether the branch is fulfilled, blocked, repaired, waived, or superseded.'
+      },
+      {
+        id: 'globalSemanticClosure', layer: 'closure', x: 779, y: 1973, w: 220, h: 70,
+        title: 'Global Semantic Closure Review', label: 'global semantic closure', sub: 'whole-turn fit',
+        kind: 'Semantic closure', status: 'canonical advisory evidence',
+        body: 'Global semantic closure asks whether locally fulfilled branches fit the whole current intent together. It may schedule semantic_review when local truth is complete but whole-turn fit is unproven.',
+        paths: 'ollmo_server/response_semantics_runtime.py; docs/CONTROL_KNOBS.md; GHOST.md',
+        authority: 'Whole-turn review evidence. Only a passed verdict can support freeze; failed or uncertain remains open repair/review state.'
+      },
+      {
+        id: 'surfaceState', layer: 'closure', x: 779, y: 2082, w: 220, h: 64,
+        title: 'surface_state', label: 'surface_state', sub: 'UI projection',
+        kind: 'Closure projection', status: 'canonical projection',
+        body: 'surface_state groups runtime truth into open, blocked, reconsiderable, waived, superseded, repair pending, semantic review pending, and completed for clients.',
+        paths: 'docs/CONTROL_KNOBS.md; static/ui/message-state.js; static/ui/messages.js',
+        authority: 'Projection of Closure/runtime truth, not a second source of truth.'
+      },
+      {
+        id: 'semanticVerdict', layer: 'closure', x: 647, y: 1664, w: 200, h: 64,
+        title: 'semantic_review_verdict', label: 'semantic verdict', sub: 'passed / failed / uncertain',
+        kind: 'Review result', status: 'canonical review evidence',
+        body: 'semantic_review_verdict is structured review evidence with verdict, criteria results, defects, confidence, evidence refs, and recommended transition.',
+        paths: 'ollmo_services/semantic_review_verdict.py; ollmo_server/response_semantics_runtime.py',
+        authority: 'Evidence for Closure. It does not freeze by itself.'
+      },
+      {
+        id: 'intent', layer: 'closure', x: 284, y: 1534, w: 112, h: 62,
+        title: 'Intent', label: 'Intent', sub: 'opens',
+        kind: 'Core cadence', status: 'canonical',
+        body: 'The current user turn opens an intent anchor. Later repair and closure must stay anchored to it.',
+        paths: 'docs/PRINCIPLES.md; docs/CORE_CONTRACTS.md',
+        authority: 'Intent anchor. It does not by itself create every possible branch.'
+      },
+      {
+        id: 'possibility', layer: 'closure', x: 488, y: 1587, w: 112, h: 62,
+        title: 'Possibility Space', label: 'Possibility', sub: 'candidates',
+        kind: 'Core cadence', status: 'canonical',
+        body: 'Possibility keeps candidates visible, including reserved and reconsiderable work, without turning every possibility into owed execution.',
+        paths: 'ollmo_g/candidate_contracts.py; docs/CONTROL_KNOBS.md',
+        authority: 'Visible possibility state, not an obligation.'
+      },
+      {
+        id: 'relevance', layer: 'closure', x: 278, y: 1666, w: 112, h: 62,
+        title: 'Relevance Gate', label: 'Relevance', sub: 'now?',
+        kind: 'Core cadence', status: 'canonical',
+        body: 'Relevance decides whether a candidate matters for the current turn now, using current evidence and policy.',
+        paths: 'ollmo_g/candidate_contracts.py; docs/CONTROL_KNOBS.md',
+        authority: 'Advisory gate until promotion review records the contract decision.'
+      },
+      {
+        id: 'promotedContracts', layer: 'closure', x: 488, y: 1752, w: 130, h: 62,
+        title: 'Promoted Contracts', label: 'Promotion', sub: 'owed work',
+        kind: 'Core cadence', status: 'canonical',
+        body: 'Promoted contracts become owed context, output obligations, workload tasks, evidence branches, repair contracts, or continuations.',
+        paths: 'ollmo_g/candidate_contracts.py; docs/CORE_CONTRACTS.md',
+        authority: 'Promotion boundary. Creates work but does not prove runtime truth.'
+      },
+      {
+        id: 'runtimeTruth', layer: 'closure', x: 283, y: 1835, w: 130, h: 62,
+        title: 'Runtime Truth', label: 'Runtime truth', sub: 'proof',
+        kind: 'Core cadence', status: 'canonical authority',
+        body: 'Runtime truth is evidence in work_tree, output branches/slots, artifacts, artifact dossiers, errors, late fill, recovery state, response frames, and replayable state.',
+        paths: 'docs/PRINCIPLES.md; docs/CORE_CONTRACTS.md; ollmo_services/responses.py',
+        authority: 'Authoritative substrate evidence. Model prose is not enough.'
+      },
+      {
+        id: 'reviewCadence', layer: 'closure', x: 518, y: 1944, w: 112, h: 62,
+        title: 'Review', label: 'Review', sub: 'truth gate',
+        kind: 'Core cadence', status: 'canonical authority',
+        body: 'Review checks whether runtime truth satisfies promoted contracts and semantic criteria before freeze, repair, waiver, supersession, or continuation.',
+        paths: 'ollmo_server/response_semantics_runtime.py; docs/CORE_CONTRACTS.md',
+        authority: 'Pre-freeze gate.'
+      },
+      {
+        id: 'freezeDecision', layer: 'closure', x: 306, y: 2049, w: 112, h: 62,
+        title: 'Freeze Decision', label: 'Freeze', sub: 'commit state',
+        kind: 'Core cadence', status: 'canonical authority',
+        body: 'Freeze commits the final truthful state image as response_frame and public outputs[].',
+        paths: 'ollmo_services/response_frames.py; docs/CORE_CONTRACTS.md',
+        authority: 'Final commit decision for this response state.'
+      },
+      {
+        id: 'responseFrame', layer: 'durable', x: 230, y: 2286, w: 260, h: 70,
+        title: 'response_frame', label: 'response_frame', sub: 'frozen audit/replay state',
+        kind: 'Frozen durable substrate', status: 'canonical',
+        body: 'response_frame preserves frozen request images with request, route, runtime, controls when meaningful, planning.artifact_flow, working_frame snapshot, outputs, artifacts, closure review, and final state.',
+        paths: 'ollmo_services/response_frames.py; state/response_frames/responses.jsonl; README.md',
+        authority: 'Frozen audit/replay state.'
+      },
+      {
+        id: 'outputsCanonical', layer: 'durable', x: 228, y: 2407, w: 260, h: 70,
+        title: 'outputs[]', label: 'outputs[]', sub: 'canonical public truth',
+        kind: 'Public output contract', status: 'canonical',
+        body: 'Top-level outputs[] is canonical public output truth. output and output_text are compatibility projections.',
+        paths: 'ollmo_services/responses.py; docs/RESPONSES_CONTRACT.md; docs/CORE_CONTRACTS.md',
+        authority: 'Canonical public output surface.'
+      },
+      {
+        id: 'frameLedger', layer: 'durable', x: 710, y: 2420, w: 210, h: 60,
+        title: 'Response Frame Ledger', label: 'Frame Ledger', sub: 'append-only freeze log',
+        kind: 'Durable substrate', status: 'canonical',
+        body: 'Non-test runtime calls append frozen response_frame snapshots to the response frame ledger for replay and audit.',
+        paths: 'state/response_frames/responses.jsonl; ollmo_services/response_frames.py',
+        authority: 'Durable response-state history.'
+      },
+      {
+        id: 'artifactDossiers', layer: 'durable', x: 1519, y: 2307, w: 230, h: 60,
+        title: 'Artifact Registry and Dossiers', label: 'artifact dossiers', sub: 'artifact_ref read surface',
+        kind: 'Durable artifact substrate', status: 'canonical',
+        body: 'Artifact dossiers keyed by artifact_ref join registry record, provenance, metadata, enrichments, linked response IDs, and linked message IDs.',
+        paths: 'ollmo_services/artifact_registry.py; ollmo_services/artifact_dossiers.py; state/artifact_registry.jsonl',
+        authority: 'Durable artifact truth and readback evidence.'
+      },
+      {
+        id: 'chatHistory', layer: 'durable', x: 1110, y: 2296, w: 210, h: 60,
+        title: 'Chat History and Context Readback', label: 'History', sub: 'candidate input only',
+        kind: 'Durable substrate', status: 'canonical',
+        body: 'History preserves conversations and request snapshots. Later turns may promote selected messages, frames, or artifact dossiers into active context through gates.',
+        paths: 'state/chat_history/; ollmo_services/chat_history.py; ollmo_services/context_scan.py',
+        authority: 'Durable history, not automatic hidden memory authority.'
+      },
+      {
+        id: 'durableRuntime', layer: 'durable', x: 1878, y: 149, w: 230, h: 60,
+        title: 'Runtime Registry / Status Ledger', label: 'Runtime Registry', sub: 'ports + status',
+        kind: 'Durable/runtime substrate', status: 'canonical',
+        body: 'model_ports.json and runtime_status.json persist and expose local runtime identity and status for current clients.',
+        paths: 'model_ports.json; state/runtime_status.json; ollmo_runtime/status.py',
+        authority: 'Durable registry/status truth.'
+      },
+      {
+        id: 'chatInferCompat', layer: 'compat', x: 2574, y: 372, w: 190, h: 44,
+        title: '/api/chat and /api/infer', label: '/api/chat + /api/infer', sub: 'lower-level routes',
+        kind: 'Compatibility route', status: 'compatibility-only',
+        body: '/api/chat and /api/infer still exist for older or specialized callers. New first-party flows should use canonical Responses.',
+        paths: 'ollmo_server/chat_runtime.py; ollmo_server/infer_runtime.py; ollmo_server/infer_support_runtime.py',
+        authority: 'Compatibility/lower-level route. Does not override canonical Responses orchestration.'
+      },
+      {
+        id: 'legacyOutputsCompat', layer: 'compat', x: 2573, y: 424, w: 190, h: 44,
+        title: 'Legacy output / output_text', label: 'output / output_text', sub: 'projection only',
+        kind: 'Compatibility projection', status: 'compatibility-only',
+        body: 'output and output_text remain compatibility projections derived from canonical outputs[] or fallback payload text.',
+        paths: 'ollmo_services/responses.py; docs/CORE_CONTRACTS.md',
+        authority: 'Projection only. Not canonical public output truth.'
+      },
+      {
+        id: 'runtimePlannerCompat', layer: 'compat', x: 2577, y: 481, w: 190, h: 44,
+        title: 'runtime.execution_planner', label: 'runtime.execution_planner', sub: 'persisted key',
+        kind: 'Compatibility metadata key', status: 'compatibility-only',
+        body: 'runtime.execution_planner is retained for persisted payloads and migration compatibility while public language should say Resolver.',
+        paths: 'docs/INTERNAL_RENAME_MIGRATION_DESIGN.md; ollmo_g/execution_planner.py; ollmo_orchestration/working_frame.py',
+        authority: 'Metadata compatibility key. Not public architecture authority.'
+      },
+      {
+        id: 'plannerTimeoutCompat', layer: 'compat', x: 2576, y: 539, w: 190, h: 44,
+        title: 'planner_timeout_ms', label: 'planner_timeout_ms', sub: 'developer flag',
+        kind: 'Compatibility request flag', status: 'compatibility-only',
+        body: 'planner_timeout_ms is a named safety budget/developer flag kept for compatibility while resolver naming migrates.',
+        paths: 'docs/CONTROL_KNOBS.md; docs/INTERNAL_RENAME_MIGRATION_DESIGN.md; ollmo_g/request_meta.py',
+        authority: 'Budget hint, not semantic role or routing authority.'
+      },
+      {
+        id: 'ghostModeCompat', layer: 'compat', x: 2576, y: 587, w: 190, h: 44,
+        title: 'ghost_mode API-edge aliases', label: 'ghost_mode aliases', sub: 'edge compatibility',
+        kind: 'Compatibility alias', status: 'compatibility-only',
+        body: 'Legacy ghost_mode values such as repair, worker, explorer, or improviser are accepted only at the API edge and translated into semantic role orientation.',
+        paths: 'ollmo_g/ghost_mode_compat.py; ollmo_g/semantic_role_profile.py; GHOST.md',
+        authority: 'Orientation alias only. Must not control planner timeout, topology, payloads, promotion, execution, waiver, supersession, or freeze.'
+      },
+      {
+        id: 'retiredRoleCompat', layer: 'compat', x: 2576, y: 637, w: 190, h: 64,
+        title: 'Retired Public Role Surfaces', label: 'public role / pipeline', sub: 'Expert Mode / execution_profile',
+        kind: 'Compatibility/retired surface', status: 'compatibility-only',
+        body: 'Public role routing, pipeline language, Expert Mode, and execution_profile are retired or compatibility-only concepts. File-backed semantic roles are advisory lenses.',
+        paths: 'docs/PROMPT_RUNTIME_TERMINOLOGY_AUDIT.md; docs/PUBLIC_NAMING_PATCH_SET.md; ollmo_g/semantic_roles/',
+        authority: 'Not canonical routing. Not a Deliberation subsystem.'
+      },
+    ];
+
+    const edges = [
+      { from: 'externalCallers', to: 'responsesApi', layer: 'service', label: 'canonical call' },
+      { from: 'integrationDock', to: 'responsesApi', layer: 'external', label: 'dock/tunnel', curve: 0.25 },
+      { from: 'v1Responses', to: 'responsesApi', layer: 'service', label: 'canonical alias', curve: -0.2 },
+      { from: 'responsesApi', to: 'requestIntake', layer: 'service', label: 'normalize intake' },
+      { from: 'requestIntake', to: 'selectedRefs', layer: 'service', label: 'selected refs' },
+      { from: 'requestIntake', to: 'workingFrame', layer: 'mutable', label: 'opens frame' },
+      { from: 'workingFrame', to: 'ghost', layer: 'ghost', label: 'frame opens Ghost' },
+      { from: 'selectedRefs', to: 'contextGate', layer: 'ghost', label: 'context candidates', curve: -0.25 },
+      { from: 'ghost', to: 'phaseGraph', layer: 'ghost', label: 'derive phases' },
+      { from: 'phaseGraph', to: 'requestIr', layer: 'ghost', label: 'phase contract' },
+      { from: 'requestIr', to: 'contextGate', layer: 'ghost', label: 'context gate' },
+      { from: 'requestIr', to: 'candidateGraph', layer: 'ghost', label: 'candidate graph', curve: 0.16 },
+      { from: 'candidateGraph', to: 'promotionReview', layer: 'ghost', label: 'candidate -> promotion' },
+      { from: 'promotionReview', to: 'decisionContract', layer: 'ghost', label: 'read model input' },
+      { from: 'acceptedLearningHints', to: 'decisionContract', layer: 'ghost', label: 'learning orientation', curve: 0.18, dashed: true },
+      { from: 'semanticRoles', to: 'decisionContract', layer: 'ghost', label: 'advisory lens', curve: 0.18 },
+      { from: 'acceptedLearningHints', to: 'ghost', layer: 'ghost', label: 'soft hint', curve: -0.28, dashed: true },
+      { from: 'decisionContract', to: 'ghost', layer: 'ghost', label: 'advisory only', curve: -0.35, dashed: true },
+      { from: 'promotionReview', to: 'workloadGraph', layer: 'mutable', label: 'promoted contract -> workload task' },
+      { from: 'promotionReview', to: 'outputObligations', layer: 'mutable', label: 'promoted output obligation', curve: -0.12 },
+      { from: 'workloadGraph', to: 'workloadTasks', layer: 'mutable', label: 'task lifecycle' },
+      { from: 'workloadTasks', to: 'resolver', layer: 'service', label: 'ready task' },
+      { from: 'outputObligations', to: 'workTree', layer: 'mutable', label: 'owed work in tree', curve: 0.12 },
+      { from: 'workTree', to: 'outputSlots', layer: 'mutable', label: 'projection only' },
+      { from: 'artifactFlow', to: 'workTree', layer: 'mutable', label: 'runtime-owned tree' },
+      { from: 'resolver', to: 'executionContracts', layer: 'service', label: 'branch-local execution contract' },
+      { from: 'executionContracts', to: 'backendFabric', layer: 'runtime', label: 'route compatible lane', curve: -0.2 },
+      { from: 'backendFabric', to: 'backendTransport', layer: 'runtime', label: 'provider adapter' },
+      { from: 'backendTransport', to: 'runtimeRegistry', layer: 'runtime', label: 'live metadata' },
+      { from: 'runtimeRegistry', to: 'ollama', layer: 'runtime', label: 'typed instance', curve: 0.05 },
+      { from: 'runtimeRegistry', to: 'mlx', layer: 'runtime', label: 'typed instance' },
+      { from: 'runtimeRegistry', to: 'llamacpp', layer: 'runtime', label: 'runner', curve: -0.05 },
+      { from: 'executionContracts', to: 'generatedOutputs', layer: 'evidence', label: 'materialized branch', curve: 0.22 },
+      { from: 'generatedOutputs', to: 'evidenceBranches', layer: 'evidence', label: 'dependency evidence' },
+      { from: 'generatedOutputs', to: 'artifactIdentity', layer: 'evidence', label: 'artifact_ref + provenance', curve: 0.32 },
+      { from: 'artifactIdentity', to: 'workTree', layer: 'evidence', label: 'registry evidence', curve: -0.16 },
+      { from: 'evidenceBranches', to: 'runtimeTruth', layer: 'closure', label: 'evidence gates proof' },
+      { from: 'outputSlots', to: 'graphClosure', layer: 'closure', label: 'slot projection audited', curve: -0.12 },
+      { from: 'workTree', to: 'graphClosure', layer: 'closure', label: 'work truth audited' },
+      { from: 'graphClosure', to: 'redrawScopeLadderReview', layer: 'closure', label: 'scope ladder review' },
+      { from: 'redrawScopeLadderReview', to: 'graphRepairProposals', layer: 'closure', label: 'scope -> repair proposals' },
+      { from: 'redrawScopeLadderReview', to: 'graphRebaseProposals', layer: 'closure', label: 'scope -> rebase proposals' },
+      { from: 'graphClosure', to: 'graphRepairProposals', layer: 'closure', label: 'repair proposals' },
+      { from: 'graphRepairProposals', to: 'graphRepairReviews', layer: 'closure', label: 'repair review' },
+      { from: 'graphRepairReviews', to: 'graphPatchLifecycle', layer: 'closure', label: 'proposal lifecycle' },
+      { from: 'graphPatchLifecycle', to: 'successorReopenRequests', layer: 'closure', label: 'successor reopen request' },
+      { from: 'successorReopenRequests', to: 'repairActions', layer: 'service', label: 'repair continuation' },
+      { from: 'graphPatchLifecycle', to: 'repairActions', layer: 'closure', label: 'repair actionability', dashed: true },
+      { from: 'graphClosure', to: 'graphRebaseProposals', layer: 'closure', label: 'rebase proposals', curve: -0.12 },
+      { from: 'graphRebaseProposals', to: 'graphRebaseReviews', layer: 'closure', label: 'rebase review' },
+      { from: 'graphRebaseReviews', to: 'graphRebaseLifecycle', layer: 'closure', label: 'lifecycle review' },
+      { from: 'graphRebaseLifecycle', to: 'successorRebaseRequests', layer: 'closure', label: 'successor rebase request' },
+      { from: 'successorRebaseRequests', to: 'repairActions', layer: 'service', label: 'rebase continuation' },
+      { from: 'lateFill', to: 'resolver', layer: 'service', label: 'continue anchored branch', curve: -0.24 },
+      { from: 'graphClosure', to: 'repairActions', layer: 'closure', label: 'closure repair' },
+      { from: 'repairActions', to: 'lateFill', layer: 'service', label: 'retry / repair / semantic_review' },
+      { from: 'graphClosure', to: 'branchSemanticReview', layer: 'closure', label: 'semantic review', curve: 0.15 },
+      { from: 'branchSemanticReview', to: 'semanticVerdict', layer: 'closure', label: 'semantic_review_verdict' },
+      { from: 'graphClosure', to: 'globalSemanticClosure', layer: 'closure', label: 'whole-turn semantic review', curve: -0.15 },
+      { from: 'globalSemanticClosure', to: 'surfaceState', layer: 'closure', label: 'surface_state' },
+      { from: 'surfaceState', to: 'freezeDecision', layer: 'closure', label: 'readback for freeze gate', curve: 0.2 },
+      { from: 'surfaceState', to: 'responseFrame', layer: 'durable', label: 'projection freezes with frame', curve: 0.2, dashed: true },
+      { from: 'semanticVerdict', to: 'graphClosure', layer: 'closure', label: 'review evidence', curve: -0.22 },
+      { from: 'intent', to: 'possibility', layer: 'closure', label: 'opens' },
+      { from: 'possibility', to: 'relevance', layer: 'closure', label: 'relevance' },
+      { from: 'relevance', to: 'promotedContracts', layer: 'closure', label: 'promotion' },
+      { from: 'promotedContracts', to: 'runtimeTruth', layer: 'closure', label: 'runtime work' },
+      { from: 'runtimeTruth', to: 'reviewCadence', layer: 'closure', label: 'review' },
+      { from: 'reviewCadence', to: 'freezeDecision', layer: 'closure', label: 'freeze' },
+      { from: 'graphClosure', to: 'reviewCadence', layer: 'closure', label: 'pre-freeze authority', curve: 0.12 },
+      { from: 'freezeDecision', to: 'responseFrame', layer: 'durable', label: 'freeze state image' },
+      { from: 'responseFrame', to: 'outputsCanonical', layer: 'durable', label: 'canonical output surface' },
+      { from: 'responseFrame', to: 'frameLedger', layer: 'durable', label: 'append ledger', curve: 0.14 },
+      { from: 'artifactIdentity', to: 'artifactDossiers', layer: 'durable', label: 'dossier read surface', curve: -0.28 },
+      { from: 'frameLedger', to: 'chatHistory', layer: 'durable', label: 'history/readback' },
+      { from: 'artifactDossiers', to: 'contextGate', layer: 'durable', label: 'durable readback -> candidates', curve: -0.38, dashed: true },
+      { from: 'chatHistory', to: 'contextGate', layer: 'durable', label: 'history -> candidates', curve: -0.3, dashed: true },
+      { from: 'durableRuntime', to: 'runtimeRegistry', layer: 'durable', label: 'registry/status truth', curve: 0.32, dashed: true },
+      { from: 'chatInferCompat', to: 'responsesApi', layer: 'compat', label: 'compat route below Responses', dashed: true },
+      { from: 'legacyOutputsCompat', to: 'outputsCanonical', layer: 'compat', label: 'derived projection', dashed: true },
+      { from: 'runtimePlannerCompat', to: 'resolver', layer: 'compat', label: 'old persisted key', dashed: true },
+      { from: 'plannerTimeoutCompat', to: 'resolver', layer: 'compat', label: 'budget hint only', dashed: true },
+      { from: 'ghostModeCompat', to: 'semanticRoles', layer: 'compat', label: 'edge alias -> orientation', dashed: true },
+      { from: 'retiredRoleCompat', to: 'semanticRoles', layer: 'compat', label: 'retired public role surface', dashed: true },
+    ];
+
+    const architectureSvg = document.getElementById('architectureSvg');
+    const diagramBackground = document.getElementById('diagramBackground');
+    const diagramGrid = document.getElementById('diagramGrid');
+    const regionsLayer = document.getElementById('regionsLayer');
+    const edgesLayer = document.getElementById('edgesLayer');
+    const edgeLabelsLayer = document.getElementById('edgeLabelsLayer');
+    const nodesLayer = document.getElementById('nodesLayer');
+    const controls = Array.from(document.querySelectorAll('[data-layer]'));
+    const layoutJson = document.getElementById('layoutJson');
+    const detailKind = document.getElementById('detailKind');
+    const detailTitle = document.getElementById('detailTitle');
+    const detailBody = document.getElementById('detailBody');
+    const detailStatus = document.getElementById('detailStatus');
+    const detailAuthority = document.getElementById('detailAuthority');
+    const detailPaths = document.getElementById('detailPaths');
+    const canvasWidthInput = document.getElementById('canvasWidthInput');
+    const focusModeToggle = document.getElementById('focusModeToggle');
+    const setCanvasWidthButton = document.getElementById('setCanvasWidth');
+    const autoCanvasWidthButton = document.getElementById('autoCanvasWidth');
+    const saveLayoutFileButton = document.getElementById('saveLayoutFile');
+    const importLayoutButton = document.getElementById('importLayout');
+    const layoutFileInput = document.getElementById('layoutFileInput');
+
+    const state = {
+      regions: new Map(defaultRegions.map((region) => [region.id, { ...region, element: null }])),
+      nodes: new Map(defaultNodes.map((node) => [node.id, { ...node }])),
+      selectedId: null,
+      selectedIds: new Set(),
+      dragging: null,
+      regionDragging: null,
+      activeLayers: new Set(),
+      autoViewBox: false,
+      focusModeEnabled: true,
+      focusModeDepth: 2,
+      suppressNextNodeClick: false,
+    };
+
+    function canvasBounds() {
+      const vb = parseViewBox(architectureSvg.getAttribute('viewBox'));
+      if (vb) return vb;
+      return { ...BASE_VIEWBOX };
+    }
+
+    function syncCanvasBackdrop() {
+      const bounds = canvasBounds();
+      if (diagramBackground) {
+        diagramBackground.setAttribute('width', bounds.w);
+        diagramBackground.setAttribute('height', bounds.h);
+      }
+      if (diagramGrid) {
+        diagramGrid.setAttribute('width', bounds.w);
+        diagramGrid.setAttribute('height', bounds.h);
+      }
+    }
+
+    function maxContentRightEdge() {
+      let maxX = BASE_VIEWBOX.w;
+      state.nodes.forEach((node) => {
+        maxX = Math.max(maxX, node.x + node.w);
+      });
+      state.regions.forEach((region) => {
+        maxX = Math.max(maxX, region.x + region.w);
+      });
+      return Math.max(MIN_CANVAS_WIDTH, Math.round(maxX + 24));
+    }
+
+    function applyCanvasStyleWidth(bounds) {
+      const isNarrow = window.matchMedia('(max-width: 900px)').matches;
+      if (isNarrow) {
+        architectureSvg.style.removeProperty('width');
+      } else {
+        architectureSvg.style.width = `${Math.round(bounds.w)}px`;
+      }
+      if (canvasWidthInput) {
+        canvasWidthInput.value = String(Math.round(bounds.w));
+      }
+      syncCanvasBackdrop();
+    }
+
+    function clampToCanvas(bounds) {
+      state.nodes.forEach((node) => {
+        node.x = Math.max(0, Math.min(node.x, bounds.w - node.w));
+        node.y = Math.max(0, Math.min(node.y, bounds.h - node.h));
+        if (node.element) node.element.setAttribute('transform', `translate(${node.x} ${node.y})`);
+      });
+      state.regions.forEach((region) => {
+        region.x = Math.max(0, Math.min(region.x, bounds.w - region.w));
+        region.y = Math.max(0, Math.min(region.y, bounds.h - region.h));
+        region.w = Math.max(region.minW || 120, Math.min(region.w, bounds.w - region.x));
+        region.h = Math.max(region.minH || 90, Math.min(region.h, bounds.h - region.y));
+        updateRegionElement(region);
+      });
+    }
+
+    function setCanvasWidth(rawWidth, { auto = false, persist = false } = {}) {
+      const vb = canvasBounds();
+      let targetW = Math.round(Number(rawWidth));
+      if (!Number.isFinite(targetW)) targetW = vb.w;
+      targetW = Math.max(MIN_CANVAS_WIDTH, Math.min(5000, targetW));
+      targetW = Math.max(targetW, maxContentRightEdge());
+      vb.w = targetW;
+      architectureSvg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+      applyCanvasStyleWidth(vb);
+      clampToCanvas(vb);
+      if (!auto) state.autoViewBox = false;
+      if (persist) {
+        persistLayout();
+      }
+      drawEdges();
+    }
+
+    function el(name, attrs = {}) {
+      const element = document.createElementNS(SVG_NS, name);
+      Object.entries(attrs).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) {
+          element.setAttribute(key, String(value));
+        }
+      });
+      return element;
+    }
+
+    function cssColor(layer, key) {
+      return (layerStyles[layer] || layerStyles.compat)[key];
+    }
+
+    function parseViewBox(value) {
+      if (typeof value !== 'string') return null;
+      const parts = value.trim().split(/\s+/).map((entry) => Number(entry));
+      if (parts.length !== 4 || parts.some((item) => Number.isNaN(item))) return null;
+      return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] };
+    }
+
+    function isDefaultViewBox(vb) {
+      return vb && vb.x === BASE_VIEWBOX.x && vb.y === BASE_VIEWBOX.y && vb.w === BASE_VIEWBOX.w && vb.h === BASE_VIEWBOX.h;
+    }
+
+    function syncCanvasViewBoxToWidth() {
+      if (!state.autoViewBox) return;
+      const container = architectureSvg.parentElement;
+      const renderedWidth = Math.round(container ? container.clientWidth : BASE_VIEWBOX.w);
+      const targetW = Math.max(BASE_VIEWBOX.w, renderedWidth);
+      const current = parseViewBox(architectureSvg.getAttribute('viewBox'));
+      if (!current) return;
+      const hasWidthChange = current.w !== targetW;
+      const rightMargins = {
+        outerTruth: 140,
+        runtimeShell: 160,
+        serviceShell: 310,
+        workingFrameShell: 400,
+        semanticShell: 520,
+        cadenceShell: 340,
+      };
+      let regionChanged = false;
+      Object.entries(rightMargins).forEach(([id, rightMargin]) => {
+        const region = state.regions.get(id);
+        if (!region) return;
+        const targetRegionW = targetW - region.x - rightMargin;
+        if (targetRegionW <= 0) return;
+        const minAllowedW = Math.max(region.minW || 120, 1);
+        const boundedW = Math.max(minAllowedW, targetRegionW);
+        if (boundedW > region.w) {
+          region.w = Math.max(region.w, boundedW);
+          regionChanged = true;
+          updateRegionElement(region);
+        }
+      });
+      if (!hasWidthChange && !regionChanged) {
+        applyCanvasStyleWidth(current);
+        return;
+      }
+      architectureSvg.setAttribute('viewBox', `${current.x} ${current.y} ${targetW} ${current.h}`);
+      applyCanvasStyleWidth({ ...current, w: targetW });
+      persistLayout();
+      drawEdges();
+    }
+
+    function wrapText(text, maxChars) {
+      const words = String(text || '').split(/\s+/).filter(Boolean);
+      const lines = [];
+      let line = '';
+      words.forEach((word) => {
+        const next = line ? `${line} ${word}` : word;
+        if (next.length > maxChars && line) {
+          lines.push(line);
+          line = word;
+        } else {
+          line = next;
+        }
+      });
+      if (line) lines.push(line);
+      return lines.slice(0, 3);
+    }
+
+    function updateRegionElement(region) {
+      if (!region.element) return;
+      const body = region.element.querySelector('.region-body');
+      const title = region.element.querySelector('.region-title');
+      const sub = region.element.querySelector('.region-subtitle');
+      const size = region.element.querySelector('.region-size');
+      const moveHandle = region.element.querySelector('.region-move-handle');
+      const resizeHandle = region.element.querySelector('.region-resize-handle');
+
+      body.setAttribute('x', region.x);
+      body.setAttribute('y', region.y);
+      body.setAttribute('width', region.w);
+      body.setAttribute('height', region.h);
+
+      title.setAttribute('x', region.x + 40);
+      title.setAttribute('y', region.y + 38);
+      sub.setAttribute('x', region.x + 40);
+      sub.setAttribute('y', region.y + 64);
+      if (size) {
+        size.setAttribute('x', region.x + 40);
+        size.setAttribute('y', region.y + 82);
+        size.textContent = `${Math.round(region.w)}×${Math.round(region.h)} @ (${Math.round(region.x)}, ${Math.round(region.y)})`;
+      }
+
+      moveHandle.setAttribute('x', region.x + 10);
+      moveHandle.setAttribute('y', region.y + 10);
+      moveHandle.setAttribute('width', 14);
+      moveHandle.setAttribute('height', 14);
+
+      resizeHandle.setAttribute('x', Math.max(region.x + 2, region.x + region.w - 14));
+      resizeHandle.setAttribute('y', Math.max(region.y + 2, region.y + region.h - 14));
+      resizeHandle.setAttribute('width', 14);
+      resizeHandle.setAttribute('height', 14);
+    }
+
+    function startRegionDrag(event) {
+      const region = state.regions.get(event.currentTarget.dataset.regionId);
+      if (!region) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const isResize = event.currentTarget.classList.contains('region-resize-handle');
+      const point = svgPoint(event);
+      state.regionDragging = {
+        id: region.id,
+        action: isResize ? 'resize' : 'move',
+        pointerId: event.pointerId,
+        startX: point.x,
+        startY: point.y,
+        startRegionX: region.x,
+        startRegionY: region.y,
+        startRegionW: region.w,
+        startRegionH: region.h,
+      };
+      region.element?.querySelector(isResize ? '.region-resize-handle' : '.region-move-handle')?.setPointerCapture(event.pointerId);
+    }
+
+    function moveRegionDrag(event) {
+      if (!state.regionDragging) return;
+      const region = state.regions.get(state.regionDragging.id);
+      if (!region || !region.element) return;
+      const point = svgPoint(event);
+      const bounds = canvasBounds();
+      const minW = Number(region.minW || 140);
+      const minH = Number(region.minH || 110);
+      if (state.regionDragging.action === 'resize') {
+        const nextW = Math.round(state.regionDragging.startRegionW + (point.x - state.regionDragging.startX));
+        const nextH = Math.round(state.regionDragging.startRegionH + (point.y - state.regionDragging.startY));
+        region.w = Math.min(bounds.w - region.x, Math.max(minW, nextW));
+        region.h = Math.min(bounds.h - region.y, Math.max(minH, nextH));
+      } else {
+        region.x = Math.round(point.x - (state.regionDragging.startX - state.regionDragging.startRegionX));
+        region.y = Math.round(point.y - (state.regionDragging.startY - state.regionDragging.startRegionY));
+      }
+      if (state.regionDragging.action === 'move') {
+        region.x = Math.max(0, Math.min(region.x, bounds.w - region.w));
+        region.y = Math.max(0, Math.min(region.y, bounds.h - region.h));
+      }
+      updateRegionElement(region);
+    }
+
+    function endRegionDrag(event) {
+      if (!state.regionDragging) return;
+      const region = state.regions.get(state.regionDragging.id);
+      if (region?.element) {
+        const handle = region.element.querySelector(`.${state.regionDragging.action === 'resize' ? 'region-resize-handle' : 'region-move-handle'}`);
+        try {
+          handle?.releasePointerCapture(state.regionDragging.pointerId);
+        } catch (_err) {
+          // Pointer capture may already have been released by the browser.
+        }
+      }
+      state.regionDragging = null;
+      persistLayout();
+    }
+
+    function drawRegion(region) {
+      const group = el('g', {
+        class: `region layer-${region.layer}`,
+        'data-region-id': region.id,
+        'data-layer': region.layer,
+      });
+      group.appendChild(el('rect', {
+        class: 'region-body',
+        x: region.x,
+        y: region.y,
+        width: region.w,
+        height: region.h,
+        rx: region.rx,
+        fill: region.fill,
+        stroke: region.stroke,
+        'stroke-width': 1.5,
+        'stroke-dasharray': region.dashed ? '10 7' : '',
+      }));
+      const title = el('text', {
+        class: 'region-label region-title',
+        x: region.x + 40,
+        y: region.y + 38,
+        fill: region.stroke,
+        'font-size': 16,
+        'font-weight': 700,
+      });
+      title.textContent = region.title;
+      group.appendChild(title);
+
+      const subtitle = el('text', {
+        class: 'region-label region-subtitle',
+        x: region.x + 40,
+        y: region.y + 64,
+        fill: region.stroke,
+        'font-size': 10,
+        opacity: 0.78,
+      });
+      subtitle.textContent = region.sub;
+      group.appendChild(subtitle);
+
+      const size = el('text', {
+        class: 'region-label region-size',
+        x: region.x + 40,
+        y: region.y + 82,
+        fill: region.stroke,
+      });
+      size.textContent = `${region.w}×${region.h} @ (${region.x}, ${region.y})`;
+      group.appendChild(size);
+
+      const moveHandle = el('rect', {
+        class: 'region-move-handle',
+        'data-region-id': region.id,
+        x: region.x + 10,
+        y: region.y + 10,
+        width: 14,
+        height: 14,
+      });
+      const resizeHandle = el('rect', {
+        class: 'region-resize-handle',
+        'data-region-id': region.id,
+        x: region.x + region.w - 14,
+        y: region.y + region.h - 14,
+        width: 14,
+        height: 14,
+      });
+      moveHandle.addEventListener('pointerdown', startRegionDrag);
+      resizeHandle.addEventListener('pointerdown', startRegionDrag);
+      group.appendChild(moveHandle);
+      group.appendChild(resizeHandle);
+      regionsLayer.appendChild(group);
+      region.element = group;
+    }
+
+    function drawNode(node) {
+      const style = layerStyles[node.layer] || layerStyles.compat;
+      const group = el('g', {
+        class: `node layer-${node.layer}${node.status === 'compatibility-only' ? ' compat-node' : ''}`,
+        'data-node-id': node.id,
+        transform: `translate(${node.x} ${node.y})`,
+      });
+      group.appendChild(el('rect', {
+        class: 'node-mask',
+        x: 0, y: 0, width: node.w, height: node.h, rx: node.layer === 'compat' ? 7 : 9,
+        fill: '#ffffff',
+        opacity: node.layer === 'compat' ? 0.86 : 1,
+      }));
+      group.appendChild(el('rect', {
+        class: 'node-rect',
+        x: 0, y: 0, width: node.w, height: node.h, rx: node.layer === 'compat' ? 7 : 9,
+        fill: style.fill, stroke: style.stroke, 'stroke-width': node.layer === 'compat' ? 1.1 : 1.55,
+        'stroke-dasharray': node.layer === 'compat' ? '4 4' : '',
+      }));
+      const labelLines = wrapText(node.label, Math.max(10, Math.floor(node.w / 8)));
+      const labelStart = node.h > 68 ? 24 : 23;
+      labelLines.forEach((line, index) => {
+        const text = el('text', {
+          x: node.w / 2, y: labelStart + index * 14,
+          fill: style.text, 'font-size': node.layer === 'compat' ? 8 : 11,
+          'font-weight': 700, 'text-anchor': 'middle',
+        });
+        text.textContent = line;
+        group.appendChild(text);
+      });
+      const sub = el('text', {
+        x: node.w / 2, y: node.h - 15,
+        fill: style.sub, 'font-size': node.layer === 'compat' ? 7 : 8,
+        'text-anchor': 'middle',
+      });
+      sub.textContent = node.sub || '';
+      group.appendChild(sub);
+      group.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (state.suppressNextNodeClick) {
+          state.suppressNextNodeClick = false;
+          return;
+        }
+        selectNode(node.id, event);
+      });
+      group.addEventListener('pointerdown', startDrag);
+      nodesLayer.appendChild(group);
+      node.element = group;
+    }
+
+    function nodeCenter(node) {
+      return { x: node.x + node.w / 2, y: node.y + node.h / 2 };
+    }
+
+    function anchorPoint(source, target) {
+      const sourceCenter = nodeCenter(source);
+      const targetCenter = nodeCenter(target);
+      const dx = targetCenter.x - sourceCenter.x;
+      const dy = targetCenter.y - sourceCenter.y;
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
+      if (absDx >= absDy) {
+        return {
+          x: source.x + (dx >= 0 ? source.w : 0),
+          y: sourceCenter.y,
+        };
+      }
+      return {
+        x: sourceCenter.x,
+        y: source.y + (dy >= 0 ? source.h : 0),
+      };
+    }
+
+    function edgePath(edge, from, to) {
+      const start = anchorPoint(from, to);
+      const end = anchorPoint(to, from);
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const curve = Number(edge.curve || 0);
+      const horizontal = Math.abs(dx) >= Math.abs(dy);
+      let c1x = start.x + dx * 0.45;
+      let c1y = start.y + dy * 0.15;
+      let c2x = start.x + dx * 0.55;
+      let c2y = start.y + dy * 0.85;
+      if (horizontal) {
+        c1y += curve * 260;
+        c2y -= curve * 260;
+      } else {
+        c1x += curve * 260;
+        c2x -= curve * 260;
+      }
+      return { d: `M ${start.x} ${start.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${end.x} ${end.y}`, start, end };
+    }
+
+    function isLayerActive(layer) {
+      return state.activeLayers.has(layer);
+    }
+
+    function nodeVisible(node) {
+      return isLayerActive(node.layer);
+    }
+
+    function connectedSelectionSets() {
+      if (!state.focusModeEnabled) {
+        return { enabled: false, nodeIds: new Set(), edgeIndexes: new Set() };
+      }
+      const maxDepth = Number.isFinite(Number(state.focusModeDepth)) ? Math.max(0, Math.floor(Number(state.focusModeDepth))) : 0;
+      const selectedIds = new Set(Array.from(state.selectedIds).filter((id) => {
+        const node = state.nodes.get(id);
+        return !!node && nodeVisible(node);
+      }));
+      if (selectedIds.size === 0) {
+        return { enabled: false, nodeIds: new Set(), edgeIndexes: new Set() };
+      }
+      if (maxDepth === 0) {
+        return { enabled: true, nodeIds: selectedIds, edgeIndexes: new Set() };
+      }
+      const byNode = new Map();
+      edges.forEach((edge, index) => {
+        const from = state.nodes.get(edge.from);
+        const to = state.nodes.get(edge.to);
+        if (!from || !to || !nodeVisible(from) || !nodeVisible(to) || !isLayerActive(edge.layer)) return;
+        if (!byNode.has(edge.from)) byNode.set(edge.from, []);
+        if (!byNode.has(edge.to)) byNode.set(edge.to, []);
+        byNode.get(edge.from).push({ id: edge.to, index });
+        byNode.get(edge.to).push({ id: edge.from, index });
+      });
+      const nodeIds = new Set();
+      const edgeIndexes = new Set();
+      const queue = Array.from(selectedIds, (id) => ({ id, depth: 0 }));
+      queue.forEach(({ id }) => {
+        if (state.nodes.get(id) && nodeVisible(state.nodes.get(id))) {
+          nodeIds.add(id);
+        }
+      });
+      for (let q = 0; q < queue.length; q += 1) {
+        const current = queue[q];
+        if (current.depth >= maxDepth) {
+          continue;
+        }
+        const currentId = current.id;
+        const adjacent = byNode.get(currentId) || [];
+        adjacent.forEach((neighbor) => {
+          edgeIndexes.add(neighbor.index);
+          if (!nodeIds.has(neighbor.id)) {
+            nodeIds.add(neighbor.id);
+            queue.push({ id: neighbor.id, depth: current.depth + 1 });
+          }
+        });
+      }
+      return { enabled: true, nodeIds, edgeIndexes };
+    }
+
+    function drawEdges() {
+      edgesLayer.replaceChildren();
+      edgeLabelsLayer.replaceChildren();
+      const relation = connectedSelectionSets();
+      edges.forEach((edge, edgeIndex) => {
+        const from = state.nodes.get(edge.from);
+        const to = state.nodes.get(edge.to);
+        if (!from || !to || !nodeVisible(from) || !nodeVisible(to) || !isLayerActive(edge.layer)) return;
+        const style = layerStyles[edge.layer] || layerStyles.compat;
+        const pathData = edgePath(edge, from, to);
+        const isConnected = relation.enabled && relation.edgeIndexes.has(edgeIndex);
+        const classes = [
+          'edge-path',
+          relation.enabled && !isConnected ? 'edge-dim' : '',
+          isConnected ? 'edge-active' : '',
+          edge.layer === 'compat' || edge.dashed ? 'compat-edge' : '',
+        ];
+        const path = el('path', {
+          class: classes.filter(Boolean).join(' '),
+          d: pathData.d,
+          stroke: style.stroke,
+          opacity: edge.layer === 'compat' ? (relation.enabled && !isConnected ? 0.28 : 0.65) : (relation.enabled && !isConnected ? 0.22 : 0.92),
+        });
+        edgesLayer.appendChild(path);
+        if (edge.label) {
+          const labelX = (pathData.start.x + pathData.end.x) / 2;
+          const labelY = (pathData.start.y + pathData.end.y) / 2 - 7 - Number(edge.curve || 0) * 42;
+          const labelClasses = ['edge-label', relation.enabled && !isConnected ? 'edge-dim' : ''];
+          const label = el('text', {
+            class: labelClasses.filter(Boolean).join(' '),
+            x: labelX, y: labelY,
+            fill: style.stroke,
+            'text-anchor': 'middle',
+          });
+          label.textContent = edge.label;
+          edgeLabelsLayer.appendChild(label);
+        }
+      });
+    }
+
+    function applyLayerVisibility() {
+      state.activeLayers = new Set(controls.filter((control) => control.checked).map((control) => control.dataset.layer));
+      regionsLayer.querySelectorAll('[data-layer]').forEach((item) => {
+        item.classList.toggle('is-hidden', !isLayerActive(item.dataset.layer));
+      });
+      state.nodes.forEach((node) => {
+        if (node.element) node.element.classList.toggle('is-hidden', !nodeVisible(node));
+      });
+      if (state.selectedIds.size) {
+        updateSelectionVisuals();
+      } else {
+        drawEdges();
+      }
+    }
+
+    function clearSelection() {
+      state.selectedIds.clear();
+      state.selectedId = null;
+      state.nodes.forEach((item) => {
+        if (item.element) item.element.classList.remove('selected');
+        if (item.element) item.element.classList.remove('dim');
+      });
+      detailKind.textContent = 'None selected';
+      detailTitle.textContent = 'Select a node';
+      detailBody.textContent = 'Click a node to view details.';
+      detailStatus.innerHTML = '';
+      detailAuthority.innerHTML = '';
+      detailPaths.innerHTML = '';
+      drawEdges();
+    }
+
+    function refreshDetailPanel() {
+      const selectedIds = Array.from(state.selectedIds);
+      if (!selectedIds.length) {
+        return;
+      }
+      if (selectedIds.length === 1) {
+        const node = state.nodes.get(selectedIds[0]);
+        if (!node) return;
+        state.selectedId = node.id;
+        detailKind.textContent = `${node.kind || 'Component'} / ${node.layer}`;
+        detailTitle.textContent = node.title || node.label;
+        detailBody.textContent = node.body || 'No detail available.';
+        detailStatus.innerHTML = `<b>Status:</b> ${node.status || 'canonical'}`;
+        detailAuthority.innerHTML = `<b>Authority:</b> ${node.authority || 'not specified'}`;
+        detailPaths.innerHTML = `<b>Files:</b> ${node.paths || 'not specified'}`;
+        return;
+      }
+      const selectedLabels = selectedIds
+        .map((selectedId) => {
+          const node = state.nodes.get(selectedId);
+          return node ? (node.title || node.label) : selectedId;
+        })
+        .filter(Boolean);
+      detailKind.textContent = `${selectedIds.length} nodes selected`;
+      detailTitle.textContent = `Multi-select (${selectedIds.length})`;
+      detailBody.textContent = selectedLabels.length ? selectedLabels.join('\n') : 'Multiple nodes selected.';
+      detailStatus.innerHTML = '<b>Status:</b> mixed';
+      detailAuthority.innerHTML = '<b>Authority:</b> mixed';
+      detailPaths.innerHTML = '<b>Files:</b> mixed';
+    }
+
+    function updateSelectionVisuals() {
+      const relation = connectedSelectionSets();
+      state.nodes.forEach((item) => {
+        if (!item.element) return;
+        item.element.classList.toggle('selected', state.selectedIds.has(item.id));
+        item.element.classList.toggle('dim', relation.enabled && !relation.nodeIds.has(item.id));
+      });
+      refreshDetailPanel();
+      drawEdges();
+    }
+
+    function selectNode(id, event = {}) {
+      const node = state.nodes.get(id);
+      if (!node) return;
+      const multiSelect = Boolean(event.shiftKey || event.ctrlKey || event.metaKey);
+      if (multiSelect) {
+        if (state.selectedIds.has(id)) {
+          state.selectedIds.delete(id);
+        } else {
+          state.selectedIds.add(id);
+        }
+        if (state.selectedIds.size === 0) {
+          state.selectedId = null;
+        } else {
+          state.selectedId = id;
+        }
+      } else {
+        state.selectedIds.clear();
+        state.selectedIds.add(id);
+        state.selectedId = id;
+      }
+      updateSelectionVisuals();
+    }
+
+    function svgPoint(event) {
+      const point = architectureSvg.createSVGPoint();
+      point.x = event.clientX;
+      point.y = event.clientY;
+      return point.matrixTransform(architectureSvg.getScreenCTM().inverse());
+    }
+
+    function startDrag(event) {
+      const group = event.currentTarget;
+      const id = group.dataset.nodeId;
+      const node = state.nodes.get(id);
+      if (!node) return;
+      if (!state.selectedIds.has(id)) {
+        selectNode(id, event);
+      }
+      event.preventDefault();
+      group.setPointerCapture(event.pointerId);
+      const start = svgPoint(event);
+      const selectedNodes = Array.from(state.selectedIds);
+      if (!selectedNodes.length) {
+        return;
+      }
+      state.dragging = {
+        initiatorId: id,
+        ids: selectedNodes,
+        pointerId: event.pointerId,
+        offsets: new Map(),
+        hasMoved: false,
+        originX: start.x,
+        originY: start.y,
+      };
+      selectedNodes.forEach((selectedId) => {
+        const selectedNode = state.nodes.get(selectedId);
+        if (!selectedNode) return;
+        state.dragging.offsets.set(selectedId, {
+          offsetX: start.x - selectedNode.x,
+          offsetY: start.y - selectedNode.y,
+        });
+        selectedNode.element?.classList.add('dragging');
+      });
+    }
+
+    function moveDrag(event) {
+      if (!state.dragging) return;
+      const point = svgPoint(event);
+      const dx = point.x - state.dragging.originX;
+      const dy = point.y - state.dragging.originY;
+      const moved = Math.abs(dx) + Math.abs(dy) > 2;
+      const bounds = canvasBounds();
+      if (moved) state.dragging.hasMoved = true;
+      state.dragging.ids.forEach((dragId) => {
+        const node = state.nodes.get(dragId);
+        const offset = state.dragging?.offsets.get(dragId);
+        if (!node || !offset || !node.element) return;
+        node.x = Math.round(point.x - offset.offsetX);
+        node.y = Math.round(point.y - offset.offsetY);
+        node.x = Math.max(0, Math.min(node.x, bounds.w - node.w));
+        node.y = Math.max(0, Math.min(node.y, bounds.h - node.h));
+        node.element.setAttribute('transform', `translate(${node.x} ${node.y})`);
+      });
+      drawEdges();
+    }
+
+    function endDrag(event) {
+      if (!state.dragging) return;
+      state.dragging.ids.forEach((dragId) => {
+        const node = state.nodes.get(dragId);
+        if (node?.element) {
+          node.element.classList.remove('dragging');
+        }
+      });
+      if (state.dragging?.hasMoved) {
+        state.suppressNextNodeClick = true;
+      }
+      const initiator = state.nodes.get(state.dragging.initiatorId);
+      if (initiator?.element) {
+        try {
+          initiator.element.releasePointerCapture(state.dragging.pointerId);
+        } catch (_err) {
+          // Pointer capture can already be released by the browser.
+        }
+      }
+      state.dragging = null;
+      persistLayout();
+    }
+
+    function currentLayout() {
+      const positions = {};
+      state.nodes.forEach((node) => {
+        positions[node.id] = { x: node.x, y: node.y };
+      });
+      const regions = {};
+      state.regions.forEach((region) => {
+        regions[region.id] = {
+          x: region.x,
+          y: region.y,
+          w: region.w,
+          h: region.h,
+        };
+      });
+      return {
+        version: 5,
+        autoViewBox: state.autoViewBox,
+        focusModeEnabled: state.focusModeEnabled,
+        focusModeDepth: state.focusModeDepth,
+        viewBox: architectureSvg.getAttribute('viewBox'),
+        positions,
+        regions,
+      };
+    }
+
+    function persistLayout() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(currentLayout()));
+    }
+
+    function applyLayout(layout) {
+      if (!layout || typeof layout !== 'object' || !layout.positions) return false;
+      state.autoViewBox = true;
+      Object.entries(layout.positions).forEach(([id, position]) => {
+        const node = state.nodes.get(id);
+        if (!node || !position) return;
+        const x = Number(position.x);
+        const y = Number(position.y);
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          node.x = Math.round(x);
+          node.y = Math.round(y);
+          if (node.element) node.element.setAttribute('transform', `translate(${node.x} ${node.y})`);
+        }
+      });
+
+      if (layout.regions && typeof layout.regions === 'object') {
+        Object.entries(layout.regions).forEach(([id, value]) => {
+          const region = state.regions.get(id);
+          if (!region || !value) return;
+          const x = Number(value.x);
+          const y = Number(value.y);
+          const w = Number(value.w);
+          const h = Number(value.h);
+          if (Number.isFinite(x)) region.x = Math.max(0, Math.round(x));
+          if (Number.isFinite(y)) region.y = Math.max(0, Math.round(y));
+          if (Number.isFinite(w)) region.w = Math.max(region.minW || 120, Math.round(w));
+          if (Number.isFinite(h)) region.h = Math.max(region.minH || 90, Math.round(h));
+          updateRegionElement(region);
+        });
+      }
+      if (typeof layout.focusModeEnabled === 'boolean') {
+        state.focusModeEnabled = layout.focusModeEnabled;
+      } else if (typeof layout.focusMode === 'boolean') {
+        state.focusModeEnabled = layout.focusMode;
+      }
+      if (Number.isFinite(Number(layout.focusModeDepth))) {
+        state.focusModeDepth = Math.max(0, Math.floor(Number(layout.focusModeDepth)));
+      }
+      if (focusModeToggle) {
+        focusModeToggle.checked = state.focusModeEnabled;
+      }
+
+      if (layout.viewBox && typeof layout.viewBox === 'string') {
+        architectureSvg.setAttribute('viewBox', layout.viewBox);
+        const parsed = parseViewBox(layout.viewBox);
+        if (typeof layout.autoViewBox === 'boolean') {
+          state.autoViewBox = layout.autoViewBox;
+        } else {
+          state.autoViewBox = isDefaultViewBox(parsed);
+        }
+      }
+      const bounds = canvasBounds();
+      if (state.autoViewBox) {
+        syncCanvasViewBoxToWidth();
+      } else {
+        applyCanvasStyleWidth(bounds);
+      }
+      if (state.selectedIds.size) {
+        updateSelectionVisuals();
+      } else {
+        drawEdges();
+      }
+      return true;
+    }
+
+    function loadPersistedLayout() {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      try {
+        applyLayout(JSON.parse(raw));
+      } catch (_err) {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    }
+
+    function resetLayout() {
+      defaultNodes.forEach((original) => {
+        const node = state.nodes.get(original.id);
+        if (!node) return;
+        node.x = original.x;
+        node.y = original.y;
+        if (node.element) node.element.setAttribute('transform', `translate(${node.x} ${node.y})`);
+      });
+      state.regions.forEach((region, id) => {
+        const def = defaultRegions.find((item) => item.id === id);
+        if (!def) return;
+        region.x = def.x;
+        region.y = def.y;
+        region.w = def.w;
+        region.h = def.h;
+        updateRegionElement(region);
+      });
+      architectureSvg.setAttribute('viewBox', `${BASE_VIEWBOX.x} ${BASE_VIEWBOX.y} ${BASE_VIEWBOX.w} ${BASE_VIEWBOX.h}`);
+      state.autoViewBox = false;
+      state.focusModeEnabled = true;
+      state.focusModeDepth = 2;
+      if (focusModeToggle) {
+        focusModeToggle.checked = true;
+      }
+      applyCanvasStyleWidth(BASE_VIEWBOX);
+      localStorage.removeItem(STORAGE_KEY);
+      drawEdges();
+      layoutJson.value = '';
+    }
+
+    function fitToView() {
+      const visible = Array.from(state.nodes.values()).filter(nodeVisible);
+      if (!visible.length) return;
+      const minX = Math.min(...visible.map((node) => node.x)) - 90;
+      const minY = Math.min(...visible.map((node) => node.y)) - 90;
+      const maxX = Math.max(...visible.map((node) => node.x + node.w)) + 90;
+      const maxY = Math.max(...visible.map((node) => node.y + node.h)) + 90;
+      state.autoViewBox = false;
+      architectureSvg.setAttribute('viewBox', `${minX} ${minY} ${maxX - minX} ${maxY - minY}`);
+      applyCanvasStyleWidth(canvasBounds());
+      persistLayout();
+    }
+
+    function setCanvasWidthFromInput() {
+      if (!canvasWidthInput) return;
+      const raw = canvasWidthInput.value;
+      setCanvasWidth(raw, { auto: false, persist: true });
+    }
+
+    function setAutoCanvas() {
+      state.autoViewBox = true;
+      syncCanvasViewBoxToWidth();
+      if (canvasWidthInput) {
+        const vb = canvasBounds();
+        canvasWidthInput.value = String(Math.round(vb.w));
+      }
+      persistLayout();
+    }
+
+    function exportLayout() {
+      layoutJson.value = JSON.stringify(currentLayout(), null, 2);
+      layoutJson.focus();
+      layoutJson.select();
+    }
+
+    function saveLayoutFile() {
+      const payload = currentLayout();
+      const content = JSON.stringify(payload, null, 2);
+      const file = new Blob([content], { type: 'application/json' });
+      const href = URL.createObjectURL(file);
+      const filename = `ollmo-state-substrate-layout-${Date.now()}.json`;
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(href);
+      layoutJson.value = content;
+      layoutJson.focus();
+    }
+
+    function importLayoutFile(event) {
+      const input = event.currentTarget;
+      const selectedFile = input.files && input.files[0];
+      if (!selectedFile) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result !== 'string') {
+          layoutJson.value = 'Import failed: file is not text';
+          return;
+        }
+        layoutJson.value = reader.result;
+        importLayout();
+        input.value = '';
+      };
+      reader.onerror = () => {
+        layoutJson.value = 'Import failed: unable to read file';
+        input.value = '';
+      };
+      reader.readAsText(selectedFile);
+    }
+
+    function importLayout() {
+      try {
+        const layout = JSON.parse(layoutJson.value);
+        if (!applyLayout(layout)) throw new Error('Invalid layout');
+        persistLayout();
+      } catch (error) {
+        layoutJson.value = `Import failed: ${error.message}`;
+      }
+    }
+
+    function render() {
+      state.regions.forEach((region) => drawRegion(region));
+      defaultNodes.forEach((node) => drawNode(state.nodes.get(node.id)));
+      loadPersistedLayout();
+      if (state.autoViewBox) syncCanvasViewBoxToWidth();
+      applyLayerVisibility();
+    }
+
+    let resizeRaf = null;
+    function onResize() {
+      if (resizeRaf !== null) cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        if (state.autoViewBox) syncCanvasViewBoxToWidth();
+      });
+    }
+
+    controls.forEach((control) => control.addEventListener('change', () => {
+      applyLayerVisibility();
+      persistLayout();
+    }));
+
+    focusModeToggle?.addEventListener('change', () => {
+      state.focusModeEnabled = Boolean(focusModeToggle?.checked);
+      if (state.selectedIds.size) {
+        updateSelectionVisuals();
+      } else {
+        state.nodes.forEach((item) => {
+          if (item.element) item.element.classList.remove('dim');
+        });
+        drawEdges();
+      }
+      persistLayout();
+    });
+
+    architectureSvg.addEventListener('pointermove', moveDrag);
+    architectureSvg.addEventListener('pointermove', moveRegionDrag);
+    architectureSvg.addEventListener('pointerup', endDrag);
+    architectureSvg.addEventListener('pointerup', endRegionDrag);
+    architectureSvg.addEventListener('pointercancel', endDrag);
+    architectureSvg.addEventListener('pointercancel', endRegionDrag);
+    architectureSvg.addEventListener('click', (event) => {
+      const clickedNode = event.target.closest?.('[data-node-id]');
+      if (clickedNode) {
+        return;
+      }
+      clearSelection();
+    });
+
+    document.getElementById('showAll').addEventListener('click', () => {
+      controls.forEach((control) => { control.checked = true; });
+      applyLayerVisibility();
+    });
+
+    document.getElementById('focusCore').addEventListener('click', () => {
+      controls.forEach((control) => {
+        control.checked = ['service', 'ghost', 'mutable', 'runtime', 'evidence', 'closure', 'durable'].includes(control.dataset.layer);
+      });
+      applyLayerVisibility();
+    });
+
+    document.getElementById('resetLayout').addEventListener('click', resetLayout);
+    document.getElementById('fitToView').addEventListener('click', fitToView);
+    document.getElementById('exportLayout').addEventListener('click', exportLayout);
+    importLayoutButton?.addEventListener('click', () => {
+      if ((layoutJson.value || '').trim()) {
+        importLayout();
+        return;
+      }
+      layoutFileInput?.click();
+    });
+    saveLayoutFileButton?.addEventListener('click', saveLayoutFile);
+    layoutFileInput?.addEventListener('change', importLayoutFile);
+    setCanvasWidthButton?.addEventListener('click', setCanvasWidthFromInput);
+    autoCanvasWidthButton?.addEventListener('click', setAutoCanvas);
+    canvasWidthInput?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        setCanvasWidthFromInput();
+      }
+    });
+    window.addEventListener('resize', onResize);
+
+    render();
+  </script>
+</body>
+</html>

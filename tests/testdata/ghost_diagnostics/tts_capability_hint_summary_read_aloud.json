@@ -1,0 +1,16 @@
+{
+  "case_id": "tts_capability_hint_summary_read_aloud",
+  "prompt": "Summarize the latest OCR result and read it aloud in a calm voice.",
+  "expected_capability": "text_to_speech",
+  "meta": {
+    "capability_hint": "text_to_speech",
+    "developer_flags": {
+      "embedding_signals_enabled": true,
+      "planner_timeout_ms": 12000
+    }
+  },
+  "expected_route_metadata": {
+    "request_meta.capability_hint": "text_to_speech",
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  }
+}

@@ -1,0 +1,8 @@
+Requests
+Flask
+Flask-Cors
+urllib3<2
+pyyaml
+pydantic
+pypdf
+pytest

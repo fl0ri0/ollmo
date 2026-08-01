@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#111315">
+    <meta name="description" content="Ollmo turns local AI work into inspectable artifacts and continuable runtime state across Ollama, MLX, and llama.cpp.">
+    <title>Ollmo – Where local AI becomes durable work</title>
+    <link rel="stylesheet" href="./landing.css">
+    <script defer src="./landing.js"></script>
+</head>
+<body data-page="ollmo-landing">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <main id="main" tabindex="-1">
+        <section id="intro" class="hero scene" aria-labelledby="hero-title" tabindex="-1">
+            <div class="ghost-stage" aria-hidden="true">
+                <div class="ghost-aura"></div>
+                <span class="landing-ghost">
+                    <svg class="landing-ghost__icon" viewBox="0 0 256 256" focusable="false">
+                        <defs>
+                            <path id="landing-ghost-shape" d="M128,24a96.11,96.11,0,0,0-96,96v96a8,8,0,0,0,13.07,6.19l24.26-19.85L93.6,222.19a8,8,0,0,0,10.13,0L128,202.34l24.27,19.85a8,8,0,0,0,10.13,0l24.27-19.85,24.26,19.85A8,8,0,0,0,224,216V120A96.11,96.11,0,0,0,128,24Z"></path>
+                            <clipPath id="landing-ghost-body-clip" clipPathUnits="userSpaceOnUse">
+                                <use href="#landing-ghost-shape"></use>
+                            </clipPath>
+                            <mask id="landing-ghost-body-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256">
+                                <rect width="256" height="256" fill="#ffffff"></rect>
+                                <g class="landing-ghost__eye-cutouts" fill="#000000">
+                                    <circle cx="100" cy="128" r="12"></circle>
+                                    <circle cx="156" cy="128" r="12"></circle>
+                                </g>
+                            </mask>
+                        </defs>
+                        <use class="landing-ghost__outline" href="#landing-ghost-shape" fill="none" stroke="#baff8a" clip-path="url(#landing-ghost-body-clip)"></use>
+                        <use class="landing-ghost__body" href="#landing-ghost-shape" fill="#baff8a" mask="url(#landing-ghost-body-mask)"></use>
+                    </svg>
+                </span>
+                <span class="ghost-shadow"></span>
+            </div>
+
+            <div class="hero-copy">
+                <p class="eyebrow">Ollmo</p>
+                <h1 id="hero-title">Where local AI becomes durable work.</h1>
+                <p class="lede">
+                    Ollmo is a state-native runtime for local AI. A model can say
+                    “done”; Ollmo records what the runtime can prove happened: which outputs exist,
+                    which work remains open, and why. Runtime results become
+                    inspectable artifacts and continuable runtime state.
+                </p>
+                <p class="local-note">
+                    Local by default. Use compatible models through Ollama, MLX, or
+                    llama.cpp. Backend packages and model weights are installed
+                    separately.
+                </p>
+            </div>
+
+        </section>
+
+        <section id="principles" class="beyond__overview scene" aria-labelledby="principles-title" tabindex="-1">
+                <div class="section-heading">
+                    <p class="eyebrow">Inside a durable response</p>
+                    <div class="section-heading__copy">
+                        <h2 id="principles-title">A response is more than an answer.</h2>
+                        <p>An Ollmo response can hold the current intent, a graph of connected work, the evidence behind each branch, the outputs that actually exist, and what remains open. The visible reply is only one view of that state.</p>
+                    </div>
+                </div>
+                <div class="principles-grid">
+                    <article class="principle-card">
+                        <span class="principle-card__icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M4 4h16l-6 7.5V18l-4 2v-8.5L4 4Z"></path>
+                            </svg>
+                        </span>
+                        <h3>Promotion turns possibility into obligation.</h3>
+                        <p>Intent opens a possibility space. Only relevant work is promoted into explicit obligations; what was merely considered can remain “checked, not bound.”</p>
+                    </article>
+                    <article class="principle-card">
+                        <span class="principle-card__icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <circle cx="5" cy="12" r="2"></circle>
+                                <circle cx="19" cy="6" r="2"></circle>
+                                <circle cx="19" cy="18" r="2"></circle>
+                                <path d="M7 12h3.5c3.25 0 3.25-6 6.5-6M10.5 12c3.25 0 3.25 6 6.5 6"></path>
+                            </svg>
+                        </span>
+                        <h3>Work becomes a graph.</h3>
+                        <p>Required outputs, branches, dependencies, artifacts, and open state stay connected instead of being flattened into one stream of prose.</p>
+                    </article>
+                    <article class="principle-card">
+                        <span class="principle-card__icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+                                <path d="m8 12 2.5 2.5L16 9"></path>
+                            </svg>
+                        </span>
+                        <h3>State becomes a response frame.</h3>
+                        <p>At a recorded boundary, Ollmo preserves what is fulfilled, blocked, or still open. Runtime evidence is reviewed before the frame can honestly report completion.</p>
+                    </article>
+                </div>
+        </section>
+
+        <section id="proof" class="proof beyond__proof scene" aria-labelledby="proof-title" tabindex="-1">
+                <div class="proof-copy">
+                    <p class="eyebrow">One response, opened up</p>
+                    <h2 id="proof-title">One request becomes connected work.</h2>
+                    <p>Ask for one webpage with three different local images. Ollmo can represent that request as four required artifacts linked by dependencies instead of flattening it into a single answer.</p>
+                    <p class="proof-axiom">Completion still has to be earned. An image prompt is not an image. A code block is not a saved webpage. A placeholder link is not a finished result.</p>
+                </div>
+
+                <div class="proof-example" aria-label="Example of Ollmo tracking a webpage with three different local images">
+                    <div class="proof-request">
+                        <span>Request</span>
+                        <p>“Create a webpage with three different local images.”</p>
+                    </div>
+                    <ol class="proof-flow">
+                        <li>
+                            <span class="proof-flow__index">1</span>
+                            <div>
+                                <strong>Shape the graph.</strong>
+                                <p>One webpage branch, three local image branches, and the dependencies needed to bind their saved paths.</p>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="proof-flow__index">2</span>
+                            <div>
+                                <strong>Materialize the evidence.</strong>
+                                <p>Each branch produces a concrete saved artifact or remains visibly open with a reason.</p>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="proof-flow__index">3</span>
+                            <div>
+                                <strong>Review and freeze.</strong>
+                                <p>Ollmo checks each required output and link against runtime evidence and, where needed, reviews whether the finished set still fits the current intent before the frame can report fulfillment.</p>
+                            </div>
+                        </li>
+                    </ol>
+                    <div class="proof-outcomes">
+                        <div class="proof-outcome proof-outcome--done">
+                            <span>Fulfilled</span>
+                            <strong class="proof-outcome__claim">The reply summarizes the moment. The response preserves the work.</strong>
+                            <p>All four artifacts satisfy their branch contracts, exist as saved outputs, and their links resolve.</p>
+                        </div>
+                    </div>
+                </div>
+        </section>
+
+        <section id="about" class="today scene" aria-labelledby="today-title" tabindex="-1">
+            <div class="section-heading">
+                <p class="eyebrow">The runtime underneath</p>
+                <div class="section-heading__copy">
+                    <h2 id="today-title">Ollmo gives every<br>response a body.</h2>
+                    <p>Ollmo connects compatible local backends, supported media capabilities, durable artifacts, and canonical Responses endpoints so work can be executed, inspected, and continued.</p>
+                </div>
+            </div>
+            <div class="principles-grid principles-grid--today">
+                <article class="principle-card principle-card--compact">
+                    <span class="principle-card__icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" focusable="false">
+                            <path d="m12 3 9 4.5-9 4.5-9-4.5L12 3Z"></path>
+                            <path d="m3 12 9 4.5 9-4.5M3 16.5 12 21l9-4.5"></path>
+                        </svg>
+                    </span>
+                    <h3>Run compatible local models.</h3>
+                    <p>Run Ollama, MLX, and llama.cpp side by side from one control plane – including multiple instances of the same model. Pull compatible models, add Hugging Face repositories or local GGUF files, remove local copies, and start or stop each instance independently.</p>
+                </article>
+                <article class="principle-card principle-card--compact">
+                    <span class="principle-card__icon" aria-hidden="true">
+                        <svg class="principle-card__icon-gear" viewBox="0 0 24 24" focusable="false">
+                            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                    </span>
+                    <h3>Turn branches into outputs.</h3>
+                    <p>Route text and image generation, voice input and transcription, text-to-speech, vision, and OCR work to compatible local capabilities, then keep saved results as previewable artifacts.</p>
+                </article>
+                <article class="principle-card principle-card--compact">
+                    <span class="principle-card__icon" aria-hidden="true">
+                        <svg class="principle-card__icon-paperclip" viewBox="0 0 24 24" focusable="false">
+                            <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                        </svg>
+                    </span>
+                    <h3>Carry the work forward.</h3>
+                    <p>Inspect outputs and response state, open compatible link-checked bundles, revisit saved work, or connect through canonical Responses endpoints.</p>
+                </article>
+            </div>
+            <p class="provider-note"><strong>Third-party providers.</strong> Ollmo can optionally use an explicitly enabled third-party provider (currently ChatGPT), directly or through Ollmo's routing. For those turns, the current prompt, only the context Ollmo promotes as relevant, and any explicitly selected files or Ollmo artifacts leave your device and are processed by that provider – by OpenAI for the current ChatGPT integration. Ollmo also offers an optional companion skill that helps ChatGPT inspect runtime truth, work with canonical outputs, and execute requests through Ollmo. Local operation does not depend on either.</p>
+        </section>
+
+        <section id="setup" class="setup-scene scene" aria-labelledby="install-title" tabindex="-1">
+            <div class="install-copy">
+                <p class="eyebrow">Local setup</p>
+                <h2 id="install-title">Start Ollmo with a local model.</h2>
+                <p class="install-lede">Ollmo itself can start before a backend or model is available. Local inference needs one supported runtime and at least one compatible model; neither the runtime nor its model weights are bundled.</p>
+                <p class="install-meta">Ollmo 0.1.0 is an experimental release candidate, tested on macOS on Apple Silicon with Python 3.11 or newer. Output quality and factual accuracy still depend on the models and providers you choose.</p>
+            </div>
+
+            <div class="setup-path" aria-label="Local Ollmo setup">
+                <article class="setup-step">
+                    <span>Backend</span>
+                    <h3>Choose a local runtime.</h3>
+                    <p>Install Ollama, MLX, or llama.cpp using that project's own setup.</p>
+                </article>
+                <article class="setup-step">
+                    <span>Model</span>
+                    <h3>Add a compatible model.</h3>
+                    <p>Add or select at least one model the chosen runtime can actually run. After Ollmo starts, its Models view can manage compatible models and instances.</p>
+                </article>
+                <article class="setup-step setup-step--launch">
+                    <div class="setup-step__copy">
+                        <span>Ollmo</span>
+                        <h3>Start the control plane.</h3>
+                        <p>From the repository checkout, create the Python environment, install the requirements, and launch Ollmo.</p>
+                    </div>
+                    <div class="install-terminal">
+                        <div class="install-terminal__bar">
+                            <span class="install-terminal__label">Terminal</span>
+                            <div class="install-terminal__actions">
+                                <span class="install-copy-status" role="status" aria-live="polite" aria-atomic="true"></span>
+                                <button class="install-copy-button" type="button" data-copy-target="install-commands" aria-label="Copy the Ollmo installation commands" title="Copy the Ollmo installation commands">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                        <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+                                        <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"></path>
+                                    </svg>
+                                    <span class="install-copy-button__label" aria-hidden="true">Copy</span>
+                                </button>
+                            </div>
+                        </div>
+                        <pre id="install-commands" class="install-commands" aria-label="Ollmo installation commands"><code>python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+./ollmo start</code></pre>
+                    </div>
+                </article>
+            </div>
+
+            <a class="repo-link" href="https://github.com/fl0ri0/ollmo" target="_blank" rel="noreferrer">
+                <span>View Ollmo on GitHub</span>
+                <span aria-hidden="true">↗</span>
+            </a>
+        </section>
+    </main>
+
+    <nav class="scene-nav" aria-label="Page sections">
+        <a class="scene-nav__marker" href="#intro" aria-label="Ollmo introduction" aria-controls="intro">
+            <span aria-hidden="true"></span>
+        </a>
+        <a class="scene-nav__marker" href="#principles" aria-label="Inside a durable response" aria-controls="principles">
+            <span aria-hidden="true"></span>
+        </a>
+        <a class="scene-nav__marker" href="#proof" aria-label="One response, opened up" aria-controls="proof">
+            <span aria-hidden="true"></span>
+        </a>
+        <a class="scene-nav__marker" href="#about" aria-label="The runtime underneath" aria-controls="about">
+            <span aria-hidden="true"></span>
+        </a>
+        <a class="scene-nav__marker" href="#setup" aria-label="Local setup" aria-controls="setup">
+            <span aria-hidden="true"></span>
+        </a>
+        <span class="scene-nav__status visually-hidden" role="status" aria-live="polite" aria-atomic="true">Section 1 of 5</span>
+    </nav>
+</body>
+</html>

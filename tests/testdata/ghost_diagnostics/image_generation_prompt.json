@@ -1,0 +1,8 @@
+{
+  "case_id": "image_generation_prompt",
+  "prompt": "Generate an image of a storm over a neon harbor at night.",
+  "expected_capability": "image_generation",
+  "expected_route_metadata": {
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  }
+}

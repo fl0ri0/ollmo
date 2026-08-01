@@ -1,0 +1,14 @@
+{
+  "case_id": "vision_analysis_image",
+  "prompt": "Describe what you see in this screenshot.",
+  "attachments": [
+    {
+      "type": "image",
+      "path": "/tmp/example.png"
+    }
+  ],
+  "expected_capability": "vision_analysis",
+  "expected_route_metadata": {
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  }
+}

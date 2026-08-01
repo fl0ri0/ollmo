@@ -1,0 +1,14 @@
+{
+  "case_id": "speech_to_text_audio",
+  "prompt": "Transcribe this recording.",
+  "attachments": [
+    {
+      "type": "audio",
+      "path": "/tmp/example.wav"
+    }
+  ],
+  "expected_capability": "speech_to_text",
+  "expected_route_metadata": {
+    "runtime.developer_diagnostics.routing_contract": "ghost_primary"
+  }
+}
