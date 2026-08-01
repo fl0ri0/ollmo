@@ -71,6 +71,7 @@ PUBLIC_DOCS = frozenset(
         'RESPONSES_CONTRACT.md',
         'TESTING_PROTOCOL.md',
         'TRUTH_SOURCES.md',
+        'VISION_ALIGNMENT.md',
     }
 )
 CURRENT_DIAGRAMS = frozenset(
@@ -80,6 +81,9 @@ CURRENT_DIAGRAMS = frozenset(
 )
 CURRENT_DIAGRAM_PATHS = frozenset(
     Path('docs/diagrams') / name for name in CURRENT_DIAGRAMS
+)
+PUBLIC_DOC_PATHS = frozenset(
+    {Path('docs') / name for name in PUBLIC_DOCS} | set(CURRENT_DIAGRAM_PATHS)
 )
 RELEASE_SKILL_FILES = frozenset(
     {
@@ -175,6 +179,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         Path('THIRD_PARTY_NOTICES.md'),
         Path('docs/KNOWN_LIMITATIONS.md'),
         Path('docs/RELEASE_SCOPE.md'),
+        Path('docs/VISION_ALIGNMENT.md'),
         Path('ollmo'),
         Path('ollmo_core/version.py'),
         Path('ollmo_webUI.html'),
@@ -551,6 +556,15 @@ def validate_release_tree(
         ):
             raise ReleaseArchiveError(
                 'Release tree contains a non-current diagram: '
+                f'{relative_path.as_posix()}'
+            )
+        if (
+            not path.is_dir()
+            and relative_path.parts[0] == 'docs'
+            and relative_path not in PUBLIC_DOC_PATHS
+        ):
+            raise ReleaseArchiveError(
+                'Release tree contains a non-public documentation path: '
                 f'{relative_path.as_posix()}'
             )
         if path.is_dir():

@@ -63,6 +63,7 @@ boundary.
 
 Useful public context:
 
+- [Vision Alignment](docs/VISION_ALIGNMENT.md)
 - [State Substrate Architecture](docs/diagrams/ollmo-state-substrate-architecture.html)
 - [Project Participation and Capacity](CONTRIBUTING.md)
 
@@ -238,6 +239,7 @@ Reference docs:
 - [Canonical Glossary](docs/CANONICAL_GLOSSARY.md)
 - [Canonical Stack](docs/CANONICAL_STACK.md)
 - [Principles](docs/PRINCIPLES.md)
+- [Vision Alignment](docs/VISION_ALIGNMENT.md)
 - [Patterns](docs/PATTERNS.md)
 - [Architecture Map](docs/ARCHITECTURE_MAP.md)
 - [Ghost Runtime Policy](GHOST.md)

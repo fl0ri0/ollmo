@@ -1,6 +1,7 @@
 # PRINCIPLES
 
-See also `docs/TRUTH_SOURCES.md` for the operational truth-source hierarchy.
+See also `docs/VISION_ALIGNMENT.md` for the conceptual north star and
+`docs/TRUTH_SOURCES.md` for the operational truth-source hierarchy.
 
 ## 1. Runtime owns truth
 

@@ -91,7 +91,7 @@ def _make_release_source(tmp_path: Path) -> Path:
     )
     _write(
         source / 'docs' / 'VISION_ALIGNMENT.md',
-        '# Internal vision alignment: excluded\n',
+        '# Vision alignment\n\nPublic conceptual architecture.\n',
     )
     _write(
         source / 'ollmo_core' / 'version.py',
@@ -249,7 +249,7 @@ def test_build_stages_only_allowlisted_clean_release_files(tmp_path: Path) -> No
     assert not (staged_root / 'docs' / 'LEGACY_ORCHESTRATION.md').exists()
     assert not (staged_root / 'docs' / 'PRODUCT_DIRECTION.md').exists()
     assert not (staged_root / 'docs' / 'RELEASE_CHECK_0.1.0.md').exists()
-    assert not (staged_root / 'docs' / 'VISION_ALIGNMENT.md').exists()
+    assert (staged_root / 'docs' / 'VISION_ALIGNMENT.md').is_file()
     assert not (staged_root / 'docs' / 'WEB_FRAMEWORK_DECISION.md').exists()
     staged_diagrams = {
         path.relative_to(staged_root)
@@ -318,6 +318,7 @@ def test_manifest_exactly_covers_release_files_and_hashes(tmp_path: Path) -> Non
         if path.is_file() and path.name != release.MANIFEST_NAME
     }
     assert set(records) == actual
+    assert Path('docs/VISION_ALIGNMENT.md') in records
     assert all(
         release.sha256_file(staged_root / relative_path) == digest
         for relative_path, digest in records.items()
@@ -335,6 +336,17 @@ def test_each_release_ollmo_skill_file_is_required(
 ) -> None:
     source = _make_release_source(tmp_path)
     (source / relative_path).unlink()
+
+    with pytest.raises(release.ReleaseArchiveError, match='missing'):
+        release.build_release_archive(
+            source_root=source,
+            output_dir=tmp_path / 'dist',
+        )
+
+
+def test_vision_alignment_is_required(tmp_path: Path) -> None:
+    source = _make_release_source(tmp_path)
+    (source / 'docs' / 'VISION_ALIGNMENT.md').unlink()
 
     with pytest.raises(release.ReleaseArchiveError, match='missing'):
         release.build_release_archive(
@@ -407,6 +419,31 @@ def test_verify_only_rejects_non_current_diagram(tmp_path: Path) -> None:
     release.write_deterministic_archive(staged_root, archive_path)
 
     with pytest.raises(release.ReleaseArchiveError, match='non-current diagram'):
+        release.verify_archive(archive_path)
+
+
+def test_verify_only_rejects_non_public_documentation_path(
+    tmp_path: Path,
+) -> None:
+    source = _make_release_source(tmp_path)
+    result = release.build_release_archive(
+        source_root=source,
+        output_dir=tmp_path / 'dist',
+    )
+    staged_root = Path(str(result['staging_root']))
+    (staged_root / release.MANIFEST_NAME).unlink()
+    _write(
+        staged_root / 'docs' / 'PRODUCT_DIRECTION.md',
+        '# Private product direction: forbidden in release\n',
+    )
+    release.write_manifest(staged_root)
+    archive_path = tmp_path / 'non-public-documentation.tar.gz'
+    release.write_deterministic_archive(staged_root, archive_path)
+
+    with pytest.raises(
+        release.ReleaseArchiveError,
+        match='non-public documentation path',
+    ):
         release.verify_archive(archive_path)
 
 

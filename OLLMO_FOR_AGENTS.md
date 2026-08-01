@@ -13,7 +13,7 @@ Resolve the active checkout from the current working directory or an explicit
 the operator explicitly promotes one to the active workspace. Historical
 plans can describe superseded intermediate paths and are not edit targets.
 
-For practical repo navigation, start with [Core Contracts](docs/CORE_CONTRACTS.md), [Canonical Stack](docs/CANONICAL_STACK.md), [Principles](docs/PRINCIPLES.md), [Patterns](docs/PATTERNS.md), [Control Knobs](docs/CONTROL_KNOBS.md), [Ghost Runtime Policy](GHOST.md), and [Ghost Router](docs/GHOST_ROUTER.md). Use [Architecture Map](docs/ARCHITECTURE_MAP.md) for code ownership and repo navigation.
+For practical repo navigation, start with [Vision Alignment](docs/VISION_ALIGNMENT.md), [Core Contracts](docs/CORE_CONTRACTS.md), [Canonical Stack](docs/CANONICAL_STACK.md), [Principles](docs/PRINCIPLES.md), [Patterns](docs/PATTERNS.md), [Control Knobs](docs/CONTROL_KNOBS.md), [Ghost Runtime Policy](GHOST.md), and [Ghost Router](docs/GHOST_ROUTER.md). Use [Architecture Map](docs/ARCHITECTURE_MAP.md) for code ownership and repo navigation.
 
 Runtime-policy note:
 
