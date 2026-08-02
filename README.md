@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/ollmo-icon.svg" width="160" height="160" alt="Ollmo ghost icon">
+</p>
+
 # Ollmo
 
 Ollmo is a local-first AI runtime substrate that turns requests into truthful,

@@ -55,7 +55,7 @@ def test_landing_is_a_standalone_static_repo_page():
     html = LANDING_PATH.read_text(encoding='utf-8')
 
     assert 'data-page="ollmo-landing"' in html
-    assert 'href="./landing.css"' in html
+    assert re.search(r'href="\./landing\.css(?:\?[^\"]+)?"', html)
     assert 'src="./landing.js"' in html
     assert '{{' not in html
     assert '{%' not in html
@@ -344,7 +344,7 @@ def test_standalone_landing_has_canonical_local_preview_route():
     assert response.mimetype == 'text/html'
     html = response.get_data(as_text=True)
     assert 'data-page="ollmo-landing"' in html
-    assert 'href="./landing.css"' in html
+    assert re.search(r'href="\./landing\.css(?:\?[^\"]+)?"', html)
     assert 'src="./landing.js"' in html
     assert 'id="models-list"' not in html
 
