@@ -44,6 +44,8 @@
     --font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
     --eyebrow-title-gap: 1.1rem;
     --section-content-gap: clamp(1.75rem, 3.5vw, 2.75rem);
+    --card-grid-gap: 1.7rem;
+    --card-stack-gap: 1.5rem;
     --scene-padding: clamp(2rem, 5svh, 4.25rem);
 }
 
@@ -447,11 +449,7 @@ h1 {
 .principles-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
-    gap: 0.85rem;
-}
-
-.beyond__overview .principles-grid {
-    gap: 1.7rem;
+    gap: var(--card-grid-gap);
 }
 
 .principle-card {
@@ -548,7 +546,7 @@ h1 {
 
 .proof-example {
     display: grid;
-    gap: 1.5rem;
+    gap: var(--card-stack-gap);
     padding: 0;
     border: 0;
     border-radius: 0;
@@ -784,7 +782,7 @@ h1 {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     align-self: start;
-    gap: 0.75rem;
+    gap: var(--card-stack-gap);
 }
 
 .setup-step {
