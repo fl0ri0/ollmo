@@ -99,9 +99,7 @@ remains a compatibility alias. The separate static project page is available
 at `http://127.0.0.1:5001/site/` while Ollmo is running, or by opening
 `site/index.html` directly from the checkout. The self-contained `site/`
 directory is also the GitHub Pages publication artifact. It uses only
-relative, bundled assets and is not the live control surface. Its contents can
-be placed at the root of a dedicated Pages branch and activated manually; no
-publication workflow is included.
+relative, bundled assets and is not the live control surface.
 
 Useful lifecycle commands:
 
