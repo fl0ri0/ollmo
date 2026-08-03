@@ -12,6 +12,7 @@ from ollmo_g.intent import (
     normalize_intent_text,
 )
 from ollmo_g.image_state import image_state_anchor
+from ollmo_services.tts_source import extract_tts_source_text
 
 IMAGE_ASPECT_PRESET_DIMENSIONS = {
     '1:1': {'width': 1024, 'height': 1024},
@@ -28,9 +29,8 @@ _SQUARE_RE = re.compile(r'\b(square|quadratisch)\b', re.IGNORECASE)
 _LANDSCAPE_RE = re.compile(r'\b(landscape|wide|widescreen|cinematic|banner|horizontal)\b', re.IGNORECASE)
 _PORTRAIT_RE = re.compile(r'\b(portrait|hochformat)\b', re.IGNORECASE)
 _VERTICAL_RE = re.compile(r'\b(vertical|tall|story format|phone wallpaper)\b', re.IGNORECASE)
-_DOUBLE_QUOTE_RE = re.compile(r'"([^"]{2,})"')
-_SMART_QUOTE_RE = re.compile(r'[“„«](.{2,}?)[”»]')
-_COLON_SUFFIX_RE = re.compile(r':\s*(.+)$')
+_DOUBLE_QUOTE_RE = re.compile(r'"([^"\n]+)"')
+_SMART_QUOTE_RE = re.compile(r'[“„]([^”“\n]+)[”“]')
 _DIRECT_GERMAN_IMAGE_PREFIX_RE = re.compile(
     r'^\s*(?:male|zeichne)\s+(?:(?:mir|bitte|doch|mal|schnell)\s+){0,4}',
     re.IGNORECASE,
@@ -151,26 +151,6 @@ def _recent_user_prompt_candidates(
         if len(candidates) >= limit:
             break
     return candidates
-
-
-def _extract_spoken_content_candidate(prompt: str) -> str:
-    raw = str(prompt or '').strip()
-    if not raw:
-        return ''
-    quoted: list[str] = []
-    for pattern in (_DOUBLE_QUOTE_RE, _SMART_QUOTE_RE):
-        for match in pattern.findall(raw):
-            candidate = str(match or '').strip()
-            if candidate:
-                quoted.append(candidate)
-    if quoted:
-        return ' '.join(quoted).strip()
-    colon_match = _COLON_SUFFIX_RE.search(raw)
-    if colon_match:
-        candidate = str(colon_match.group(1) or '').strip()
-        if candidate:
-            return candidate
-    return raw
 
 
 def _detect_language_from_content(text: str) -> Optional[str]:
@@ -465,7 +445,7 @@ def infer_tts_language_from_prompt(
     languages = analysis.get('language_codes') if isinstance(analysis.get('language_codes'), list) else []
     if languages:
         return str(languages[0]).strip()
-    detected = _detect_language_from_content(_extract_spoken_content_candidate(prompt))
+    detected = _detect_language_from_content(extract_tts_source_text(prompt))
     if detected:
         return detected
     for candidate in _recent_user_prompt_candidates(prompt, context_messages):
@@ -473,7 +453,7 @@ def infer_tts_language_from_prompt(
         candidate_languages = candidate_analysis.get('language_codes') if isinstance(candidate_analysis.get('language_codes'), list) else []
         if candidate_languages:
             return str(candidate_languages[0]).strip()
-        detected = _detect_language_from_content(_extract_spoken_content_candidate(candidate))
+        detected = _detect_language_from_content(extract_tts_source_text(candidate))
         if detected:
             return detected
     return None

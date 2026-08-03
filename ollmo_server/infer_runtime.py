@@ -1107,6 +1107,9 @@ class InferRuntimeOwner:
                 image_height=image_height,
                 image_seed=image_seed,
                 text_artifact_requests=text_artifact_requests,
+                prompt_is_semantic_materializer_payload=bool(
+                    semantic_materializer_prompt
+                ),
             )
             infer_artifacts = InferArtifacts(
                 temp_path=temp_path,
@@ -1126,7 +1129,7 @@ class InferRuntimeOwner:
             )
             infer_ops = {
                 "whisper_transcribe": whisper_transcribe,
-                "mlx_audio_speech": (lambda port, _model_name, prompt, instruct=None, voice=None, response_format=None, speed=1.0, pitch=1.0, lang_code=None, timeout_sec=600: mlx_audio_speech(
+                "mlx_audio_speech": (lambda port, _model_name, prompt, instruct=None, voice=None, response_format=None, speed=1.0, pitch=1.0, lang_code=None, max_tokens=None, temperature=None, top_p=None, top_k=None, repetition_penalty=None, timeout_sec=600: mlx_audio_speech(
                     port,
                     request_model_name,
                     prompt,
@@ -1136,6 +1139,11 @@ class InferRuntimeOwner:
                     speed=speed,
                     pitch=pitch,
                     lang_code=lang_code,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                     timeout_sec=timeout_sec,
                 )),
                 "ollama_generate": ollama_generate,

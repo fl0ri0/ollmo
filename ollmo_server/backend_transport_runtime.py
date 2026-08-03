@@ -463,6 +463,11 @@ class BackendTransportRuntimeOwner:
         speed: float = 1.0,
         pitch: float = 1.0,
         lang_code: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        repetition_penalty: Optional[float] = None,
         timeout_sec: int = 600,
     ) -> dict:
         requests_module = self._hook('requests_module')
@@ -477,6 +482,11 @@ class BackendTransportRuntimeOwner:
             speed=speed,
             pitch=pitch,
             lang_code=lang_code,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
             timeout_sec=timeout_sec,
         )
 

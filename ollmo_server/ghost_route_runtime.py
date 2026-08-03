@@ -23,7 +23,10 @@ from helpers.model_capabilities import (
 from ollmo_g import build_ghost_payload
 from ollmo_g.control_hints import infer_tts_speaker_from_prompt
 from ollmo_g.semantic_role_profile import build_semantic_role_profile
-from ollmo_g.intent import analyze_prompt_intent
+from ollmo_g.intent import (
+    analyze_prompt_intent,
+    prompt_has_self_contained_direct_tts_source,
+)
 from ollmo_g.request_meta import (
     apply_request_meta_to_route_context,
     compact_request_meta,
@@ -1039,6 +1042,8 @@ class GhostRouteRuntimeOwner:
     def _prompt_needs_thread_context(self, prompt: str) -> bool:
         text = str(prompt or '').strip()
         if not text:
+            return False
+        if prompt_has_self_contained_direct_tts_source(text):
             return False
         return bool(
             _THREAD_CONTEXT_REFERENCE_RE.search(text)

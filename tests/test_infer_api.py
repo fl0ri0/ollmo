@@ -760,6 +760,11 @@ class InferApiTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["mode"], "text_to_speech")
         self.assertEqual(payload["saved_audio_path"], "/tmp/artifacts/audio/qwen3-tts.wav")
+        self.assertEqual(payload["tts_generation_budget"]["max_tokens"], 256)
+        self.assertEqual(
+            payload["tts_sampling_profile"]["policy_id"],
+            "qwen3_tts_model_native_sampling_v1",
+        )
         mock_tts.assert_called_once()
         args, kwargs = mock_tts.call_args
         self.assertEqual(args[1], "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16")
@@ -767,7 +772,12 @@ class InferApiTests(unittest.TestCase):
         self.assertEqual(kwargs["instruct"], "Warm, calm, elegant German narration.")
         self.assertEqual(kwargs["speed"], 0.95)
         self.assertEqual(kwargs["pitch"], 1.1)
-        self.assertEqual(kwargs["lang_code"], "de")
+        self.assertEqual(kwargs["lang_code"], "german")
+        self.assertEqual(kwargs["max_tokens"], 256)
+        self.assertEqual(kwargs["temperature"], 0.9)
+        self.assertEqual(kwargs["top_p"], 1.0)
+        self.assertEqual(kwargs["top_k"], 50)
+        self.assertEqual(kwargs["repetition_penalty"], 1.05)
         mock_persist_audio.assert_called_once()
         mock_activity.assert_called_once()
         mock_success.assert_called_once()

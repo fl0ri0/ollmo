@@ -1513,6 +1513,118 @@ class GhostRouterTests(unittest.TestCase):
         self.assertNotIn('memory', context)
 
     @patch('ollmo_g.router.read_chat_history')
+    def test_inline_direct_tts_is_not_an_artifact_follow_up_or_thread_reference(
+        self,
+        mock_read_chat_history,
+    ):
+        mock_read_chat_history.return_value = {
+            'instance_id': '__responses_workbench__',
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': 'Draft an unrelated sentence.',
+                    'timestamp': '2026-08-03T18:00:00Z',
+                },
+                {
+                    'role': 'assistant',
+                    'content': 'This is stale thread text.',
+                    'saved_text_path': '/tmp/stale-thread-text.md',
+                    'timestamp': '2026-08-03T18:01:00Z',
+                },
+            ],
+        }
+        prompts = (
+            (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Speak this text exactly: "At sunrise, the harbor slowly came alive."'
+            ),
+            (
+                'Erstelle genau ein deutsches Audio-Artefakt mit lokaler Sprachsynthese. '
+                'Sprich diesen Text genau: „Bei Sonnenaufgang erwachte der Hafen langsam.“'
+            ),
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                context = build_route_context(
+                    prompt=prompt,
+                    upload_filename='',
+                    file_path='',
+                    conversation_id='__responses_workbench__',
+                    messages=[{'role': 'user', 'content': prompt}],
+                    runtime_manifest={'capabilities': {}, 'instances': []},
+                    ghost_payload={'recommendations': [], 'issues': []},
+                    instances=[],
+                )
+                route = build_route_hint(context)
+                memory_scope = build_route_memory_scope(context, route_hint=route)
+
+                self.assertEqual(route['capability'], 'text_to_speech')
+                self.assertIsNone(memory_scope['prompt_class'])
+                self.assertFalse(
+                    context['runtime']['intake_context']['thread_context_requested']
+                )
+                self.assertEqual(
+                    context['runtime']['intake_context']['history_binding'],
+                    'current_turn_only',
+                )
+                self.assertEqual(context['recent_messages'], [])
+                self.assertEqual(context['recent_artifacts'], [])
+                self.assertEqual(context['latest_artifacts'], {})
+
+    def test_write_then_read_aloud_remains_chat_preparation(self):
+        prompt = 'Write a short poem about the harbor, then read it aloud.'
+        intent = analyze_prompt_intent(prompt)
+        route = build_route_hint(
+            {
+                'prompt': prompt,
+                'request_attachment': {'has_explicit_file': False, 'file_kind': None},
+                'latest_artifacts': {},
+                'memory': {},
+            }
+        )
+
+        self.assertTrue(intent['requests_audio_output'])
+        self.assertTrue(intent['text_preparation_before_audio_output'])
+        self.assertEqual(route['capability'], 'chat')
+        self.assertEqual(route['reason'], 'text preparation required before audio output')
+
+    @patch('ollmo_g.router.read_chat_history')
+    def test_ungrounded_tts_transform_remains_an_artifact_follow_up_with_context(
+        self,
+        mock_read_chat_history,
+    ):
+        prompt = 'Read this text aloud.'
+        mock_read_chat_history.return_value = {
+            'instance_id': '__responses_workbench__',
+            'messages': [
+                {'role': 'user', 'content': 'Write a short status update.'},
+                {'role': 'assistant', 'content': 'The rollout is complete.'},
+            ],
+        }
+
+        context = build_route_context(
+            prompt=prompt,
+            upload_filename='',
+            file_path='',
+            conversation_id='__responses_workbench__',
+            messages=[{'role': 'user', 'content': prompt}],
+            runtime_manifest={'capabilities': {}, 'instances': []},
+            ghost_payload={'recommendations': [], 'issues': []},
+            instances=[],
+        )
+        route = build_route_hint(context)
+        memory_scope = build_route_memory_scope(context, route_hint=route)
+
+        self.assertEqual(memory_scope['prompt_class'], 'artifact_follow_up')
+        self.assertTrue(context['runtime']['intake_context']['thread_context_requested'])
+        self.assertEqual(
+            context['runtime']['intake_context']['history_binding'],
+            'referential',
+        )
+        self.assertNotEqual(context['recent_messages'], [])
+
+    @patch('ollmo_g.router.read_chat_history')
     def test_build_route_context_preserves_fresh_root_conversation_metadata(self, mock_read_chat_history):
         mock_read_chat_history.return_value = {
             'instance_id': '__responses_workbench__--fresh',
@@ -2053,6 +2165,56 @@ class GhostContextStrategyTests(unittest.TestCase):
             [item['content'] for item in prepared],
             ['Ollmo runtime policy.', 'Explain request graphs conceptually.'],
         )
+
+    def test_inline_direct_tts_uses_current_turn_only_but_ungrounded_tts_keeps_history(self):
+        inline_prompts = (
+            (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Speak this text exactly: "At sunrise, the harbor slowly came alive."'
+            ),
+            (
+                'Erstelle genau ein deutsches Audio-Artefakt mit lokaler Sprachsynthese. '
+                'Sprich diesen Text genau: „Bei Sonnenaufgang erwachte der Hafen langsam.“'
+            ),
+        )
+
+        for prompt in inline_prompts:
+            with self.subTest(prompt=prompt):
+                messages = [
+                    {'role': 'system', 'content': 'Ollmo runtime policy.'},
+                    {'role': 'user', 'content': 'Draft an unrelated sentence.'},
+                    {'role': 'assistant', 'content': 'This is stale thread text.'},
+                    {'role': 'user', 'content': prompt},
+                ]
+                strategy = self.owner.choose_context_strategy(
+                    instance={},
+                    messages=messages,
+                    prompt=prompt,
+                    has_file_context=False,
+                )
+                prepared = self.owner.apply_context_strategy(messages, strategy)
+
+                self.assertEqual(strategy['mode'], 'current_turn_only')
+                self.assertEqual(
+                    [item['content'] for item in prepared],
+                    ['Ollmo runtime policy.', prompt],
+                )
+
+        ungrounded_prompt = 'Read this text aloud.'
+        ungrounded_messages = [
+            {'role': 'system', 'content': 'Ollmo runtime policy.'},
+            {'role': 'user', 'content': 'Draft a short status update.'},
+            {'role': 'assistant', 'content': 'The rollout is complete.'},
+            {'role': 'user', 'content': ungrounded_prompt},
+        ]
+        ungrounded_strategy = self.owner.choose_context_strategy(
+            instance={},
+            messages=ungrounded_messages,
+            prompt=ungrounded_prompt,
+            has_file_context=False,
+        )
+
+        self.assertEqual(ungrounded_strategy['mode'], 'recent_history')
 
     def test_referential_strategy_keeps_recent_history(self):
         messages = [

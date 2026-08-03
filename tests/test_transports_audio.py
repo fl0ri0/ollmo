@@ -1,13 +1,31 @@
+import io
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from typing import Optional
 
 from ollmo_core.transports import (
+    join_pcm_wav_bytes,
     ollama_generate,
     mlx_audio_speech,
     persist_audio_bytes_locally,
 )
+
+
+def _pcm_wav_bytes(samples, *, sample_rate=8000, sample_width=2):
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as output:
+        output.setnchannels(1)
+        output.setsampwidth(sample_width)
+        output.setframerate(sample_rate)
+        output.writeframes(
+            b''.join(
+                int(sample).to_bytes(sample_width, 'little', signed=True)
+                for sample in samples
+            )
+        )
+    return buffer.getvalue()
 
 
 class FakeResponse:
@@ -49,6 +67,33 @@ class FakeRequests:
 
 
 class TransportAudioTests(unittest.TestCase):
+    def test_join_pcm_wav_bytes_preserves_format_and_frame_order(self):
+        first = _pcm_wav_bytes([100, 200, 300])
+        second = _pcm_wav_bytes([-100, -200])
+
+        joined, evidence = join_pcm_wav_bytes([first, second])
+
+        with wave.open(io.BytesIO(joined), 'rb') as audio:
+            self.assertEqual(audio.getnchannels(), 1)
+            self.assertEqual(audio.getsampwidth(), 2)
+            self.assertEqual(audio.getframerate(), 8000)
+            self.assertEqual(audio.getnframes(), 5)
+            raw = audio.readframes(5)
+        samples = [
+            int.from_bytes(raw[offset:offset + 2], 'little', signed=True)
+            for offset in range(0, len(raw), 2)
+        ]
+        self.assertEqual(samples, [100, 200, 300, -100, -200])
+        self.assertEqual(evidence['chunk_frame_counts'], [3, 2])
+        self.assertEqual(evidence['total_frame_count'], 5)
+
+    def test_join_pcm_wav_bytes_rejects_incompatible_formats(self):
+        first = _pcm_wav_bytes([100, 200], sample_rate=8000)
+        second = _pcm_wav_bytes([300, 400], sample_rate=16000)
+
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            join_pcm_wav_bytes([first, second])
+
     def test_mlx_audio_speech_defaults_blank_format_to_wav(self):
         fake_requests = FakeRequests(
             FakeResponse(content=b'RIFFfakewav', headers={}),
@@ -65,10 +110,14 @@ class TransportAudioTests(unittest.TestCase):
 
         self.assertEqual(fake_requests.calls[0]['json']['response_format'], 'wav')
         self.assertNotIn('max_tokens', fake_requests.calls[0]['json'])
+        self.assertNotIn('temperature', fake_requests.calls[0]['json'])
+        self.assertNotIn('top_p', fake_requests.calls[0]['json'])
+        self.assertNotIn('top_k', fake_requests.calls[0]['json'])
+        self.assertNotIn('repetition_penalty', fake_requests.calls[0]['json'])
         self.assertEqual(result['content_type'], 'audio/wav')
         self.assertEqual(result['audio_bytes'], b'RIFFfakewav')
 
-    def test_mlx_audio_speech_allows_explicit_max_tokens_override(self):
+    def test_mlx_audio_speech_allows_explicit_qwen_generation_controls(self):
         fake_requests = FakeRequests(
             FakeResponse(content=b'RIFFfakewav', headers={}),
         )
@@ -79,11 +128,24 @@ class TransportAudioTests(unittest.TestCase):
             'Hello from Ollmo.',
             fake_requests,
             response_format='wav',
-            max_tokens=2048,
+            lang_code='auto',
+            max_tokens=624,
+            temperature=0.9,
+            top_p=1.0,
+            top_k=50,
+            repetition_penalty=1.05,
             timeout_sec=1200,
         )
 
-        self.assertEqual(fake_requests.calls[0]['json']['max_tokens'], 2048)
+        request_payload = fake_requests.calls[0]['json']
+        self.assertEqual(request_payload['lang_code'], 'auto')
+        self.assertEqual(request_payload['max_tokens'], 624)
+        self.assertEqual(request_payload['temperature'], 0.9)
+        self.assertEqual(request_payload['top_p'], 1.0)
+        self.assertEqual(request_payload['top_k'], 50)
+        self.assertEqual(request_payload['repetition_penalty'], 1.05)
+        self.assertEqual(request_payload['model'], 'mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16')
+        self.assertEqual(request_payload['input'], 'Hello from Ollmo.')
 
     def test_persist_audio_bytes_locally_uses_mp3_extension_for_mpeg_content(self):
         with tempfile.TemporaryDirectory() as tmpdir:

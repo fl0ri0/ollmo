@@ -21,6 +21,7 @@ from ollmo_webserver import (
     _RESPONSES_REQUEST_RUNTIME,
     _attach_embedding_hints_to_route_context,
     _build_deferred_follow_up_gap_for_capability,
+    _build_late_fill_retry_wave_branch,
     _build_late_fill_state,
     _build_response_lookup_payload,
     _build_response_status_lookup_payload,
@@ -43,6 +44,7 @@ from ollmo_webserver import (
     _inject_ghost_runtime_policy_into_chat_messages,
     _inject_prepare_phase_contract_into_chat_messages,
     _normalize_chat_messages_for_backend,
+    _normalize_late_fill_branches,
     _normalize_reference_mirror_input_artifacts,
     _pick_ghost_preference_instance,
     _plan_compound_execution_payload,
@@ -6938,6 +6940,95 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(audio_slot["lifecycle"], "deferred_output")
         audio_output = next(output for output in payload["outputs"] if output["type"] == "audio")
         self.assertEqual(audio_output["status"], "pending")
+        mock_schedule_late_fill.assert_called_once()
+
+    @patch("ollmo_webserver._schedule_response_late_fill", return_value=True)
+    @patch("ollmo_webserver._execute_chat_backend_request")
+    @patch("ollmo_webserver._resolve_ghost_auto_route")
+    def test_canonical_responses_direct_quoted_tts_source_is_not_rewritten_as_file_clarification(
+        self,
+        mock_resolve_ghost_route,
+        mock_execute,
+        mock_schedule_late_fill,
+    ):
+        spoken_text = "At sunrise, the harbor slowly came alive."
+        prompt = (
+            "Create exactly one English audio artifact using local text-to-speech. "
+            f'Speak this text exactly: "{spoken_text}"'
+        )
+        phase_graph = build_request_phase_graph(
+            prompt,
+            request_payload={"ghost_route": True, "prompt": prompt},
+            route_payload={"capability": "chat", "route_source": "ghost_carried"},
+        )
+        mock_resolve_ghost_route.return_value = (
+            {
+                "instance_id": "chat-1",
+                "instance": {
+                    "instance_id": "chat-1",
+                    "model": "gemma4:e4b",
+                    "backend": "ollama",
+                    "capability": "chat",
+                    "port": 11438,
+                },
+                "capability": "chat",
+                "route_source": "ghost_carried",
+                "route_reason": "direct TTS source preparation",
+                "route_confidence": 0.9,
+                "route_reuse_last_artifact": False,
+                "route_artifact_path": None,
+                "route_runtime": {"request_phase_graph": phase_graph},
+            },
+            None,
+        )
+        mock_execute.return_value = spoken_text
+
+        response = self.client.post(
+            "/api/responses",
+            json={
+                "ghost_route": True,
+                "prompt": prompt,
+                "request_meta": {"capability_hint": "text_to_speech"},
+                "response_id": "resp_direct_quoted_tts_source_not_file_reference",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["output_text"], spoken_text)
+        self.assertNotIn("source/content for the referenced file", payload["output_text"])
+        self.assertEqual(payload["late_fill"]["status"], "pending")
+        self.assertEqual(payload["late_fill"]["expected_capability"], "text_to_speech")
+        self.assertEqual(payload["late_fill"]["content_payload"], spoken_text)
+        self.assertEqual(
+            [branch["capability"] for branch in payload["late_fill"]["pending_branches"]],
+            ["text_to_speech"],
+        )
+
+        payload = self._canonical_truth_for_payload(payload)
+        graph = payload["runtime"]["request_phase_graph"]
+        self.assertEqual(graph["downstream_capabilities"], ["text_to_speech"])
+        self.assertEqual(
+            graph["downstream_branches"][0]["content_payload"],
+            spoken_text,
+        )
+        self.assertNotEqual(
+            (payload.get("runtime", {}).get("truth_guard") or {}).get("kind"),
+            "ungrounded_text_artifact_reference",
+        )
+        self.assertEqual(
+            [output["type"] for output in payload["outputs"]],
+            ["text", "audio"],
+        )
+        self.assertEqual(payload["outputs"][0]["value"], spoken_text)
+        self.assertEqual(payload["outputs"][1]["status"], "pending")
+        self.assertNotIn("image_generation", graph["downstream_capabilities"])
+        self.assertFalse(
+            any(output.get("type") == "image" for output in payload["outputs"])
+        )
+        self.assertFalse(
+            any(branch.get("capability") == "image_generation" for branch in graph["downstream_branches"])
+        )
         mock_schedule_late_fill.assert_called_once()
 
     def test_responses_lookup_rebuilds_slot_only_pending_outputs_for_replay(self):
@@ -19099,8 +19190,9 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["output_text"], substantive_text)
+        truth = self._canonical_truth_for_payload(payload)
         self.assertEqual(
-            payload["runtime"]["phase_output_acceptance"]["status"],
+            truth["runtime"]["phase_output_acceptance"]["status"],
             "unwrapped",
         )
         self.assertEqual(mock_execute.call_count, 1)
@@ -27694,6 +27786,116 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             'focused_image_prompt_slot',
         )
 
+    def test_late_fill_direct_mixed_media_payloads_survive_bad_phase_one_output(self):
+        prompt = (
+            'Create one image of a lighthouse at sunrise. Then create one English audio '
+            'artifact that says, "The lighthouse welcomes the morning."'
+        )
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'route_source': 'ghost_carried', 'capability': 'chat'},
+        )
+        current_payload = {
+            'output_text': (
+                'I need the source/content for the referenced file before I can create that artifact.'
+            ),
+            'runtime': {
+                'truth_guard': {
+                    'kind': 'ungrounded_text_artifact_reference',
+                    'status': 'clarification_required',
+                },
+                'request_phase_graph': graph,
+            },
+        }
+        branches = graph.get('downstream_branches') or []
+        self.assertEqual(
+            [branch.get('capability') for branch in branches],
+            ['image_generation', 'text_to_speech'],
+        )
+
+        specs = [
+            _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+                branch=branch,
+                artifact_gap={'trigger': 'phase_continuation'},
+                current_payload=current_payload,
+                request_payload={'ghost_route': True, 'prompt': prompt},
+                assistant_message=current_payload['output_text'],
+                source_route_payload=None,
+                failed_instance_id=None,
+            )
+            for branch in branches
+        ]
+        image_gap = specs[0]['prepare_args']['artifact_gap']
+        tts_gap = specs[1]['prepare_args']['artifact_gap']
+
+        self.assertEqual(image_gap['artifact_prompt'], 'a lighthouse at sunrise')
+        self.assertEqual(
+            image_gap['artifact_prompt_source'],
+            'current_turn_direct_image_clause',
+        )
+        self.assertEqual(
+            tts_gap['content_payload'],
+            'The lighthouse welcomes the morning.',
+        )
+        self.assertEqual(
+            tts_gap['content_payload_source'],
+            'current_turn_direct_spoken_clause',
+        )
+        for gap in (image_gap, tts_gap):
+            self.assertEqual(
+                gap['dependency_payload_policy'],
+                'preserve_current_turn_direct_media_payload',
+            )
+            self.assertNotIn('source/content for the referenced file', str(gap))
+
+    def test_late_fill_direct_audio_payload_survives_bad_phase_one_output(self):
+        prompt = (
+            'Create exactly one English audio artifact using local text-to-speech. '
+            'Speak this text exactly: "At sunrise, the harbor slowly came alive."'
+        )
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'route_source': 'ghost_carried', 'capability': 'chat'},
+        )
+        current_payload = {
+            'output_text': (
+                'I need the source/content for the referenced file before I can create that artifact.'
+            ),
+            'runtime': {'request_phase_graph': graph},
+        }
+        branches = graph.get('downstream_branches') or []
+        self.assertEqual(
+            [branch.get('capability') for branch in branches],
+            ['text_to_speech'],
+        )
+
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=branches[0],
+            artifact_gap={'trigger': 'phase_continuation'},
+            current_payload=current_payload,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            assistant_message=current_payload['output_text'],
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+        gap = spec['prepare_args']['artifact_gap']
+
+        self.assertEqual(
+            gap['content_payload'],
+            'At sunrise, the harbor slowly came alive.',
+        )
+        self.assertEqual(
+            gap['content_payload_source'],
+            'current_turn_direct_spoken_clause',
+        )
+        self.assertEqual(
+            gap['dependency_payload_policy'],
+            'preserve_current_turn_direct_media_payload',
+        )
+        self.assertNotIn('source/content for the referenced file', str(gap))
+
     def test_late_fill_branch_spec_builds_execution_contract(self):
         spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
             branch={
@@ -28470,6 +28672,16 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                             b'Light, I am.'
                         ).hexdigest(),
                     },
+                    'tts_generation_budget': {
+                        'kind': 'ollmo.tts_generation_budget',
+                        'policy_id': 'qwen3_tts_adaptive_audio_tokens_v1',
+                        'max_tokens': 192,
+                    },
+                    'tts_sampling_profile': {
+                        'kind': 'ollmo.tts_sampling_profile',
+                        'policy_id': 'qwen3_tts_explicit_sampling_v1',
+                        'temperature': 0.9,
+                    },
                     'tts_audio_integrity_evidence': (
                         _passed_tts_audio_integrity_evidence(
                             'Light, I am.',
@@ -28550,6 +28762,12 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertEqual(late_fill['status'], 'completed')
         self.assertEqual([item['capability'] for item in late_fill['fill_results']], ['speech_to_text', 'text_to_speech'])
         self.assertEqual(late_fill['fill_results'][0]['content_payload'], 'Light, I am.')
+        tts_fill = late_fill['fill_results'][1]
+        self.assertEqual(tts_fill['tts_generation_budget']['max_tokens'], 192)
+        self.assertEqual(
+            tts_fill['tts_sampling_profile']['policy_id'],
+            'qwen3_tts_explicit_sampling_v1',
+        )
         output_slots = lookup_payload['response_frame']['planning']['artifact_flow']['output_slots']
         transcript_slot = next(slot for slot in output_slots if slot.get('branch_id') == 'branch-speech_to_text-1')
         self.assertEqual(transcript_slot.get('value'), 'Light, I am.')
@@ -28828,6 +29046,428 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
 
     @patch("ollmo_webserver._execute_prepared_late_fill_branch")
     @patch("ollmo_webserver._prepare_late_fill_branch_plan")
+    def test_complete_response_late_fill_auto_retries_required_tts_on_alternative(
+        self,
+        mock_prepare_late_fill_branch_plan,
+        mock_execute_prepared_late_fill_branch,
+    ):
+        response_id = 'resp_tts_integrity_auto_retry_alternative'
+        spoken_text = 'The lighthouse welcomes every returning boat.'
+        branch = {
+            'branch_id': 'branch-text_to_speech-1',
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'status': 'pending',
+            'depends_on': ['phase-1'],
+            'content_payload': spoken_text,
+            'content_payload_source': 'current_turn_direct_spoken_clause',
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+                'fulfillment_policy': 'materialized_artifact_required',
+            },
+        }
+        phase_graph = {
+            'current_phase_id': 'phase-1',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'downstream_branch_ids': [branch['branch_id']],
+            'downstream_branches': [dict(branch)],
+            'phases': [
+                {
+                    'phase_id': 'phase-1',
+                    'capability': 'chat',
+                    'status': 'completed',
+                },
+                dict(branch),
+            ],
+        }
+        response_payload = {
+            'id': response_id,
+            'mode': 'chat',
+            'status': 'completed',
+            'output_text': spoken_text,
+            'runtime': {'request_phase_graph': phase_graph},
+            'late_fill': {
+                'status': 'pending',
+                'expected_capability': 'text_to_speech',
+                'pending_capabilities': ['text_to_speech'],
+                'pending_branches': [dict(branch)],
+            },
+        }
+        source_evidence = (
+            _LATE_FILL_RUNTIME.tts_source_evidence_from_effective_data(
+                {
+                    'content_payload': spoken_text,
+                    'content_payload_source': (
+                        'current_turn_direct_spoken_clause'
+                    ),
+                },
+                infer_payload={'prompt': spoken_text},
+                execution_contract={
+                    'branch_id': branch['branch_id'],
+                    'phase_id': branch['phase_id'],
+                    'capability': 'text_to_speech',
+                },
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rejected_path = str(Path(temp_dir) / 'rejected.wav')
+            accepted_path = str(Path(temp_dir) / 'accepted.wav')
+            Path(rejected_path).write_bytes(b'RIFF-rejected-diagnostic')
+            Path(accepted_path).write_bytes(b'RIFF-accepted-test-artifact')
+            failed_integrity = {
+                'kind': 'ollmo.tts_audio_integrity_evidence',
+                'version': 1,
+                'policy_id': TTS_AUDIO_INTEGRITY_POLICY_ID,
+                'authority': 'runtime_deterministic_audio_verification',
+                'status': 'failed',
+                'reason_code': 'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'defect_codes': [
+                    'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                    'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+                ],
+                'materialization_eligible': False,
+                'artifact_path': rejected_path,
+                'source_sha256': source_evidence[
+                    'tts_source_text_sha256'
+                ],
+            }
+            passed_integrity = _passed_tts_audio_integrity_evidence(
+                spoken_text,
+                accepted_path,
+            )
+            seen_exclusions = []
+
+            def prepare_side_effect(**kwargs):
+                excluded = list(kwargs.get('excluded_instance_ids') or [])
+                seen_exclusions.append(excluded)
+                recovered = bool(excluded)
+                instance_id = 'tts-good' if recovered else 'tts-bad'
+                return {
+                    'capability': 'text_to_speech',
+                    'branch_id': branch['branch_id'],
+                    'phase_id': branch['phase_id'],
+                    'execution_contract': kwargs['artifact_gap'].get(
+                        'execution_contract',
+                        {},
+                    ),
+                    'route_info': {
+                        'instance_id': instance_id,
+                        'capability': 'text_to_speech',
+                        'route_source': 'phase_continuation',
+                        'route_runtime': (
+                            {
+                                'selection_policy': (
+                                    'nonexcluded_alternative_for_tts_recovery'
+                                ),
+                                'excluded_instance_ids': excluded,
+                                'tts_recovery_trigger': (
+                                    'tts_auto_recovery'
+                                ),
+                                'tts_recovery_policy_id': (
+                                    'tts_bounded_materialization_recovery_v1'
+                                ),
+                            }
+                            if recovered
+                            else {}
+                        ),
+                    },
+                    'instance': {
+                        'instance_id': instance_id,
+                        'model': (
+                            'mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16'
+                            if recovered
+                            else 'mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16'
+                        ),
+                        'backend': 'mlx',
+                        'capability': 'text_to_speech',
+                    },
+                    'effective_data': {
+                        'content_payload': spoken_text,
+                        'content_payload_source': (
+                            'current_turn_direct_spoken_clause'
+                        ),
+                    },
+                    'infer_payload': {'prompt': spoken_text},
+                }
+
+            def execute_side_effect(plan):
+                recovered = plan['instance']['instance_id'] == 'tts-good'
+                path = accepted_path if recovered else rejected_path
+                return {
+                    'capability': 'text_to_speech',
+                    'branch_id': branch['branch_id'],
+                    'phase_id': branch['phase_id'],
+                    'execution_contract': plan.get('execution_contract') or {},
+                    'route_info': plan['route_info'],
+                    'instance': plan['instance'],
+                    'effective_data': plan['effective_data'],
+                    'infer_result': {
+                        'mode': 'text_to_speech',
+                        'saved_audio_path': path,
+                        'artifacts': [{'type': 'audio', 'path': path}],
+                        'tts_semantic_source': source_evidence,
+                        'tts_audio_integrity_evidence': (
+                            passed_integrity
+                            if recovered
+                            else failed_integrity
+                        ),
+                    },
+                }
+
+            mock_prepare_late_fill_branch_plan.side_effect = (
+                prepare_side_effect
+            )
+            mock_execute_prepared_late_fill_branch.side_effect = (
+                execute_side_effect
+            )
+            _complete_response_late_fill(
+                response_payload=response_payload,
+                request_payload={'prompt': spoken_text},
+                assistant_message=spoken_text,
+                artifact_gap={
+                    'trigger': 'phase_continuation',
+                    'expected_capability': 'text_to_speech',
+                    'pending_branches': [dict(branch)],
+                    'pending_capabilities': ['text_to_speech'],
+                },
+                source_route_payload={
+                    'route_runtime': {'request_phase_graph': phase_graph}
+                },
+            )
+
+            lookup_payload = _RESPONSE_LOOKUP[response_id][
+                'response_payload'
+            ]
+            late_fill = lookup_payload['late_fill']
+            self.assertEqual(seen_exclusions, [[], ['tts-bad']])
+            self.assertEqual(late_fill['status'], 'completed')
+            self.assertFalse(late_fill.get('failed_branches'))
+            self.assertEqual(
+                late_fill['fill_results'][0]['saved_audio_path'],
+                accepted_path,
+            )
+            self.assertEqual(
+                late_fill['fill_results'][0]['selection_policy'],
+                'nonexcluded_alternative_for_tts_recovery',
+            )
+            self.assertEqual(
+                late_fill['fill_results'][0]['recovery_attempt'][
+                    'maximum_attempts'
+                ],
+                2,
+            )
+            self.assertFalse(
+                any(
+                    artifact.get('path') == rejected_path
+                    for artifact in lookup_payload.get('artifacts') or []
+                    if isinstance(artifact, dict)
+                )
+            )
+            self.assertFalse(
+                any(
+                    item.get('capability') == 'image_generation'
+                    for item in late_fill.get('completed_branches') or []
+                    if isinstance(item, dict)
+                )
+            )
+
+    @patch("ollmo_webserver._execute_prepared_late_fill_branch")
+    @patch("ollmo_webserver._prepare_late_fill_branch_plan")
+    def test_complete_response_late_fill_auto_retries_required_tts_after_backend_timeout(
+        self,
+        mock_prepare_late_fill_branch_plan,
+        mock_execute_prepared_late_fill_branch,
+    ):
+        response_id = 'resp_tts_backend_timeout_auto_retry'
+        spoken_text = 'The lighthouse welcomes every returning boat.'
+        branch = {
+            'branch_id': 'branch-text_to_speech-1',
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'status': 'pending',
+            'depends_on': ['phase-1'],
+            'content_payload': spoken_text,
+            'content_payload_source': 'current_turn_direct_spoken_clause',
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+                'fulfillment_policy': 'materialized_artifact_required',
+            },
+        }
+        phase_graph = {
+            'current_phase_id': 'phase-1',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'downstream_branch_ids': [branch['branch_id']],
+            'downstream_branches': [dict(branch)],
+            'phases': [
+                {
+                    'phase_id': 'phase-1',
+                    'capability': 'chat',
+                    'status': 'completed',
+                },
+                dict(branch),
+            ],
+        }
+        response_payload = {
+            'id': response_id,
+            'mode': 'chat',
+            'status': 'completed',
+            'output_text': spoken_text,
+            'runtime': {'request_phase_graph': phase_graph},
+            'late_fill': {
+                'status': 'pending',
+                'expected_capability': 'text_to_speech',
+                'pending_capabilities': ['text_to_speech'],
+                'pending_branches': [dict(branch)],
+            },
+        }
+        source_evidence = (
+            _LATE_FILL_RUNTIME.tts_source_evidence_from_effective_data(
+                {
+                    'content_payload': spoken_text,
+                    'content_payload_source': (
+                        'current_turn_direct_spoken_clause'
+                    ),
+                },
+                infer_payload={'prompt': spoken_text},
+                execution_contract={
+                    'branch_id': branch['branch_id'],
+                    'phase_id': branch['phase_id'],
+                    'capability': 'text_to_speech',
+                },
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            accepted_path = str(Path(temp_dir) / 'accepted.wav')
+            Path(accepted_path).write_bytes(b'RIFF-accepted-test-artifact')
+            seen_exclusions = []
+
+            def prepare_side_effect(**kwargs):
+                excluded = list(kwargs.get('excluded_instance_ids') or [])
+                seen_exclusions.append(excluded)
+                recovered = bool(excluded)
+                instance_id = 'tts-good' if recovered else 'tts-timeout'
+                return {
+                    'capability': 'text_to_speech',
+                    'branch_id': branch['branch_id'],
+                    'phase_id': branch['phase_id'],
+                    'route_info': {
+                        'instance_id': instance_id,
+                        'capability': 'text_to_speech',
+                        'route_source': 'phase_continuation',
+                        'route_runtime': (
+                            {
+                                'selection_policy': (
+                                    'nonexcluded_alternative_for_tts_recovery'
+                                ),
+                                'excluded_instance_ids': excluded,
+                                'tts_recovery_trigger': 'tts_auto_recovery',
+                                'tts_recovery_policy_id': (
+                                    'tts_bounded_materialization_recovery_v1'
+                                ),
+                            }
+                            if recovered
+                            else {}
+                        ),
+                    },
+                    'instance': {
+                        'instance_id': instance_id,
+                        'model': 'deterministic-tts',
+                        'backend': 'deterministic-test-backend',
+                        'capability': 'text_to_speech',
+                    },
+                    'effective_data': {
+                        'content_payload': spoken_text,
+                        'content_payload_source': (
+                            'current_turn_direct_spoken_clause'
+                        ),
+                    },
+                    'infer_payload': {'prompt': spoken_text},
+                }
+
+            def execute_side_effect(plan):
+                if plan['instance']['instance_id'] == 'tts-timeout':
+                    raise TimeoutError('The TTS backend timed out.')
+                return {
+                    'capability': 'text_to_speech',
+                    'branch_id': branch['branch_id'],
+                    'phase_id': branch['phase_id'],
+                    'route_info': plan['route_info'],
+                    'instance': plan['instance'],
+                    'effective_data': plan['effective_data'],
+                    'infer_result': {
+                        'mode': 'text_to_speech',
+                        'saved_audio_path': accepted_path,
+                        'artifacts': [
+                            {'type': 'audio', 'path': accepted_path}
+                        ],
+                        'tts_semantic_source': source_evidence,
+                        'tts_audio_integrity_evidence': (
+                            _passed_tts_audio_integrity_evidence(
+                                spoken_text,
+                                accepted_path,
+                            )
+                        ),
+                    },
+                }
+
+            mock_prepare_late_fill_branch_plan.side_effect = (
+                prepare_side_effect
+            )
+            mock_execute_prepared_late_fill_branch.side_effect = (
+                execute_side_effect
+            )
+            _complete_response_late_fill(
+                response_payload=response_payload,
+                request_payload={'prompt': spoken_text},
+                assistant_message=spoken_text,
+                artifact_gap={
+                    'trigger': 'phase_continuation',
+                    'expected_capability': 'text_to_speech',
+                    'pending_branches': [dict(branch)],
+                    'pending_capabilities': ['text_to_speech'],
+                },
+                source_route_payload={
+                    'route_runtime': {'request_phase_graph': phase_graph}
+                },
+            )
+
+            lookup_payload = _RESPONSE_LOOKUP[response_id][
+                'response_payload'
+            ]
+            late_fill = lookup_payload['late_fill']
+            self.assertEqual(seen_exclusions, [[], ['tts-timeout']])
+            self.assertEqual(late_fill['status'], 'completed')
+            self.assertFalse(late_fill.get('failed_branches'))
+            self.assertEqual(
+                late_fill['fill_results'][0]['saved_audio_path'],
+                accepted_path,
+            )
+            self.assertEqual(
+                late_fill['fill_results'][0]['selection_policy'],
+                'nonexcluded_alternative_for_tts_recovery',
+            )
+            self.assertEqual(
+                late_fill['fill_results'][0]['recovery_attempt'][
+                    'prior_error_code'
+                ],
+                'BACKEND_TIMEOUT',
+            )
+            self.assertFalse(
+                any(
+                    item.get('capability') == 'image_generation'
+                    for item in late_fill.get('completed_branches') or []
+                    if isinstance(item, dict)
+                )
+            )
+
+    @patch("ollmo_webserver._execute_prepared_late_fill_branch")
+    @patch("ollmo_webserver._prepare_late_fill_branch_plan")
     def test_complete_response_late_fill_blocks_truncated_tts_before_fulfillment(
         self,
         mock_prepare_late_fill_branch_plan,
@@ -28859,6 +29499,10 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             'authority': 'runtime_deterministic_audio_verification',
             'status': 'failed',
             'reason_code': 'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+            'defect_codes': [
+                'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+            ],
             'materialization_eligible': False,
             'artifact_path': '/tmp/truncated-output.wav',
             'source_sha256': source_evidence['tts_source_text_sha256'],
@@ -28936,6 +29580,16 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                     }
                 ],
                 'tts_semantic_source': source_evidence,
+                'tts_generation_budget': {
+                    'kind': 'ollmo.tts_generation_budget',
+                    'policy_id': 'qwen3_tts_adaptive_audio_tokens_v1',
+                    'max_tokens': 384,
+                },
+                'tts_sampling_profile': {
+                    'kind': 'ollmo.tts_sampling_profile',
+                    'policy_id': 'qwen3_tts_explicit_sampling_v1',
+                    'temperature': 0.9,
+                },
                 'tts_audio_integrity_evidence': failed_integrity,
             },
         }
@@ -28974,6 +29628,8 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
 
         lookup_payload = _RESPONSE_LOOKUP[response_id]['response_payload']
         late_fill = lookup_payload['late_fill']
+        self.assertEqual(mock_prepare_late_fill_branch_plan.call_count, 2)
+        self.assertEqual(mock_execute_prepared_late_fill_branch.call_count, 2)
         self.assertEqual(late_fill.get('fill_results') or [], [])
         failed_branch = late_fill['failed_branches'][0]
         self.assertEqual(failed_branch['status'], 'failed')
@@ -28986,6 +29642,18 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
         )
         self.assertEqual(
+            failed_branch['error']['defect_codes'],
+            [
+                'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+            ],
+        )
+        self.assertEqual(
+            failed_branch['auto_executable_repair_retry_count'],
+            1,
+        )
+        self.assertFalse(failed_branch['recovery_state']['auto_execute'])
+        self.assertEqual(
             failed_branch['error']['diagnostic_artifact']['path'],
             '/tmp/truncated-output.wav',
         )
@@ -28994,6 +29662,14 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 'effective_active_seconds'
             ],
             6.0,
+        )
+        self.assertEqual(
+            failed_branch['error']['tts_generation_budget']['max_tokens'],
+            384,
+        )
+        self.assertEqual(
+            failed_branch['error']['tts_sampling_profile']['policy_id'],
+            'qwen3_tts_explicit_sampling_v1',
         )
         self.assertEqual(late_fill['status'], 'failed')
         self.assertEqual(
@@ -33187,6 +33863,16 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 'output_format': 'mp3',
                 'speed': 0.95,
                 'pitch': 1.05,
+                'tts_generation_budget': {
+                    'kind': 'ollmo.tts_generation_budget',
+                    'policy_id': 'qwen3_tts_adaptive_audio_tokens_v1',
+                    'max_tokens': 384,
+                },
+                'tts_sampling_profile': {
+                    'kind': 'ollmo.tts_sampling_profile',
+                    'policy_id': 'qwen3_tts_explicit_sampling_v1',
+                    'temperature': 0.9,
+                },
             },
         )
 
@@ -33198,6 +33884,11 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertEqual(merged['output_format'], 'mp3')
         self.assertEqual(merged['speed'], 0.95)
         self.assertEqual(merged['pitch'], 1.05)
+        self.assertEqual(merged['tts_generation_budget']['max_tokens'], 384)
+        self.assertEqual(
+            merged['tts_sampling_profile']['policy_id'],
+            'qwen3_tts_explicit_sampling_v1',
+        )
 
     @patch('ollmo_webserver.merge_instances_with_runtime_status')
     @patch('ollmo_webserver.load_running_instances')
@@ -33245,6 +33936,1059 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertEqual(route_info['capability'], 'image_generation')
         self.assertTrue(route_info['route_runtime']['phase_continuation']['active'])
         mock_resolve_ghost_auto_route.assert_not_called()
+
+    @staticmethod
+    def _tts_recovery_instance(instance_id):
+        return {
+            'instance_id': instance_id,
+            'model': 'mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            'backend': 'mlx',
+            'capability': 'text_to_speech',
+            'runtime_status': {'readiness': 'ready', 'activity': 'idle'},
+        }
+
+    @staticmethod
+    def _explicit_single_branch_tts_recovery_gap(failed_instance_id='tts-failed'):
+        branch_id = 'branch-text_to_speech-1'
+        return {
+            'trigger': 'execution_planner_deferred_follow_up',
+            'branch_id': branch_id,
+            'expected_capability': 'text_to_speech',
+            'active_capability': 'text_to_speech',
+            'output_type': 'audio',
+            'execution_contract': {
+                'branch_id': branch_id,
+                'capability': 'text_to_speech',
+                'output_type': 'audio',
+                'output_contract': {
+                    'output_type': 'audio',
+                    'required': True,
+                },
+            },
+            'recovery_attempt': {
+                'kind': 'ollmo.late_fill_recovery_attempt',
+                'trigger': 'explicit_retry_endpoint',
+                'branch_id': branch_id,
+                'capability': 'text_to_speech',
+                'preserve_intent': True,
+                'failed_instance_id': failed_instance_id,
+                'excluded_instance_ids': [failed_instance_id],
+            },
+            'recovery_state': {
+                'kind': 'ollmo.late_fill_recovery_state',
+                'status': 'attempting',
+                'trigger': 'explicit_retry_endpoint',
+                'branch_id': branch_id,
+                'capability': 'text_to_speech',
+                'preserve_intent': True,
+                'retry_scope': 'same_branch',
+                'suggested_action': 'retry_excluding_instance',
+                'failed_instance_id': failed_instance_id,
+                'exclude_instance_ids': [failed_instance_id],
+            },
+        }
+
+    @staticmethod
+    def _automatic_single_branch_tts_recovery_gap(
+        failed_instance_id='tts-failed',
+    ):
+        branch_id = 'branch-text_to_speech-1'
+        source_text = 'The lighthouse welcomes every returning boat.'
+        integrity_evidence = {
+            'kind': 'ollmo.tts_audio_integrity_evidence',
+            'version': 1,
+            'policy_id': TTS_AUDIO_INTEGRITY_POLICY_ID,
+            'authority': 'runtime_deterministic_audio_verification',
+            'status': 'failed',
+            'reason_code': 'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+            'defect_codes': [
+                'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+            ],
+            'materialization_eligible': False,
+            'artifact_path': '/tmp/rejected-tts.wav',
+            'source_sha256': hashlib.sha256(
+                source_text.encode('utf-8')
+            ).hexdigest(),
+        }
+        branch = {
+            'branch_id': branch_id,
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'content_payload': source_text,
+            'content_payload_source': 'current_turn_direct_spoken_clause',
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+            },
+            'execution_contract': {
+                'branch_id': branch_id,
+                'phase_id': 'phase-2',
+                'capability': 'text_to_speech',
+                'output_type': 'audio',
+                'output_contract': {
+                    'output_type': 'audio',
+                    'required': True,
+                },
+            },
+        }
+        error = _LATE_FILL_RUNTIME.normalize_late_fill_error_payload(
+            {
+                'code': 'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED',
+                'reason_code': (
+                    'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT'
+                ),
+                'defect_code': (
+                    'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT'
+                ),
+                'defect_codes': list(
+                    integrity_evidence['defect_codes']
+                ),
+                'message': 'Generated audio failed integrity verification.',
+                'stage': 'tts_audio_integrity_gate',
+                'retryable': True,
+                'repair_action': 'retry_same_branch',
+                'materialization_blocked': True,
+                'blocked_scope': 'current_tts_branch',
+                'repair_work_available': True,
+                'repair_work_policy': (
+                    'bounded_same_response_tts_integrity_retry'
+                ),
+                'needs_external_input': False,
+                'audio_integrity_evidence': integrity_evidence,
+            }
+        )
+        attempt = {
+            'stage': 'tts_audio_integrity_gate',
+            'capability': 'text_to_speech',
+            'instance_id': failed_instance_id,
+        }
+        recovery_context = _LATE_FILL_RUNTIME.late_fill_recovery_context(
+            error=error,
+            attempt=attempt,
+        )
+        recovery_state = _LATE_FILL_RUNTIME.late_fill_recovery_state(
+            branch,
+            recovery_context=recovery_context,
+            attempt=attempt,
+            status='candidate',
+            trigger='semantic_evidence_gate',
+        )
+        retry_branch = (
+            _LATE_FILL_RUNTIME.build_auto_executable_repair_retry_branch(
+                branch,
+                recovery_context=recovery_context,
+                recovery_state=recovery_state,
+                attempt=attempt,
+                trigger='tts_auto_recovery',
+            )
+        )
+        if not isinstance(retry_branch, dict):
+            raise AssertionError('TTS integrity recovery was not schedulable.')
+        retry_branch = _normalize_late_fill_branches([retry_branch])[0]
+        branch_spec = (
+            _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+                branch=retry_branch,
+                artifact_gap={
+                    'trigger': 'execution_planner_deferred_follow_up',
+                    'expected_capability': 'text_to_speech',
+                    'active_capability': 'text_to_speech',
+                    'pending_branches': [retry_branch],
+                },
+                current_payload={},
+                request_payload={
+                    'capability': 'text_to_speech',
+                    'prompt': source_text,
+                },
+                assistant_message=source_text,
+                source_route_payload=None,
+                failed_instance_id=None,
+            )
+        )
+        return branch, recovery_state, retry_branch, branch_spec['prepare_args']
+
+    def test_required_tts_integrity_failure_gets_one_bounded_auto_retry(self):
+        _branch, recovery_state, retry_branch, prepare_args = (
+            self._automatic_single_branch_tts_recovery_gap()
+        )
+
+        self.assertFalse(recovery_state['promotion_required'])
+        self.assertTrue(recovery_state['auto_execute'])
+        self.assertTrue(recovery_state['materialization_blocked'])
+        self.assertEqual(recovery_state['blocked_scope'], 'current_tts_branch')
+        self.assertEqual(
+            retry_branch['auto_executable_repair_retry_count'],
+            1,
+        )
+        self.assertEqual(
+            retry_branch['auto_executable_repair_max_attempts'],
+            2,
+        )
+        self.assertEqual(
+            retry_branch['recovery_policy_id'],
+            'tts_bounded_materialization_recovery_v1',
+        )
+        self.assertEqual(
+            retry_branch['recovery_attempt']['trigger'],
+            'tts_auto_recovery',
+        )
+        self.assertEqual(
+            retry_branch['recovery_attempt']['prior_error_code'],
+            'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED',
+        )
+        self.assertEqual(
+            retry_branch['recovery_attempt']['attempt_number'],
+            2,
+        )
+        self.assertEqual(
+            retry_branch['recovery_attempt']['maximum_attempts'],
+            2,
+        )
+        self.assertEqual(
+            retry_branch['recovery_attempt'][
+                'prior_audio_integrity_evidence'
+            ]['defect_codes'],
+            [
+                'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+            ],
+        )
+        self.assertEqual(
+            prepare_args['excluded_instance_ids'],
+            ['tts-failed'],
+        )
+
+        second_failure_context = dict(
+            retry_branch['recovery_context']
+        )
+        self.assertFalse(
+            _LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+                retry_branch,
+                recovery_context=second_failure_context,
+            )
+        )
+
+    def test_required_tts_retryable_backend_failure_gets_one_bounded_auto_retry(
+        self,
+    ):
+        branch_id = 'branch-text_to_speech-backend-retry'
+        branch = {
+            'branch_id': branch_id,
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+            },
+            'execution_contract': {
+                'branch_id': branch_id,
+                'phase_id': 'phase-2',
+                'capability': 'text_to_speech',
+                'output_type': 'audio',
+                'output_contract': {
+                    'output_type': 'audio',
+                    'required': True,
+                },
+            },
+        }
+        error = _LATE_FILL_RUNTIME.normalize_late_fill_error_payload(
+            {
+                'code': 'BACKEND_TIMEOUT',
+                'message': 'The TTS backend timed out.',
+                'stage': 'execute_prepared_branch',
+                'retryable': True,
+            }
+        )
+        attempt = {
+            'stage': 'execute_prepared_branch',
+            'capability': 'text_to_speech',
+            'instance_id': 'tts-failed',
+        }
+        recovery_context = _LATE_FILL_RUNTIME.late_fill_recovery_context(
+            error=error,
+            attempt=attempt,
+        )
+        recovery_state = _LATE_FILL_RUNTIME.late_fill_recovery_state(
+            branch,
+            recovery_context=recovery_context,
+            attempt=attempt,
+            status='candidate',
+        )
+        retry_branch = (
+            _LATE_FILL_RUNTIME.build_auto_executable_repair_retry_branch(
+                branch,
+                recovery_context=recovery_context,
+                recovery_state=recovery_state,
+                attempt=attempt,
+                trigger='late_fill_failure',
+            )
+        )
+
+        self.assertIsInstance(retry_branch, dict)
+        normalized_retry = _normalize_late_fill_branches([retry_branch])[0]
+        self.assertEqual(
+            normalized_retry['recovery_policy_id'],
+            'tts_bounded_materialization_recovery_v1',
+        )
+        self.assertEqual(
+            normalized_retry['recovery_attempt']['trigger'],
+            'tts_auto_recovery',
+        )
+        self.assertEqual(
+            normalized_retry['recovery_attempt']['prior_error_code'],
+            'BACKEND_TIMEOUT',
+        )
+        self.assertEqual(
+            normalized_retry['auto_executable_repair_retry_count'],
+            1,
+        )
+        self.assertEqual(
+            normalized_retry['auto_executable_repair_max_attempts'],
+            2,
+        )
+        self.assertEqual(
+            normalized_retry['excluded_instance_ids'],
+            ['tts-failed'],
+        )
+        self.assertFalse(
+            _LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+                normalized_retry,
+                recovery_context=recovery_context,
+            )
+        )
+
+    def test_tts_auto_recovery_rejects_optional_nonretryable_and_dependency_failures(
+        self,
+    ):
+        branch = {
+            'branch_id': 'branch-text_to_speech-bounded-scope',
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+            },
+        }
+        retryable_context = {
+            'can_retry': True,
+            'retry_scope': 'same_branch',
+            'suggested_action': 'retry_excluding_instance',
+            'preserve_intent': True,
+            'error_code': 'BACKEND_TIMEOUT',
+        }
+
+        optional_branch = {
+            **branch,
+            'optional': True,
+        }
+        self.assertFalse(
+            _LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+                optional_branch,
+                recovery_context=retryable_context,
+            )
+        )
+        self.assertFalse(
+            _LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+                branch,
+                recovery_context={
+                    **retryable_context,
+                    'can_retry': False,
+                },
+            )
+        )
+        self.assertFalse(
+            _LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+                branch,
+                recovery_context={
+                    **retryable_context,
+                    'blocked_by_dependency_input': True,
+                },
+            )
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_auto_tts_integrity_recovery_prefers_nonexcluded_alternative(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        alternative = self._tts_recovery_instance('tts-alternative')
+        instances = [failed, alternative]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+        _branch, _state, _retry, prepare_args = (
+            self._automatic_single_branch_tts_recovery_gap()
+        )
+        route_gap = _build_deferred_follow_up_gap_for_capability(
+            prepare_args['artifact_gap'],
+            capability='text_to_speech',
+            artifact_payload={},
+        )
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {
+                'capability': 'text_to_speech',
+                'prompt': 'The lighthouse welcomes every returning boat.',
+            },
+            expected_capability='text_to_speech',
+            failed_instance_id=prepare_args['failed_instance_id'],
+            excluded_instance_ids=prepare_args['excluded_instance_ids'],
+            artifact_gap=route_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-alternative')
+        route_runtime = route_info['route_runtime']
+        self.assertEqual(
+            route_runtime['selection_policy'],
+            'nonexcluded_alternative_for_tts_recovery',
+        )
+        self.assertEqual(
+            route_runtime['tts_recovery_trigger'],
+            'tts_auto_recovery',
+        )
+        failed_diagnostic = next(
+            item
+            for item in route_runtime['candidate_diagnostics']
+            if item['instance_id'] == 'tts-failed'
+        )
+        self.assertTrue(failed_diagnostic['excluded'])
+        self.assertFalse(failed_diagnostic['selected'])
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_auto_tts_integrity_recovery_reuses_only_sole_excluded_instance(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+        _branch, _state, _retry, prepare_args = (
+            self._automatic_single_branch_tts_recovery_gap()
+        )
+        route_gap = _build_deferred_follow_up_gap_for_capability(
+            prepare_args['artifact_gap'],
+            capability='text_to_speech',
+            artifact_payload={},
+        )
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {
+                'capability': 'text_to_speech',
+                'prompt': 'The lighthouse welcomes every returning boat.',
+            },
+            expected_capability='text_to_speech',
+            failed_instance_id=prepare_args['failed_instance_id'],
+            excluded_instance_ids=prepare_args['excluded_instance_ids'],
+            artifact_gap=route_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-failed')
+        route_runtime = route_info['route_runtime']
+        self.assertEqual(
+            route_runtime['selection_policy'],
+            'excluded_reuse_for_single_tts_recovery',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_reason'],
+            'bounded_auto_retry_single_compatible_tts_instance',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_recovery_trigger'],
+            'tts_auto_recovery',
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_auto_tts_no_compatible_recovery_reuses_only_live_sole_excluded_instance(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed_instance_id = 'tts-failed'
+        failed = self._tts_recovery_instance(failed_instance_id)
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+        branch_id = 'branch-text_to_speech-1'
+        branch = {
+            'branch_id': branch_id,
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'failed_instance_id': failed_instance_id,
+            'excluded_instance_ids': [failed_instance_id],
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+            },
+            'execution_contract': {
+                'branch_id': branch_id,
+                'phase_id': 'phase-2',
+                'capability': 'text_to_speech',
+                'output_type': 'audio',
+                'output_contract': {
+                    'output_type': 'audio',
+                    'required': True,
+                },
+            },
+        }
+        error = _LATE_FILL_RUNTIME.normalize_late_fill_error_payload(
+            {
+                'code': 'NO_COMPATIBLE_INSTANCE',
+                'message': (
+                    'No non-excluded compatible TTS instance remained.'
+                ),
+                'stage': 'prepare_branch_plan',
+                'retryable': True,
+            }
+        )
+        attempt = {
+            'stage': 'prepare_branch_plan',
+            'capability': 'text_to_speech',
+        }
+        recovery_context = _LATE_FILL_RUNTIME.late_fill_recovery_context(
+            error=error,
+            attempt=attempt,
+        )
+        recovery_state = _LATE_FILL_RUNTIME.late_fill_recovery_state(
+            branch,
+            recovery_context=recovery_context,
+            attempt=attempt,
+            status='candidate',
+        )
+        retry_branch = (
+            _LATE_FILL_RUNTIME.build_auto_executable_repair_retry_branch(
+                branch,
+                recovery_context=recovery_context,
+                recovery_state=recovery_state,
+                attempt=attempt,
+                trigger='late_fill_failure',
+            )
+        )
+        self.assertIsInstance(retry_branch, dict)
+        retry_branch = _normalize_late_fill_branches([retry_branch])[0]
+        branch_spec = (
+            _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+                branch=retry_branch,
+                artifact_gap={
+                    'trigger': 'execution_planner_deferred_follow_up',
+                    'expected_capability': 'text_to_speech',
+                    'active_capability': 'text_to_speech',
+                    'pending_branches': [retry_branch],
+                },
+                current_payload={},
+                request_payload={
+                    'capability': 'text_to_speech',
+                    'prompt': 'Read the harbor report aloud.',
+                },
+                assistant_message='Read the harbor report aloud.',
+                source_route_payload=None,
+                failed_instance_id=None,
+            )
+        )
+        prepare_args = branch_spec['prepare_args']
+        route_gap = _build_deferred_follow_up_gap_for_capability(
+            prepare_args['artifact_gap'],
+            capability='text_to_speech',
+            artifact_payload={},
+        )
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {
+                'capability': 'text_to_speech',
+                'prompt': 'Read the harbor report aloud.',
+            },
+            expected_capability='text_to_speech',
+            failed_instance_id=prepare_args['failed_instance_id'],
+            excluded_instance_ids=prepare_args['excluded_instance_ids'],
+            artifact_gap=route_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], failed_instance_id)
+        route_runtime = route_info['route_runtime']
+        self.assertEqual(
+            route_runtime['selection_policy'],
+            'excluded_reuse_for_single_tts_recovery',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_reason'],
+            'bounded_auto_retry_single_compatible_tts_instance',
+        )
+        self.assertEqual(
+            retry_branch['recovery_attempt']['prior_error_code'],
+            'NO_COMPATIBLE_INSTANCE',
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_resolve_late_fill_route_prefers_nonexcluded_tts_alternative(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        alternative = self._tts_recovery_instance('tts-alternative')
+        instances = [failed, alternative]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap=self._explicit_single_branch_tts_recovery_gap(),
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-alternative')
+        self.assertNotEqual(
+            route_info['route_runtime'].get('selection_policy'),
+            'excluded_reuse_for_single_tts_recovery',
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_resolve_late_fill_route_reuses_sole_excluded_tts_for_explicit_recovery(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text erneut.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap=self._explicit_single_branch_tts_recovery_gap(),
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-failed')
+        route_runtime = route_info['route_runtime']
+        self.assertEqual(
+            route_runtime['selection_policy'],
+            'excluded_reuse_for_single_tts_recovery',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_reason'],
+            'explicit_retry_single_compatible_tts_instance',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_instance_id'],
+            'tts-failed',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_recovery_trigger'],
+            'explicit_retry_endpoint',
+        )
+        selected_diagnostic = next(
+            item
+            for item in route_runtime['candidate_diagnostics']
+            if item['instance_id'] == 'tts-failed'
+        )
+        self.assertTrue(selected_diagnostic['excluded'])
+        self.assertTrue(selected_diagnostic['excluded_reuse_applied'])
+        self.assertTrue(selected_diagnostic['usable'])
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_explicit_tts_retry_reuses_sole_failed_instance_after_no_compatible_instance(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+        failed_branch = {
+            'branch_id': 'branch-text_to_speech-1',
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'output_contract': {
+                'output_type': 'audio',
+                'required': True,
+            },
+            'status': 'failed',
+            'failed_instance_id': 'tts-failed',
+            'excluded_instance_ids': ['tts-failed'],
+            'error': {
+                'code': 'NO_COMPATIBLE_INSTANCE',
+                'message': 'No non-excluded compatible TTS instance remained.',
+                'retryable': True,
+            },
+            'recovery_context': {
+                'can_retry': True,
+                'retry_scope': 'same_branch',
+                'suggested_action': 'start_compatible_instance',
+                'preserve_intent': True,
+            },
+            'recovery_state': {
+                'kind': 'ollmo.late_fill_recovery_state',
+                'status': 'candidate',
+                'trigger': 'late_fill_failure',
+                'branch_id': 'branch-text_to_speech-1',
+                'capability': 'text_to_speech',
+                'retry_scope': 'same_branch',
+                'suggested_action': 'start_compatible_instance',
+                'preserve_intent': True,
+            },
+        }
+        retry_branch, retry_state, retry_attempt, excluded = (
+            _build_late_fill_retry_wave_branch(
+                failed_branch,
+                anchor_branch_id='branch-text_to_speech-1',
+            )
+        )
+        retry_branch = _normalize_late_fill_branches([retry_branch])[0]
+        self.assertEqual(
+            retry_branch['recovery_attempt']['prior_error_code'],
+            'NO_COMPATIBLE_INSTANCE',
+        )
+        artifact_gap = {
+            'trigger': 'execution_planner_deferred_follow_up',
+            'expected_capability': 'text_to_speech',
+            'active_capability': 'text_to_speech',
+            'pending_branches': [retry_branch],
+            'active_branches': [retry_branch],
+            'recovery_state': retry_state,
+            'recovery_attempt': retry_attempt,
+        }
+        branch_spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=retry_branch,
+            artifact_gap=artifact_gap,
+            current_payload={},
+            request_payload={
+                'capability': 'text_to_speech',
+                'prompt': 'Sprich diesen Text erneut.',
+            },
+            assistant_message='Sprich diesen Text erneut.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+        prepare_args = branch_spec['prepare_args']
+        route_gap = _build_deferred_follow_up_gap_for_capability(
+            prepare_args['artifact_gap'],
+            capability='text_to_speech',
+            artifact_payload={},
+        )
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text erneut.'},
+            expected_capability='text_to_speech',
+            failed_instance_id=prepare_args['failed_instance_id'],
+            excluded_instance_ids=prepare_args['excluded_instance_ids'],
+            artifact_gap=route_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(excluded, ['tts-failed'])
+        self.assertEqual(route_info['instance_id'], 'tts-failed')
+        self.assertEqual(
+            route_info['route_runtime']['selection_policy'],
+            'excluded_reuse_for_single_tts_recovery',
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_start_compatible_tts_recovery_requires_no_compatible_provenance(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+        artifact_gap = self._explicit_single_branch_tts_recovery_gap()
+        artifact_gap['recovery_state']['suggested_action'] = (
+            'start_compatible_instance'
+        )
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text erneut.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap=artifact_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_info)
+        self.assertIn('No non-excluded running instance', route_error)
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_tts_retry_wave_spec_prefers_branch_local_recovery_markers(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+        tts_branch = {
+            'branch_id': 'branch-text_to_speech-1',
+            'phase_id': 'phase-2',
+            'capability': 'text_to_speech',
+            'output_type': 'audio',
+            'output_contract': {'output_type': 'audio', 'required': True},
+            'status': 'failed',
+            'attempt': {'instance_id': 'tts-failed'},
+            'error': {
+                'code': 'INSTANCE_UNAVAILABLE',
+                'message': 'TTS backend unavailable.',
+                'retryable': True,
+            },
+            'recovery_context': {
+                'can_retry': True,
+                'retry_scope': 'same_branch',
+                'suggested_action': 'retry_excluding_instance',
+                'preserve_intent': True,
+                'exclude_instance_ids': ['tts-failed'],
+            },
+        }
+        retry_branch, _retry_state, _retry_attempt, _excluded = (
+            _build_late_fill_retry_wave_branch(
+                tts_branch,
+                anchor_branch_id='branch-image_generation-1',
+            )
+        )
+        retry_branch = _normalize_late_fill_branches([retry_branch])[0]
+        anchor_recovery_state = {
+            'trigger': 'explicit_retry_endpoint',
+            'branch_id': 'branch-image_generation-1',
+            'capability': 'image_generation',
+            'retry_scope': 'same_branch',
+            'suggested_action': 'retry_excluding_instance',
+            'preserve_intent': True,
+        }
+        anchor_recovery_attempt = {
+            'trigger': 'explicit_retry_endpoint',
+            'branch_id': 'branch-image_generation-1',
+            'capability': 'image_generation',
+            'preserve_intent': True,
+            'failed_instance_id': 'image-failed',
+        }
+        branch_spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=retry_branch,
+            artifact_gap={
+                'trigger': 'execution_planner_deferred_follow_up',
+                'expected_capability': 'image_generation',
+                'active_capability': 'image_generation',
+                'recovery_state': anchor_recovery_state,
+                'recovery_attempt': anchor_recovery_attempt,
+            },
+            current_payload={},
+            request_payload={'prompt': 'Sprich diesen Text.'},
+            assistant_message='Sprich diesen Text.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+        prepare_args = branch_spec['prepare_args']
+        branch_gap = prepare_args['artifact_gap']
+        self.assertEqual(
+            branch_gap['recovery_attempt']['branch_id'],
+            'branch-text_to_speech-1',
+        )
+        self.assertEqual(
+            branch_gap['recovery_state']['capability'],
+            'text_to_speech',
+        )
+        route_gap = _build_deferred_follow_up_gap_for_capability(
+            branch_gap,
+            capability='text_to_speech',
+            artifact_payload={},
+        )
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text.'},
+            expected_capability='text_to_speech',
+            failed_instance_id=prepare_args['failed_instance_id'],
+            excluded_instance_ids=prepare_args['excluded_instance_ids'],
+            artifact_gap=route_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-failed')
+        self.assertEqual(
+            route_info['route_runtime']['selection_policy'],
+            'excluded_reuse_for_single_tts_recovery',
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_tts_recovery_ignores_unusable_alternative_for_sole_usable_count(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        offline_alternative = self._tts_recovery_instance('tts-offline')
+        offline_alternative['runtime_status'] = {
+            'readiness': 'unreachable',
+            'activity': 'idle',
+            'process_alive': False,
+            'port_listening': False,
+        }
+        instances = [failed, offline_alternative]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text erneut.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap=self._explicit_single_branch_tts_recovery_gap(),
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-failed')
+        self.assertEqual(
+            route_info['route_runtime']['selection_policy'],
+            'excluded_reuse_for_single_tts_recovery',
+        )
+        offline_diagnostic = next(
+            item
+            for item in route_info['route_runtime']['candidate_diagnostics']
+            if item['instance_id'] == 'tts-offline'
+        )
+        self.assertFalse(offline_diagnostic['usable'])
+        self.assertIn('not_ready', offline_diagnostic['rejection_reasons'])
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_resolve_late_fill_route_does_not_reuse_excluded_tts_outside_explicit_recovery(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap={
+                'trigger': 'execution_planner_deferred_follow_up',
+                'branch_id': 'branch-text_to_speech-1',
+                'expected_capability': 'text_to_speech',
+                'output_type': 'audio',
+            },
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_info)
+        self.assertIn('No non-excluded running instance', route_error)
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_resolve_late_fill_route_does_not_reuse_excluded_tts_for_optional_output(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        mock_load_running_instances.return_value = [failed]
+        mock_merge_instances.return_value = [failed]
+        artifact_gap = self._explicit_single_branch_tts_recovery_gap()
+        artifact_gap['execution_contract']['output_contract']['required'] = False
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Optionaler Sprechtext.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap=artifact_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_info)
+        self.assertIn('No non-excluded running instance', route_error)
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_resolve_late_fill_route_does_not_reuse_when_multiple_tts_candidates_are_excluded(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        instances = [
+            self._tts_recovery_instance('tts-failed'),
+            self._tts_recovery_instance('tts-also-excluded'),
+        ]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed', 'tts-also-excluded'],
+            artifact_gap=self._explicit_single_branch_tts_recovery_gap(),
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_info)
+        self.assertIn('No non-excluded running instance', route_error)
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_resolve_late_fill_route_refreshes_snapshot_before_reusing_excluded_tts(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        failed = self._tts_recovery_instance('tts-failed')
+        alternative = self._tts_recovery_instance('tts-live-alternative')
+        live_instances = [failed, alternative]
+        mock_load_running_instances.return_value = live_instances
+        mock_merge_instances.return_value = live_instances
+        artifact_gap = self._explicit_single_branch_tts_recovery_gap()
+        artifact_gap['_runtime_candidate_snapshot'] = [failed]
+
+        payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'text_to_speech', 'prompt': 'Sprich diesen Text erneut.'},
+            expected_capability='text_to_speech',
+            failed_instance_id='tts-failed',
+            excluded_instance_ids=['tts-failed'],
+            artifact_gap=artifact_gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'tts-live-alternative')
+        refresh = payload['_late_fill_route_candidate_refresh']
+        self.assertTrue(refresh['attempted'])
+        self.assertTrue(refresh['applied'])
+        self.assertEqual(
+            refresh['reason'],
+            'snapshot_tts_recovery_requires_live_alternative_check',
+        )
 
     @patch('ollmo_webserver.merge_instances_with_runtime_status')
     @patch('ollmo_webserver.load_running_instances')

@@ -115,6 +115,27 @@ class GhostExecutionPlannerTests(unittest.TestCase):
         self.assertEqual(graph['downstream_capabilities'], ['text_to_speech'])
         self.assertEqual(len(graph['downstream_branches']), 1)
 
+    def test_request_phase_graph_treats_quoted_tts_passage_as_payload_not_image_work(self):
+        prompt = (
+            'Create exactly one English audio artifact using local text-to-speech. '
+            'Read only the quoted passage. Do not create or plan an image. '
+            '"Nothing was finished, but everything was finally moving."'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertEqual(graph['downstream_capabilities'], ['text_to_speech'])
+        self.assertEqual(
+            [branch.get('capability') for branch in graph['downstream_branches']],
+            ['text_to_speech'],
+        )
+        self.assertEqual(graph['prompt_intent']['required_intent_output_counts'], {'audio': 1})
+        self.assertFalse(graph['prompt_intent']['requests_visual_output'])
+
     def test_request_phase_graph_owns_reported_answer_as_audio_intent_before_output_claims(self):
         prompts = (
             'Erzähl mir etwas über doch. gib mir die antwort als generiertes audio.',
@@ -2199,7 +2220,11 @@ class GhostExecutionPlannerTests(unittest.TestCase):
         self.assertEqual(graph['current_phase_capability'], 'speech_to_text')
         self.assertEqual(graph['downstream_capabilities'], ['text_to_speech'])
         self.assertEqual(graph['phases'][1]['depends_on'], ['phase-1'])
-        self.assertNotIn('content_payload_source', graph['downstream_branches'][0])
+        self.assertEqual(graph['downstream_branches'][0]['content_payload'], 'Hallo Welt')
+        self.assertEqual(
+            graph['downstream_branches'][0]['content_payload_source'],
+            'current_turn_direct_spoken_clause',
+        )
 
     def test_request_phase_graph_promotes_mixed_materialized_artifact_list(self):
         graph = build_request_phase_graph(
@@ -2521,14 +2546,50 @@ class GhostExecutionPlannerTests(unittest.TestCase):
         self.assertTrue(graph['prompt_intent']['requests_visual_output'])
         self.assertTrue(graph['prompt_intent']['text_preparation_before_visual_output'])
 
+    def test_generated_tts_content_waits_for_phase_output_instead_of_literal_controls(self):
+        prompts = (
+            'Write a poem titled "At Sunrise", then speak it aloud.',
+            'Write a poem, then speak it aloud. Style: concise',
+            'Summarize the source, then read the summary aloud: '
+            '```text\nSource material only.\n```',
+            'Read this passage "The harbor was quiet.", condense it to one sentence, '
+            'then speak the result aloud.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                execute_chat = Mock()
+                updated, meta = plan_compound_execution(
+                    {'ghost_route': True, 'prompt': prompt},
+                    route_info={
+                        'capability': 'chat',
+                        'route_source': 'ghost_carried',
+                        'instance': {
+                            'instance_id': 'chat-1',
+                            'model': 'gemma4:e4b',
+                            'backend': 'ollama',
+                            'capability': 'chat',
+                            'port': 11437,
+                        },
+                    },
+                    instances=[],
+                    context_messages=[{'role': 'user', 'content': prompt}],
+                    execute_chat_request=execute_chat,
+                )
+
+                self.assertNotIn('content_payload', updated)
+                self.assertIsNone(meta['planned_prompt'])
+                execute_chat.assert_not_called()
+
     def test_ghost_carried_direct_reply_read_aloud_defers_tts_and_extracts_content_payload(self):
         execute_chat = Mock()
         referenced_reply = (
             'The fog rolling into the harbor carried a low metallic knock from the deepest channel.'
         )
+        prompt = 'Read that text aloud using voice "Vivian".'
 
         updated, meta = plan_compound_execution(
-            {'prompt': 'Read that exact reply aloud in a calm voice.'},
+            {'prompt': prompt},
             route_info={
                 'capability': 'chat',
                 'route_source': 'ghost_carried',
@@ -2543,7 +2604,7 @@ class GhostExecutionPlannerTests(unittest.TestCase):
             instances=[],
             context_messages=[
                 {'role': 'assistant', 'content': referenced_reply},
-                {'role': 'user', 'content': 'Read that exact reply aloud in a calm voice.'},
+                {'role': 'user', 'content': prompt},
             ],
             execute_chat_request=execute_chat,
         )

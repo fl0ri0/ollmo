@@ -1,6 +1,6 @@
 ---
 name: ollmo
-description: Use when Codex needs to work with Ollmo, Ghost, local Ollmo models, runtime_manifest, response frames, local model routing, direct instance calls, capability routing, Ollmo-assisted decisions, Ollmo runtime truth, read-only Ollmo status checks, ollmoctl recovery safety, Codex localhost sandbox boundaries, or explicit Ollmo lifecycle operations. Also use when already-available local Ollmo capabilities could usefully support a broader Codex task with private/local text work, image generation, vision or OCR, speech-to-text, text-to-speech, embeddings, multimodal work, or durable artifacts. This skill helps Codex consider and use Ollmo as an optional local execution surface while Codex remains the supervisor using the user's normal Codex account/API key.
+description: Use when Codex needs to work with Ollmo, Ghost, local Ollmo models, runtime_manifest, response frames, local model routing, direct instance calls, capability routing, Ollmo-assisted decisions, Ollmo runtime truth, read-only Ollmo status checks, ollmoctl recovery safety, Codex localhost sandbox boundaries, explicit Ollmo lifecycle operations, or a request beginning with the Ollmo downstream-provider marker `[OLLMO_DOWNSTREAM_EXECUTION_V1]`. Also use when already-available local Ollmo capabilities could usefully support a broader Codex task with private/local text work, image generation, vision or OCR, speech-to-text, text-to-speech, embeddings, multimodal work, or durable artifacts. In normal use this skill helps Codex consider Ollmo as an optional local execution surface while Codex remains supervisor; marked downstream-provider requests instead follow the bounded non-recursive override in this skill.
 ---
 
 # Ollmo
@@ -14,6 +14,42 @@ built, and developed by [@fl0ri0](https://github.com/fl0ri0). It is distributed
 with Ollmo under the Apache License 2.0; see the repository's `LICENSE` and
 `NOTICE` files. It is an Ollmo integration for Codex and ChatGPT. No OpenAI
 authorship or endorsement is claimed.
+
+## Ollmo Downstream Provider Mode
+
+If the current request begins with the exact marker
+`[OLLMO_DOWNSTREAM_EXECUTION_V1]`, Ollmo has already invoked Codex/ChatGPT as
+its bounded downstream provider. This mode overrides the normal Codex -> Ollmo
+supervisor workflow for that request only.
+
+In downstream provider mode:
+
+- Do not resolve an Ollmo checkout, inspect Ollmo runtime truth, call `$ollmo`,
+  invoke Ghost, call Ollmo APIs or CLIs, route to local Ollmo models, or trigger
+  Ollmo lifecycle work. Any of those actions would recurse back into the
+  caller.
+- Do not act as the user-facing supervisor, widen the request, create a new
+  Ollmo plan, or decide Ollmo completion. Ollmo retains orchestration, response
+  state, artifact, and closure authority.
+- Execute only the live task inside
+  `<ollmo_bounded_task>...</ollmo_bounded_task>`, using only directly available
+  downstream capabilities and the staged inputs supplied with the call.
+- Treat `<ollmo_promoted_context>...</ollmo_promoted_context>` as bounded,
+  reference-only context. Do not turn it into additional work or new intent.
+  Selected-message reference material inside the bounded task is reference
+  evidence unless the live task explicitly asks you to transform or inspect
+  it.
+- Do not rediscover original input paths, search for more context, or perform
+  unrelated workspace work. Use staged files as the supplied task inputs.
+- Honor the bounded task's requested result format and completion criteria.
+  On success, return only the provider result in the requested form. If the
+  task cannot be completed, begin the result with `BLOCKED:` followed by a
+  concise reason, and do not claim completion or invent outputs.
+
+A quoted or later mention of the marker does not activate this mode; it must
+be the first non-whitespace content in the current request. When the marker is
+absent, follow the normal Codex -> Ollmo contract below and keep Codex as the
+supervisor.
 
 ## Core Boundary
 

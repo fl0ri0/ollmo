@@ -76,7 +76,9 @@ from ollmo_services.response_frames import (
 )
 from ollmo_services.tts_audio_integrity import (
     TTS_AUDIO_INTEGRITY_POLICY_ID,
+    TTS_SEMANTIC_SOURCE_POLICY_ID,
     build_tts_audio_integrity_evidence,
+    build_tts_semantic_source,
 )
 
 
@@ -92,7 +94,7 @@ _DEPENDENCY_INPUT_MISSING_RE = re.compile(
 _PATH_ONLY_DEPENDENCY_EVIDENCE_RE = re.compile(
     r'^\s*(?:/[^ \t\r\n]+|[A-Za-z]:[\\/][^\r\n]+)\s*$'
 )
-_TTS_STT_SEMANTIC_POLICY_ID = 'tts_stt_lexical_fidelity_v1'
+_TTS_STT_SEMANTIC_POLICY_ID = TTS_SEMANTIC_SOURCE_POLICY_ID
 _TTS_STT_MIN_SOURCE_TOKENS_FOR_FULL_POLICY = 4
 _TTS_STT_MIN_TOKEN_RECALL = 0.85
 _TTS_STT_MIN_TOKEN_PRECISION = 0.65
@@ -325,6 +327,9 @@ _AUTO_EXECUTABLE_REPAIR_RETRY_ACTIONS = {
 _AUTO_EXECUTABLE_REPAIR_DEFAULT_MAX_ATTEMPTS = 6
 _AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS_LIMIT = 12
 _AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS_ENV = 'OLLMO_AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS'
+_TTS_AUTO_RECOVERY_POLICY_ID = 'tts_bounded_materialization_recovery_v1'
+_TTS_AUTO_RECOVERY_TRIGGER = 'tts_auto_recovery'
+_TTS_AUTO_RECOVERY_MAX_ATTEMPTS = 2
 _PARTIAL_GRAPH_REBASE_HANDOFF_LOCK = threading.RLock()
 _GRAPH_PATCH_TERMINAL_REVIEW_HANDOFF_LOCK = threading.RLock()
 _GRAPH_PATCH_TERMINAL_REVIEW_RELATION = 'graph_patch_terminal_review'
@@ -604,6 +609,178 @@ class LateFillRuntimeOwner:
             return False
         return True
 
+    def _artifact_gap_allows_excluded_candidate_reuse_for_tts_recovery(
+        self,
+        artifact_gap: Optional[Mapping[str, Any]],
+    ) -> bool:
+        gap = artifact_gap if isinstance(artifact_gap, Mapping) else {}
+        recovery_attempt = (
+            gap.get('recovery_attempt')
+            if isinstance(gap.get('recovery_attempt'), Mapping)
+            else {}
+        )
+        recovery_state = (
+            gap.get('recovery_state')
+            if isinstance(gap.get('recovery_state'), Mapping)
+            else {}
+        )
+        execution_contract = (
+            gap.get('execution_contract')
+            if isinstance(gap.get('execution_contract'), Mapping)
+            else {}
+        )
+        output_contract = (
+            execution_contract.get('output_contract')
+            if isinstance(execution_contract.get('output_contract'), Mapping)
+            else {}
+        )
+        attempt_trigger = str(
+            recovery_attempt.get('trigger') or ''
+        ).strip().lower()
+        state_trigger = str(
+            recovery_state.get('trigger') or ''
+        ).strip().lower()
+        if attempt_trigger != state_trigger:
+            return False
+        if attempt_trigger not in {
+            'explicit_retry_endpoint',
+            _TTS_AUTO_RECOVERY_TRIGGER,
+        }:
+            return False
+        automatic_tts_recovery = bool(
+            attempt_trigger == _TTS_AUTO_RECOVERY_TRIGGER
+        )
+        capabilities = {
+            self.normalize_capability(value)
+            for value in (
+                gap.get('expected_capability'),
+                gap.get('active_capability'),
+                execution_contract.get('capability'),
+                recovery_attempt.get('capability'),
+                recovery_state.get('capability'),
+            )
+            if str(value or '').strip()
+        }
+        if capabilities != {self.capability_text_to_speech}:
+            return False
+        output_type = str(
+            gap.get('output_type')
+            or execution_contract.get('output_type')
+            or gap.get('missing_artifact_type')
+            or ''
+        ).strip().lower()
+        if output_type != 'audio':
+            return False
+        if output_contract.get('required') is not True:
+            return False
+        action = normalize_recovery_suggested_action(
+            recovery_state.get('suggested_action')
+            or gap.get('repair_action')
+            or gap.get('recovery_action')
+            or gap.get('suggested_action'),
+            default='',
+        )
+        if action not in {
+            RECOVERY_ACTION_RETRY_EXCLUDING_INSTANCE,
+            RECOVERY_ACTION_START_COMPATIBLE_INSTANCE,
+        }:
+            return False
+        if automatic_tts_recovery and action not in {
+            RECOVERY_ACTION_RETRY_EXCLUDING_INSTANCE,
+            RECOVERY_ACTION_RETRY_SAME_BRANCH,
+            RECOVERY_ACTION_START_COMPATIBLE_INSTANCE,
+        }:
+            return False
+        if action == RECOVERY_ACTION_START_COMPATIBLE_INSTANCE:
+            prior_error_code = str(
+                recovery_attempt.get('prior_error_code')
+                or recovery_state.get('prior_error_code')
+                or gap.get('prior_error_code')
+                or ''
+            ).strip().upper()
+            if prior_error_code != 'NO_COMPATIBLE_INSTANCE':
+                return False
+        if str(recovery_state.get('retry_scope') or '').strip() != 'same_branch':
+            return False
+        branch_id = str(
+            gap.get('branch_id') or execution_contract.get('branch_id') or ''
+        ).strip()
+        attempt_branch_id = str(recovery_attempt.get('branch_id') or '').strip()
+        state_branch_id = str(recovery_state.get('branch_id') or '').strip()
+        if not branch_id or branch_id != attempt_branch_id or branch_id != state_branch_id:
+            return False
+        if recovery_attempt.get('preserve_intent') is not True:
+            return False
+        if recovery_state.get('preserve_intent') is not True:
+            return False
+        if (
+            gap.get('needs_external_input') is True
+            or recovery_state.get('needs_external_input') is True
+        ):
+            return False
+        if automatic_tts_recovery:
+            if (
+                str(
+                    recovery_attempt.get('recovery_policy_id') or ''
+                ).strip()
+                != _TTS_AUTO_RECOVERY_POLICY_ID
+                or str(
+                    recovery_state.get('recovery_policy_id') or ''
+                ).strip()
+                != _TTS_AUTO_RECOVERY_POLICY_ID
+            ):
+                return False
+            if (
+                recovery_attempt.get('auto_execute') is not True
+                or recovery_state.get('auto_execute') is not True
+            ):
+                return False
+            try:
+                attempt_number = int(
+                    recovery_attempt.get('attempt_number') or 0
+                )
+                maximum_attempts = int(
+                    recovery_attempt.get('maximum_attempts') or 0
+                )
+                retry_count = int(
+                    gap.get('auto_executable_repair_retry_count') or 0
+                )
+            except (TypeError, ValueError):
+                return False
+            if (
+                attempt_number != 2
+                or maximum_attempts
+                != _TTS_AUTO_RECOVERY_MAX_ATTEMPTS
+                or retry_count != 1
+            ):
+                return False
+            prior_error_code = str(
+                recovery_attempt.get('prior_error_code')
+                or recovery_state.get('prior_error_code')
+                or ''
+            ).strip().upper()
+            if not prior_error_code:
+                return False
+            if prior_error_code == 'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED':
+                prior_integrity = (
+                    recovery_attempt.get('prior_audio_integrity_evidence')
+                    if isinstance(
+                        recovery_attempt.get('prior_audio_integrity_evidence'),
+                        Mapping,
+                    )
+                    else {}
+                )
+                if not (
+                    str(prior_integrity.get('kind') or '').strip()
+                    == 'ollmo.tts_audio_integrity_evidence'
+                    and prior_integrity.get('version') == 1
+                    and str(prior_integrity.get('policy_id') or '').strip()
+                    == TTS_AUDIO_INTEGRITY_POLICY_ID
+                    and prior_integrity.get('materialization_eligible') is False
+                ):
+                    return False
+        return True
+
     @classmethod
     def _artifact_gap_is_authoritative_bounded_text_artifact_repair(
         cls,
@@ -875,6 +1052,116 @@ class LateFillRuntimeOwner:
         if branch.get('optional') is True or output_contract.get('optional') is True:
             return False
         return self._artifact_gap_is_required_image_materialization(branch) or self._branch_is_image_generation(branch)
+
+    def _branch_is_required_tts_materialization(
+        self,
+        branch: Mapping[str, Any],
+    ) -> bool:
+        if (
+            not isinstance(branch, Mapping)
+            or self.branch_capability(branch) != self.capability_text_to_speech
+            or not self.branch_id(branch)
+        ):
+            return False
+        execution_contract = (
+            branch.get('execution_contract')
+            if isinstance(branch.get('execution_contract'), Mapping)
+            else {}
+        )
+        output_contract = (
+            branch.get('output_contract')
+            if isinstance(branch.get('output_contract'), Mapping)
+            else execution_contract.get('output_contract')
+            if isinstance(execution_contract.get('output_contract'), Mapping)
+            else {}
+        )
+        output_type = str(
+            branch.get('output_type')
+            or execution_contract.get('output_type')
+            or output_contract.get('output_type')
+            or ''
+        ).strip().lower()
+        if output_type and output_type != 'audio':
+            return False
+        if branch.get('required') is False or output_contract.get('required') is False:
+            return False
+        if branch.get('optional') is True or output_contract.get('optional') is True:
+            return False
+        return True
+
+    def _required_tts_auto_recovery_allowed(
+        self,
+        branch: Mapping[str, Any],
+        recovery_context: Mapping[str, Any],
+    ) -> bool:
+        if not self._branch_is_required_tts_materialization(branch):
+            return False
+        error_code = str(
+            recovery_context.get('error_code') or ''
+        ).strip().upper()
+        if not error_code:
+            return False
+        if recovery_context.get('can_retry') is not True:
+            return False
+        if str(recovery_context.get('retry_scope') or '').strip() != 'same_branch':
+            return False
+        if recovery_context.get('preserve_intent') is not True:
+            return False
+        if recovery_context.get('needs_external_input') is True:
+            return False
+        if recovery_context.get('repair_work_available') is False:
+            return False
+        if any(
+            recovery_context.get(key) is True
+            for key in (
+                'blocked_by_dependency_input',
+                'blocked_by_branch_contract',
+                'blocked_by_underplanned_promoted_obligations',
+            )
+        ):
+            return False
+        action = normalize_recovery_suggested_action(
+            recovery_context.get('suggested_action'),
+            default='',
+        )
+        if action not in {
+            *_AUTO_EXECUTABLE_REPAIR_RETRY_ACTIONS,
+            RECOVERY_ACTION_START_COMPATIBLE_INSTANCE,
+        }:
+            return False
+        materialization_blocked = (
+            recovery_context.get('materialization_blocked') is True
+        )
+        if error_code != 'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED':
+            return not materialization_blocked
+        if not materialization_blocked:
+            return False
+        if str(recovery_context.get('blocked_scope') or '').strip() != (
+            'current_tts_branch'
+        ):
+            return False
+        if recovery_context.get('repair_work_available') is not True:
+            return False
+        integrity_evidence = (
+            recovery_context.get('audio_integrity_evidence')
+            if isinstance(
+                recovery_context.get('audio_integrity_evidence'),
+                Mapping,
+            )
+            else {}
+        )
+        return bool(
+            str(integrity_evidence.get('kind') or '').strip()
+            == 'ollmo.tts_audio_integrity_evidence'
+            and integrity_evidence.get('version') == 1
+            and str(integrity_evidence.get('policy_id') or '').strip()
+            == TTS_AUDIO_INTEGRITY_POLICY_ID
+            and str(integrity_evidence.get('authority') or '').strip()
+            == 'runtime_deterministic_audio_verification'
+            and str(integrity_evidence.get('status') or '').strip().lower()
+            in {'failed', 'unavailable'}
+            and integrity_evidence.get('materialization_eligible') is False
+        )
 
     def _branch_is_required_text_artifact(self, branch: Mapping[str, Any]) -> bool:
         return self._artifact_gap_is_required_text_materialization(branch)
@@ -1981,6 +2268,7 @@ class LateFillRuntimeOwner:
         for key in (
             'reason_code',
             'defect_code',
+            'defect_codes',
             'repair_action',
             'recovery_action',
             'suggested_action',
@@ -1993,6 +2281,8 @@ class LateFillRuntimeOwner:
             'failed_dependency_ids',
             'semantic_evidence',
             'audio_integrity_evidence',
+            'tts_generation_budget',
+            'tts_sampling_profile',
             'diagnostic_artifact',
         ):
             value = raw.get(key) if raw else None
@@ -2100,7 +2390,27 @@ class LateFillRuntimeOwner:
             ),
             'suggested_action': suggested_action,
             'preserve_intent': True,
+            'error_code': code,
         }
+        reason_code = str(error.get('reason_code') or '').strip()
+        if reason_code:
+            payload['reason_code'] = reason_code
+        defect_codes = [
+            str(item).strip()
+            for item in (error.get('defect_codes') or [])
+            if str(item).strip()
+        ] if isinstance(error.get('defect_codes'), list) else []
+        if defect_codes:
+            payload['defect_codes'] = defect_codes
+        audio_integrity_evidence = (
+            error.get('audio_integrity_evidence')
+            if isinstance(error.get('audio_integrity_evidence'), Mapping)
+            else {}
+        )
+        if audio_integrity_evidence:
+            payload['audio_integrity_evidence'] = dict(
+                audio_integrity_evidence
+            )
         if branch_contract_repair:
             payload['repair_required'] = True
             payload['blocked_by_branch_contract'] = True
@@ -2214,6 +2524,11 @@ class LateFillRuntimeOwner:
 
     def auto_executable_repair_max_attempts(self, branch: Mapping[str, Any]) -> int:
         contract = branch.get('repair_contract') if isinstance(branch.get('repair_contract'), Mapping) else {}
+        attempt_limit = (
+            _TTS_AUTO_RECOVERY_MAX_ATTEMPTS
+            if self._branch_is_required_tts_materialization(branch)
+            else _AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS_LIMIT
+        )
         for key in (
             'auto_executable_repair_max_attempts',
             'repair_auto_execute_max_attempts',
@@ -2225,14 +2540,18 @@ class LateFillRuntimeOwner:
                 except (AttributeError, TypeError, ValueError):
                     continue
                 if value > 0:
-                    return min(value, _AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS_LIMIT)
+                    return min(value, attempt_limit)
         try:
             env_value = int(os.environ.get(_AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS_ENV, ''))
         except (TypeError, ValueError):
             env_value = 0
         if env_value > 0:
-            return min(env_value, _AUTO_EXECUTABLE_REPAIR_MAX_ATTEMPTS_LIMIT)
-        return _AUTO_EXECUTABLE_REPAIR_DEFAULT_MAX_ATTEMPTS
+            return min(env_value, attempt_limit)
+        return (
+            _TTS_AUTO_RECOVERY_MAX_ATTEMPTS
+            if self._branch_is_required_tts_materialization(branch)
+            else _AUTO_EXECUTABLE_REPAIR_DEFAULT_MAX_ATTEMPTS
+        )
 
     def auto_executable_repair_recovery_allowed(
         self,
@@ -2244,7 +2563,17 @@ class LateFillRuntimeOwner:
             return False
         required_text_artifact = self._branch_is_required_text_artifact(branch)
         required_image_materialization = self._branch_is_required_image_materialization(branch)
-        if not required_text_artifact and not required_image_materialization:
+        required_tts_recovery = (
+            self._required_tts_auto_recovery_allowed(
+                branch,
+                recovery_context,
+            )
+        )
+        if (
+            not required_text_artifact
+            and not required_image_materialization
+            and not required_tts_recovery
+        ):
             return False
         try:
             retry_count = int(branch.get('auto_executable_repair_retry_count') or 0)
@@ -2266,6 +2595,8 @@ class LateFillRuntimeOwner:
             auto_requested = True
         if required_image_materialization and not required_text_artifact:
             auto_requested = True
+        if required_tts_recovery:
+            auto_requested = True
         if not auto_requested:
             return False
         if self._repair_bool_from_branch_or_contract(branch, 'repair_work_available') is False:
@@ -2273,13 +2604,19 @@ class LateFillRuntimeOwner:
         for source in (branch, recovery_context):
             if source.get('needs_external_input') is True:
                 return False
-            if source.get('materialization_blocked') is True:
+            if (
+                source.get('materialization_blocked') is True
+                and not required_tts_recovery
+            ):
                 return False
         action = normalize_recovery_suggested_action(
             recovery_context.get('suggested_action') or branch.get('recovery_action') or branch.get('repair_action'),
             default='',
         )
-        if action not in _AUTO_EXECUTABLE_REPAIR_RETRY_ACTIONS:
+        if action not in _AUTO_EXECUTABLE_REPAIR_RETRY_ACTIONS and not (
+            required_tts_recovery
+            and action == RECOVERY_ACTION_START_COMPATIBLE_INSTANCE
+        ):
             return False
         retry_scope = str(recovery_context.get('retry_scope') or '').strip()
         return recovery_context.get('can_retry') is True and retry_scope in {'', 'same_branch'}
@@ -2306,6 +2643,18 @@ class LateFillRuntimeOwner:
             retry_count = int(branch.get('auto_executable_repair_retry_count') or 0)
         except (TypeError, ValueError):
             retry_count = 0
+        tts_auto_recovery = (
+            self._required_tts_auto_recovery_allowed(
+                branch,
+                recovery_context,
+            )
+        )
+        resolved_trigger = (
+            _TTS_AUTO_RECOVERY_TRIGGER
+            if tts_auto_recovery
+            else str(trigger or '').strip() or 'auto_executable_repair_retry'
+        )
+        max_attempts = self.auto_executable_repair_max_attempts(branch)
         retry_branch = {
             key: value
             for key, value in dict(branch).items()
@@ -2340,7 +2689,7 @@ class LateFillRuntimeOwner:
             {
                 'kind': 'ollmo.late_fill_recovery_state',
                 'status': 'attempting',
-                'trigger': str(trigger or '').strip() or 'auto_executable_repair_retry',
+                'trigger': resolved_trigger,
                 'branch_id': branch_id,
                 'capability': capability,
                 'promotion_required': False,
@@ -2356,7 +2705,7 @@ class LateFillRuntimeOwner:
             retry_recovery_state['exclude_instance_ids'] = excluded_instance_ids
         recovery_attempt = {
             'kind': 'ollmo.late_fill_recovery_attempt',
-            'trigger': str(trigger or '').strip() or 'auto_executable_repair_retry',
+            'trigger': resolved_trigger,
             'branch_id': branch_id,
             'capability': capability,
             'preserve_intent': True,
@@ -2364,6 +2713,53 @@ class LateFillRuntimeOwner:
             'failed_instance_id': failed_instance_id or None,
             'excluded_instance_ids': excluded_instance_ids,
         }
+        if tts_auto_recovery:
+            prior_error_code = str(
+                recovery_context.get('error_code') or ''
+            ).strip().upper()
+            prior_reason_code = str(
+                recovery_context.get('reason_code') or ''
+            ).strip()
+            prior_defect_codes = [
+                str(item).strip()
+                for item in (recovery_context.get('defect_codes') or [])
+                if str(item).strip()
+            ] if isinstance(recovery_context.get('defect_codes'), list) else []
+            prior_integrity = (
+                recovery_context.get('audio_integrity_evidence')
+                if isinstance(
+                    recovery_context.get('audio_integrity_evidence'),
+                    Mapping,
+                )
+                else {}
+            )
+            retry_recovery_state.update(
+                {
+                    'recovery_policy_id': (
+                        _TTS_AUTO_RECOVERY_POLICY_ID
+                    ),
+                    'attempt_number': retry_count + 2,
+                    'maximum_attempts': max_attempts,
+                    'prior_error_code': prior_error_code,
+                    'prior_reason_code': prior_reason_code or None,
+                    'prior_defect_codes': prior_defect_codes,
+                }
+            )
+            recovery_attempt.update(
+                {
+                    'recovery_policy_id': (
+                        _TTS_AUTO_RECOVERY_POLICY_ID
+                    ),
+                    'attempt_number': retry_count + 2,
+                    'maximum_attempts': max_attempts,
+                    'prior_error_code': prior_error_code,
+                    'prior_reason_code': prior_reason_code or None,
+                    'prior_defect_codes': prior_defect_codes,
+                    'prior_audio_integrity_evidence': (
+                        dict(prior_integrity) if prior_integrity else None
+                    ),
+                }
+            )
         retry_branch.update(
             {
                 'status': 'pending',
@@ -2374,6 +2770,7 @@ class LateFillRuntimeOwner:
                 'recovery_action': action,
                 'suggested_action': action,
                 'auto_executable_repair_retry_count': retry_count + 1,
+                'auto_executable_repair_max_attempts': max_attempts,
                 'recovery_context': dict(recovery_context),
                 'recovery_state': {
                     key: value
@@ -2391,6 +2788,10 @@ class LateFillRuntimeOwner:
             retry_branch['failed_instance_id'] = failed_instance_id
         if excluded_instance_ids:
             retry_branch['excluded_instance_ids'] = excluded_instance_ids
+        if tts_auto_recovery:
+            retry_branch['recovery_policy_id'] = (
+                _TTS_AUTO_RECOVERY_POLICY_ID
+            )
         return retry_branch
 
     def late_fill_branch_control_records(self, current_payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2563,6 +2964,32 @@ class LateFillRuntimeOwner:
             'repair_required',
         }
 
+    def _branch_has_current_turn_direct_media_payload(
+        self,
+        branch: Mapping[str, Any],
+    ) -> bool:
+        dependencies = {
+            str(item or '').strip()
+            for item in (branch.get('depends_on') or [])
+            if str(item or '').strip()
+        }
+        if dependencies != {'phase-1'}:
+            return False
+        capability = self.branch_capability(branch)
+        if capability == self.capability_text_to_speech:
+            return bool(
+                str(branch.get('content_payload') or '').strip()
+                and str(branch.get('content_payload_source') or '').strip()
+                == 'current_turn_direct_spoken_clause'
+            )
+        if capability == self.capability_image_generation:
+            return bool(
+                str(branch.get('artifact_prompt') or '').strip()
+                and str(branch.get('artifact_prompt_source') or '').strip()
+                == 'current_turn_direct_image_clause'
+            )
+        return False
+
     def _branch_depends_on_rejected_current_payload(
         self,
         branch: Mapping[str, Any],
@@ -2571,6 +2998,8 @@ class LateFillRuntimeOwner:
     ) -> bool:
         capability = self.branch_capability(branch)
         if capability == 'chat':
+            return False
+        if self._branch_has_current_turn_direct_media_payload(branch):
             return False
         depends_on = {
             str(item or '').strip()
@@ -3407,6 +3836,29 @@ class LateFillRuntimeOwner:
                 }
                 return False
 
+            if reason == 'snapshot_tts_recovery_requires_live_alternative_check':
+                instances = [
+                    dict(entry)
+                    for entry in (live_instances or [])
+                    if isinstance(entry, Mapping)
+                ]
+                candidate_snapshot_meta = self._runtime_candidate_snapshot_meta(
+                    instances,
+                    source='per_branch_refresh_for_tts_recovery',
+                )
+                candidate_snapshot_meta['refresh_reason'] = str(reason or '').strip()
+                candidate_snapshot_meta['snapshot_candidate_count'] = len(runtime_candidate_snapshot)
+                candidate_snapshot_meta['live_candidate_count'] = len(instances)
+                late_fill_payload['_late_fill_route_candidate_refresh'] = {
+                    'attempted': True,
+                    'applied': True,
+                    'reason': str(reason or '').strip(),
+                    'snapshot_candidate_count': len(runtime_candidate_snapshot),
+                    'live_candidate_count': len(instances),
+                    'candidate_count': len(instances),
+                }
+                return True
+
             combined: list[dict[str, Any]] = []
             seen: set[str] = set()
             for entry in [*(instances or []), *(live_instances or [])]:
@@ -3455,6 +3907,7 @@ class LateFillRuntimeOwner:
             entries: list[dict[str, Any]],
             *,
             selected_instance_id: str = '',
+            reused_excluded_instance_id: str = '',
         ) -> list[dict[str, Any]]:
             diagnostics: list[dict[str, Any]] = []
             for entry in entries[:12]:
@@ -3463,11 +3916,20 @@ class LateFillRuntimeOwner:
                     continue
                 supports = self.instance_supports_capability(entry, expected_capability)
                 excluded = instance_id in resolved_excluded_instance_ids
-                usable = bool(supports and not excluded and _late_fill_instance_is_usable(entry, capability=expected_capability))
+                excluded_reuse_applied = bool(
+                    excluded
+                    and reused_excluded_instance_id
+                    and instance_id == reused_excluded_instance_id
+                )
+                usable = bool(
+                    supports
+                    and (not excluded or excluded_reuse_applied)
+                    and _late_fill_instance_is_usable(entry, capability=expected_capability)
+                )
                 rejection_reasons: list[str] = []
                 if not supports:
                     rejection_reasons.append('capability_mismatch')
-                if excluded:
+                if excluded and not excluded_reuse_applied:
                     rejection_reasons.append('excluded_instance')
                 if supports and not _late_fill_instance_is_usable(entry, capability=expected_capability):
                     rejection_reasons.append('not_ready')
@@ -3478,6 +3940,7 @@ class LateFillRuntimeOwner:
                     'model': str(entry.get('model') or entry.get('modelName') or '').strip() or None,
                     'supports_expected_capability': supports,
                     'excluded': excluded,
+                    'excluded_reuse_applied': excluded_reuse_applied,
                     'usable': usable,
                     'selected': bool(selected_instance_id and instance_id == selected_instance_id),
                     'readiness': str(
@@ -3522,6 +3985,7 @@ class LateFillRuntimeOwner:
             list[dict[str, Any]],
             int,
             bool,
+            bool,
             list[dict[str, Any]],
             list[dict[str, Any]],
         ]:
@@ -3536,19 +4000,55 @@ class LateFillRuntimeOwner:
                 for entry in all_items
                 if str(entry.get('instance_id') or '').strip() not in resolved_excluded_instance_ids
             ]
+            usable_compatible_items = [
+                entry
+                for entry in all_items
+                if _late_fill_instance_is_usable(entry, capability=expected_capability)
+            ]
+            usable_nonexcluded_items = [
+                entry
+                for entry in usable_compatible_items
+                if str(entry.get('instance_id') or '').strip() not in resolved_excluded_instance_ids
+            ]
             excluded_count = sum(
                 1
                 for entry in all_items
                 if str(entry.get('instance_id') or '').strip() in resolved_excluded_instance_ids
             )
-            reuse_excluded = bool(
+            reuse_excluded_for_text_repair = bool(
                 resolved_excluded_instance_ids
                 and not filtered_items
                 and self._artifact_gap_allows_excluded_candidate_reuse_for_text_repair(artifact_gap_payload)
             )
+            sole_usable_candidate_id = (
+                str(usable_compatible_items[0].get('instance_id') or '').strip()
+                if len(usable_compatible_items) == 1
+                else ''
+            )
+            recovery_attempt = (
+                artifact_gap_payload.get('recovery_attempt')
+                if isinstance(artifact_gap_payload.get('recovery_attempt'), Mapping)
+                else {}
+            )
+            recovery_failed_instance_id = str(
+                recovery_attempt.get('failed_instance_id') or ''
+            ).strip()
+            reuse_excluded_for_tts_recovery = bool(
+                normalized_expected_capability == self.capability_text_to_speech
+                and resolved_excluded_instance_ids
+                and not usable_nonexcluded_items
+                and len(usable_compatible_items) == 1
+                and sole_usable_candidate_id
+                and sole_usable_candidate_id == str(failed_instance_id or '').strip()
+                and sole_usable_candidate_id == recovery_failed_instance_id
+                and sole_usable_candidate_id in resolved_excluded_instance_ids
+                and self._artifact_gap_allows_excluded_candidate_reuse_for_tts_recovery(
+                    artifact_gap_payload
+                )
+            )
             base_items = (
                 all_items
-                if reuse_excluded
+                if reuse_excluded_for_text_repair or reuse_excluded_for_tts_recovery
                 else filtered_items
                 if resolved_excluded_instance_ids
                 else all_items
@@ -3567,7 +4067,8 @@ class LateFillRuntimeOwner:
                 all_items,
                 filtered_items,
                 excluded_count,
-                reuse_excluded,
+                reuse_excluded_for_text_repair,
+                reuse_excluded_for_tts_recovery,
                 base_items,
                 usable_items,
             )
@@ -3577,25 +4078,39 @@ class LateFillRuntimeOwner:
             filtered_candidates,
             excluded_candidate_count,
             reuse_excluded_candidates_for_text_repair,
+            reuse_excluded_candidate_for_tts_recovery,
             base_candidates,
             usable_candidates,
         ) = compute_candidate_pools()
         refresh_reason = ''
-        if not all_candidates:
+        if reuse_excluded_candidate_for_tts_recovery and used_runtime_candidate_snapshot:
+            refresh_reason = 'snapshot_tts_recovery_requires_live_alternative_check'
+        elif not all_candidates:
             refresh_reason = 'snapshot_missing_expected_capability'
         elif resolved_excluded_instance_ids and not filtered_candidates and not reuse_excluded_candidates_for_text_repair:
             refresh_reason = 'snapshot_candidates_excluded'
         elif base_candidates and not usable_candidates:
             refresh_reason = 'snapshot_candidates_not_usable'
-        if refresh_reason and refresh_snapshot_candidates_from_live_truth(refresh_reason):
-            (
-                all_candidates,
-                filtered_candidates,
-                excluded_candidate_count,
-                reuse_excluded_candidates_for_text_repair,
-                base_candidates,
-                usable_candidates,
-            ) = compute_candidate_pools()
+        if refresh_reason:
+            refreshed_candidates = refresh_snapshot_candidates_from_live_truth(refresh_reason)
+            if refreshed_candidates:
+                (
+                    all_candidates,
+                    filtered_candidates,
+                    excluded_candidate_count,
+                    reuse_excluded_candidates_for_text_repair,
+                    reuse_excluded_candidate_for_tts_recovery,
+                    base_candidates,
+                    usable_candidates,
+                ) = compute_candidate_pools()
+            elif refresh_reason == 'snapshot_tts_recovery_requires_live_alternative_check':
+                reuse_excluded_candidate_for_tts_recovery = False
+                base_candidates = list(filtered_candidates)
+                usable_candidates = [
+                    entry
+                    for entry in base_candidates
+                    if _late_fill_instance_is_usable(entry, capability=expected_capability)
+                ]
         if not all_candidates:
             return late_fill_payload, None, attach_route_diagnostics(
                 f"No running instance for late fill capability '{expected_capability}'."
@@ -3667,6 +4182,22 @@ class LateFillRuntimeOwner:
             return late_fill_payload, None, attach_route_diagnostics(
                 f"Late-fill instance '{selected_instance_id}' could not be resolved."
             )
+        tts_recovery_attempt = (
+            artifact_gap_payload.get('recovery_attempt')
+            if isinstance(
+                artifact_gap_payload.get('recovery_attempt'),
+                Mapping,
+            )
+            else {}
+        )
+        tts_recovery_trigger = str(
+            tts_recovery_attempt.get('trigger') or ''
+        ).strip().lower()
+        bounded_tts_recovery = (
+            self._artifact_gap_allows_excluded_candidate_reuse_for_tts_recovery(
+                artifact_gap_payload
+            )
+        )
         source_route = source_route_payload if isinstance(source_route_payload, dict) else {}
         route_source = 'phase_continuation' if phase_continuation else 'late_fill'
         route_reason = (
@@ -3691,6 +4222,14 @@ class LateFillRuntimeOwner:
                     if isinstance(entry, dict)
                 ],
                 selected_instance_id=selected_instance_id,
+                reused_excluded_instance_id=(
+                    selected_instance_id
+                    if (
+                        reuse_excluded_candidates_for_text_repair
+                        or reuse_excluded_candidate_for_tts_recovery
+                    )
+                    else ''
+                ),
             ),
         }
         if reuse_excluded_candidates_for_text_repair:
@@ -3704,13 +4243,71 @@ class LateFillRuntimeOwner:
                 artifact_gap_payload.get('_spread_retry_reason') or 'internal_reservation_exhausted'
             ).strip()
             route_runtime_seed['spread_retry_preferred_instance_ids'] = list(spread_retry_preferred_ids)
+        if (
+            bounded_tts_recovery
+            and not reuse_excluded_candidate_for_tts_recovery
+            and selected_instance_id not in resolved_excluded_instance_ids
+        ):
+            route_runtime_seed['selection_policy'] = (
+                'nonexcluded_alternative_for_tts_recovery'
+            )
+            route_runtime_seed['tts_recovery_trigger'] = (
+                tts_recovery_trigger
+            )
+            route_runtime_seed['tts_recovery_policy_id'] = str(
+                tts_recovery_attempt.get('recovery_policy_id') or ''
+            ).strip() or None
+        if reuse_excluded_candidate_for_tts_recovery:
+            route_runtime_seed['selection_policy'] = 'excluded_reuse_for_single_tts_recovery'
+            route_runtime_seed['excluded_instance_reuse_reason'] = (
+                'bounded_auto_retry_single_compatible_tts_instance'
+                if tts_recovery_trigger
+                == _TTS_AUTO_RECOVERY_TRIGGER
+                else 'explicit_retry_single_compatible_tts_instance'
+            )
+            route_runtime_seed['excluded_instance_reuse_instance_id'] = selected_instance_id
+            route_runtime_seed['excluded_instance_reuse_recovery_trigger'] = (
+                tts_recovery_trigger
+            )
+            route_runtime_seed['tts_recovery_policy_id'] = str(
+                tts_recovery_attempt.get('recovery_policy_id') or ''
+            ).strip() or None
+            logging.info(
+                'Late-fill TTS recovery is reusing sole compatible excluded instance %s '
+                'for branch %s after live candidate refresh.',
+                selected_instance_id,
+                artifact_gap_payload.get('branch_id'),
+            )
         route_runtime = self.merge_request_meta_runtime_truth({}, late_fill_payload, route_payload=route_runtime_seed)
         route_runtime['runtime_candidate_snapshot'] = dict(candidate_snapshot_meta)
         route_runtime['candidate_diagnostics'] = list(route_runtime_seed.get('candidate_diagnostics') or [])
-        if selected_via_spread_retry:
+        if reuse_excluded_candidate_for_tts_recovery:
+            route_runtime['selection_policy'] = 'excluded_reuse_for_single_tts_recovery'
+            route_runtime['excluded_instance_reuse_reason'] = str(
+                route_runtime_seed.get('excluded_instance_reuse_reason') or ''
+            ).strip()
+            route_runtime['excluded_instance_reuse_instance_id'] = selected_instance_id
+            route_runtime['excluded_instance_reuse_recovery_trigger'] = (
+                tts_recovery_trigger
+            )
+            route_runtime['tts_recovery_policy_id'] = str(
+                route_runtime_seed.get('tts_recovery_policy_id') or ''
+            ).strip() or None
+        elif selected_via_spread_retry:
             route_runtime['selection_policy'] = 'spread_retry_preferred_instance'
             route_runtime['spread_retry_reason'] = str(route_runtime_seed.get('spread_retry_reason') or '').strip()
             route_runtime['spread_retry_preferred_instance_ids'] = list(spread_retry_preferred_ids)
+        elif (
+            bounded_tts_recovery
+            and selected_instance_id not in resolved_excluded_instance_ids
+        ):
+            route_runtime['selection_policy'] = (
+                'nonexcluded_alternative_for_tts_recovery'
+            )
+            route_runtime['tts_recovery_trigger'] = tts_recovery_trigger
+            route_runtime['tts_recovery_policy_id'] = str(
+                route_runtime_seed.get('tts_recovery_policy_id') or ''
+            ).strip() or None
         elif reuse_excluded_candidates_for_text_repair:
             route_runtime['selection_policy'] = 'excluded_reuse_for_authoritative_text_repair'
             route_runtime['excluded_instance_reuse_reason'] = str(
@@ -4126,46 +4723,35 @@ class LateFillRuntimeOwner:
                 source_authority = 'effective_branch_content_payload'
         if not source_text.strip():
             return {}
-        source_bytes = source_text.encode('utf-8')
         content_payload_source = str(
             effective.get('content_payload_source')
             or contract.get('content_payload_source')
             or ''
         ).strip()
-        return {
-            key: value
-            for key, value in {
-                'kind': 'ollmo.tts_semantic_source',
-                'version': 1,
-                'policy_id': _TTS_STT_SEMANTIC_POLICY_ID,
-                'authority': 'runtime_exact_backend_prompt',
-                'source_authority': source_authority,
-                'tts_source_text': source_text,
-                'tts_source_text_sha256': hashlib.sha256(source_bytes).hexdigest(),
-                'tts_source_text_source': content_payload_source or source_authority,
-                'branch_id': str(
-                    contract.get('branch_id') or effective.get('branch_id') or ''
-                ).strip() or None,
-                'phase_id': str(
-                    contract.get('phase_id') or effective.get('phase_id') or ''
-                ).strip() or None,
-                'lang_code': str(
-                    infer.get('lang_code')
-                    or effective.get('lang_code')
-                    or contract.get('lang_code')
-                    or ''
-                ).strip().lower() or None,
-            }.items()
-            if value not in (None, '', [], {})
-        }
+        return build_tts_semantic_source(
+            source_text,
+            source_authority=source_authority,
+            source_text_source=content_payload_source or source_authority,
+            branch_id=(
+                contract.get('branch_id') or effective.get('branch_id')
+            ),
+            phase_id=contract.get('phase_id') or effective.get('phase_id'),
+            lang_code=(
+                infer.get('lang_code')
+                or effective.get('lang_code')
+                or contract.get('lang_code')
+            ),
+        )
 
     @classmethod
     def tts_source_evidence_from_prepared_plan(
         cls,
         plan: Mapping[str, Any],
+        *,
+        infer_result: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         payload = plan if isinstance(plan, Mapping) else {}
-        return cls.tts_source_evidence_from_effective_data(
+        planned_source = cls.tts_source_evidence_from_effective_data(
             payload.get('effective_data')
             if isinstance(payload.get('effective_data'), Mapping)
             else {},
@@ -4180,6 +4766,47 @@ class LateFillRuntimeOwner:
                 else {}
             ),
         )
+        result_payload = infer_result if isinstance(infer_result, Mapping) else {}
+        runtime_source = (
+            result_payload.get('tts_semantic_source')
+            if isinstance(result_payload.get('tts_semantic_source'), Mapping)
+            else {}
+        )
+        if not runtime_source:
+            return planned_source
+        runtime_source_text = str(
+            runtime_source.get('tts_source_text') or ''
+        )
+        runtime_source_sha256 = str(
+            runtime_source.get('tts_source_text_sha256') or ''
+        ).strip().lower()
+        runtime_source_contract_valid = bool(
+            str(runtime_source.get('kind') or '').strip()
+            == 'ollmo.tts_semantic_source'
+            and runtime_source.get('version') == 1
+            and str(runtime_source.get('policy_id') or '').strip()
+            == TTS_SEMANTIC_SOURCE_POLICY_ID
+            and str(runtime_source.get('authority') or '').strip()
+            == 'runtime_exact_backend_prompt'
+            and runtime_source_text.strip()
+            and runtime_source_sha256
+            == hashlib.sha256(runtime_source_text.encode('utf-8')).hexdigest()
+        )
+        if not runtime_source_contract_valid:
+            return planned_source
+
+        # The inference owner has observed the post-extraction, post-file-merge
+        # prompt actually handed to MLX Audio. Preserve that text/digest and add
+        # only branch-local bindings that inference cannot know.
+        enriched_source = dict(runtime_source)
+        for key in ('branch_id', 'phase_id', 'lang_code'):
+            value = planned_source.get(key)
+            if (
+                enriched_source.get(key) in (None, '', [], {})
+                and value not in (None, '', [], {})
+            ):
+                enriched_source[key] = value
+        return enriched_source
 
     def tts_audio_integrity_evidence_for_branch_result(
         self,
@@ -4207,6 +4834,16 @@ class LateFillRuntimeOwner:
             )
             else {}
         )
+        generation_budget = (
+            result_payload.get('tts_generation_budget')
+            if isinstance(result_payload.get('tts_generation_budget'), Mapping)
+            else {}
+        )
+        tts_model_type = str(
+            result_payload.get('tts_model_type')
+            or generation_budget.get('tts_model_type')
+            or ''
+        ).strip()
         existing_contract_valid = bool(
             str(existing.get('kind') or '').strip()
             == 'ollmo.tts_audio_integrity_evidence'
@@ -4223,23 +4860,39 @@ class LateFillRuntimeOwner:
             ).strip()
             evidence_path = str(evidence.get('artifact_path') or '').strip()
             if source_sha256 and evidence_source_sha256 != source_sha256:
+                defect_codes = [
+                    str(item).strip()
+                    for item in (evidence.get('defect_codes') or [])
+                    if str(item).strip()
+                ] if isinstance(evidence.get('defect_codes'), list) else []
+                if 'TTS_AUDIO_SOURCE_BINDING_MISMATCH' not in defect_codes:
+                    defect_codes.insert(0, 'TTS_AUDIO_SOURCE_BINDING_MISMATCH')
                 evidence.update(
                     {
                         'status': 'failed',
                         'reason_code': 'TTS_AUDIO_SOURCE_BINDING_MISMATCH',
                         'materialization_eligible': False,
                         'expected_source_sha256': source_sha256,
+                        'defect_codes': defect_codes,
                     }
                 )
             elif path and evidence_path and Path(path).expanduser() != Path(
                 evidence_path
             ).expanduser():
+                defect_codes = [
+                    str(item).strip()
+                    for item in (evidence.get('defect_codes') or [])
+                    if str(item).strip()
+                ] if isinstance(evidence.get('defect_codes'), list) else []
+                if 'TTS_AUDIO_ARTIFACT_BINDING_MISMATCH' not in defect_codes:
+                    defect_codes.insert(0, 'TTS_AUDIO_ARTIFACT_BINDING_MISMATCH')
                 evidence.update(
                     {
                         'status': 'failed',
                         'reason_code': 'TTS_AUDIO_ARTIFACT_BINDING_MISMATCH',
                         'materialization_eligible': False,
                         'expected_artifact_path': path,
+                        'defect_codes': defect_codes,
                     }
                 )
             return evidence
@@ -4253,11 +4906,15 @@ class LateFillRuntimeOwner:
                 'reason_code': 'TTS_AUDIO_SOURCE_EVIDENCE_UNAVAILABLE',
                 'materialization_eligible': False,
                 'artifact_path': path or None,
+                'defect_codes': ['TTS_AUDIO_SOURCE_EVIDENCE_UNAVAILABLE'],
             }
         return build_tts_audio_integrity_evidence(
             path,
             source_text,
             source_sha256=source_sha256 or None,
+            generation_budget=generation_budget or None,
+            model_family=(generation_budget.get('model_family') or None),
+            tts_model_type=tts_model_type or None,
         )
 
     def tts_audio_integrity_error_for_branch_result(
@@ -4280,13 +4937,31 @@ class LateFillRuntimeOwner:
             evidence.get('reason_code')
             or 'TTS_AUDIO_INTEGRITY_UNAVAILABLE'
         ).strip()
+        defect_codes = [
+            str(item).strip()
+            for item in (evidence.get('defect_codes') or [])
+            if str(item).strip()
+        ] if isinstance(evidence.get('defect_codes'), list) else []
+        if reason_code and reason_code not in defect_codes:
+            defect_codes.insert(0, reason_code)
         saved_audio_path = str(
             (infer_result or {}).get('saved_audio_path') or ''
         ).strip()
+        generation_budget = (
+            (infer_result or {}).get('tts_generation_budget')
+            if isinstance((infer_result or {}).get('tts_generation_budget'), Mapping)
+            else {}
+        )
+        sampling_profile = (
+            (infer_result or {}).get('tts_sampling_profile')
+            if isinstance((infer_result or {}).get('tts_sampling_profile'), Mapping)
+            else {}
+        )
         return {
             'code': 'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED',
             'reason_code': reason_code,
             'defect_code': reason_code,
+            'defect_codes': defect_codes,
             'message': (
                 'Generated audio failed output-side integrity verification; '
                 'the preserved file is diagnostic evidence, not fulfilled audio.'
@@ -4296,7 +4971,14 @@ class LateFillRuntimeOwner:
             'repair_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
             'materialization_blocked': True,
             'blocked_scope': 'current_tts_branch',
+            'repair_work_available': True,
+            'repair_work_policy': (
+                'bounded_same_response_tts_integrity_retry'
+            ),
+            'needs_external_input': False,
             'audio_integrity_evidence': evidence,
+            'tts_generation_budget': dict(generation_budget) if generation_budget else None,
+            'tts_sampling_profile': dict(sampling_profile) if sampling_profile else None,
             'diagnostic_artifact': (
                 {
                     'type': 'audio',
@@ -5231,6 +5913,7 @@ class LateFillRuntimeOwner:
             'semantic_batch_prompt',
             'semantic_batch_prompts',
             'semantic_prepare_phase_output',
+            'current_turn_direct_image_clause',
             'action_input',
             'prompt_blockquote_section',
             'quoted_prompt_section',
@@ -11273,6 +11956,7 @@ class LateFillRuntimeOwner:
             'semantic_batch_prompt',
             'semantic_batch_prompts',
             'semantic_prepare_phase_output',
+            'current_turn_direct_image_clause',
             'action_input',
             'prompt_blockquote_section',
             'quoted_prompt_section',
@@ -11873,6 +12557,12 @@ class LateFillRuntimeOwner:
         )
         if selected_reference_payload.get('branch_contract_error'):
             return selected_reference_payload
+        if self._branch_has_current_turn_direct_media_payload(branch):
+            return {
+                'dependency_payload_policy': (
+                    'preserve_current_turn_direct_media_payload'
+                )
+            }
         if not depends_on and not selected_reference_payload:
             return {}
         target_capability = self.normalize_capability(branch.get('capability'))
@@ -12122,6 +12812,8 @@ class LateFillRuntimeOwner:
             'speed',
             'pitch',
             'tts_semantic_source',
+            'tts_generation_budget',
+            'tts_sampling_profile',
             'tts_audio_integrity_evidence',
             'reference_image_count',
             'reference_image_kind',
@@ -12660,7 +13352,10 @@ class LateFillRuntimeOwner:
             and self.normalize_capability(plan.get('capability'))
             == self.capability_text_to_speech
         ):
-            semantic_source = self.tts_source_evidence_from_prepared_plan(plan)
+            semantic_source = self.tts_source_evidence_from_prepared_plan(
+                plan,
+                infer_result=infer_result,
+            )
             if semantic_source:
                 infer_result = dict(infer_result)
                 infer_result['tts_semantic_source'] = semantic_source
@@ -12773,6 +13468,14 @@ class LateFillRuntimeOwner:
             or failed_instance_id
             or ''
         ).strip() or None
+        if capability == self.capability_text_to_speech:
+            # A retry-wave envelope carries the anchor's recovery markers.
+            # TTS branch markers remain authoritative so sibling retries do
+            # not inherit the anchor identity during the narrow reuse policy.
+            for key in ('recovery_state', 'recovery_attempt'):
+                value = branch.get(key)
+                if isinstance(value, Mapping) and value:
+                    branch_gap[key] = dict(value)
         for key in (
             'artifact_prompt',
             'artifact_prompt_source',
@@ -12834,6 +13537,11 @@ class LateFillRuntimeOwner:
             self._artifact_gap_is_authoritative_bounded_text_artifact_repair(branch_gap)
             and str(branch_gap.get('content_payload') or '').strip()
         )
+        preserve_direct_spoken_payload = bool(
+            str(branch_gap.get('content_payload') or '').strip()
+            and str(branch_gap.get('content_payload_source') or '').strip()
+            == 'current_turn_direct_spoken_clause'
+        )
         dependency_payload = self.branch_dependency_payload(
             branch,
             current_payload=current_payload,
@@ -12845,6 +13553,14 @@ class LateFillRuntimeOwner:
                     and key in {'content_payload', 'content_payload_source'}
                 ):
                     branch_gap['dependency_payload_policy'] = 'preserve_authoritative_text_repair_payload'
+                    continue
+                if (
+                    preserve_direct_spoken_payload
+                    and key in {'content_payload', 'content_payload_source'}
+                ):
+                    branch_gap['dependency_payload_policy'] = (
+                        'preserve_current_turn_direct_media_payload'
+                    )
                     continue
                 branch_gap[key] = value
         branch_gap = self.focus_late_fill_branch_gap_payload(
@@ -15149,6 +15865,35 @@ class LateFillRuntimeOwner:
                             status='candidate',
                             trigger='semantic_evidence_gate',
                         )
+                        retry_branch = (
+                            self.build_auto_executable_repair_retry_branch(
+                                branch,
+                                recovery_context=recovery_context,
+                                recovery_state=recovery_state,
+                                attempt=attempt_payload,
+                                trigger=(
+                                    _TTS_AUTO_RECOVERY_TRIGGER
+                                ),
+                            )
+                        )
+                        if retry_branch:
+                            retry_branch_replacements[branch_id] = retry_branch
+                            branch_errors.pop(branch_id, None)
+                            self.log_unified_event(
+                                category='responses',
+                                action='late_fill',
+                                status='queued',
+                                response_id=response_id,
+                                capability=capability,
+                                recovery_policy_id=(
+                                    _TTS_AUTO_RECOVERY_POLICY_ID
+                                ),
+                                message=(
+                                    'Required TTS branch requeued for one bounded '
+                                    'integrity recovery attempt.'
+                                ),
+                            )
+                            continue
                         _remember_branch(
                             failed_branch_records,
                             failed_branches,
@@ -15253,6 +15998,32 @@ class LateFillRuntimeOwner:
                         'route_source': str((late_fill_route_info or {}).get('route_source') or '').strip() or None,
                         'route_reason': str((late_fill_route_info or {}).get('route_reason') or '').strip() or None,
                     }
+                    late_fill_route_runtime = (
+                        late_fill_route_info.get('route_runtime')
+                        if isinstance(
+                            late_fill_route_info.get('route_runtime'),
+                            Mapping,
+                        )
+                        else {}
+                    )
+                    for key in (
+                        'selection_policy',
+                        'excluded_instance_ids',
+                        'excluded_candidate_count',
+                        'candidate_diagnostics',
+                        'tts_recovery_trigger',
+                        'tts_recovery_policy_id',
+                        'excluded_instance_reuse_reason',
+                        'excluded_instance_reuse_instance_id',
+                        'excluded_instance_reuse_recovery_trigger',
+                    ):
+                        value = late_fill_route_runtime.get(key)
+                        if value not in (None, '', [], {}):
+                            fill_record[key] = value
+                    if isinstance(branch.get('recovery_attempt'), Mapping):
+                        fill_record['recovery_attempt'] = dict(
+                            branch.get('recovery_attempt') or {}
+                        )
                     if execution_contract:
                         fill_record['execution_contract'] = execution_contract
                         workload_task_ref = (
@@ -15343,6 +16114,8 @@ class LateFillRuntimeOwner:
                         'speed',
                         'pitch',
                         'tts_semantic_source',
+                        'tts_generation_budget',
+                        'tts_sampling_profile',
                         'tts_audio_integrity_evidence',
                         'tts_stt_semantic_evidence',
                     ):

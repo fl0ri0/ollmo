@@ -18,6 +18,9 @@ from ollmo_integrations.codex.execution import (
 from ollmo_webserver import _resolve_ghost_auto_route, app
 
 
+_OLLMO_DOWNSTREAM_EXECUTION_MARKER = '[OLLMO_DOWNSTREAM_EXECUTION_V1]'
+
+
 def _discovery():
     return CodexDiscovery(
         available=True,
@@ -68,6 +71,33 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
+
+    def _assert_downstream_prompt(self, prompt, task):
+        self.assertTrue(prompt.startswith(_OLLMO_DOWNSTREAM_EXECUTION_MARKER))
+        self.assertIn(
+            'this request is already being executed by Ollmo through ChatGPT/Codex',
+            prompt,
+        )
+
+    def _completed_stream_response(self, body):
+        for block in body.split('\n\n'):
+            lines = block.splitlines()
+            if not lines or lines[0] != 'event: response.completed':
+                continue
+            data_line = next(
+                (line for line in lines[1:] if line.startswith('data: ')),
+                '',
+            )
+            if data_line:
+                return json.loads(data_line[len('data: '):])['response']
+        self.fail('response.completed event was not found')
+        self.assertIn('Do not invoke, route to, or use Ollmo again', prompt)
+        self.assertIn('begin the response with "BLOCKED:"', prompt)
+        self.assertIn(
+            f'<ollmo_bounded_task>\nCurrent user request:\n{task}\n'
+            '</ollmo_bounded_task>',
+            prompt,
+        )
 
     @patch(
         'ollmo_integrations.codex.runtime_target.probe_codex_access',
@@ -189,7 +219,91 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
             payload['runtime']['external_execution']['exact_model_exposed'],
         )
         self.assertIn('response_frame', payload)
-        execute_codex.assert_called_once_with('Return OLLMO_CODEX_OK.')
+        execute_codex.assert_called_once()
+        self._assert_downstream_prompt(
+            execute_codex.call_args.args[0],
+            'Return OLLMO_CODEX_OK.',
+        )
+
+    @patch(
+        'ollmo_integrations.codex.runtime_target.probe_codex_access',
+        return_value=_access(),
+    )
+    @patch('ollmo_webserver._execute_codex_external_text')
+    def test_codex_explicit_block_is_canonical_and_never_materialized(
+        self,
+        execute_codex,
+        _probe,
+    ):
+        self._enable_codex()
+        blocked_text = (
+            'bLoCkEd: $OLLMO_HOME is unavailable in this downstream session.\n'
+            'The bounded task cannot be completed safely.'
+        )
+        blocked_reason = (
+            '$OLLMO_HOME is unavailable in this downstream session.\n'
+            'The bounded task cannot be completed safely.'
+        )
+        execute_codex.return_value = CodexExecutionResult(
+            status=CodexExecutionState.COMPLETED,
+            discovery=_discovery(),
+            output_text=blocked_text,
+            exit_code=0,
+        )
+
+        with (
+            patch(
+                'ollmo_server.responses_request_runtime.phase_output_is_graph_preparation'
+            ) as phase_acceptance,
+            patch(
+                'ollmo_server.responses_request_runtime.ResponsesRequestRuntimeOwner.'
+                'attach_pre_freeze_closure_review'
+            ) as pre_freeze,
+            patch(
+                'ollmo_server.responses_request_runtime.ResponsesRequestRuntimeOwner.'
+                'apply_direct_artifact_materialization_closure'
+            ) as direct_closure,
+            patch('ollmo_webserver._schedule_response_late_fill') as late_fill,
+        ):
+            response = self.client.post(
+                '/api/responses',
+                json={
+                    'instance_id': 'external:codex',
+                    'prompt': 'Read $OLLMO_HOME and create an artifact.',
+                    'stream': False,
+                    'response_id': 'resp_codex_blocked',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload['status'], 'completed')
+        self.assertEqual(payload['lifecycle_state'], 'blocked')
+        self.assertEqual(payload['output_text'], blocked_text)
+        self.assertEqual(payload['artifacts'], [])
+        self.assertNotIn('late_fill', payload)
+        self.assertEqual(payload['outputs'][0]['status'], 'blocked')
+        self.assertEqual(payload['outputs'][0]['lifecycle'], 'blocked_output')
+        self.assertEqual(payload['outputs'][0]['value'], blocked_text)
+        self.assertEqual(payload['outputs'][0]['blocked_reason'], blocked_reason)
+        self.assertEqual(payload['surface_state']['status'], 'blocked')
+        self.assertEqual(payload['surface_state']['category_counts'], {'blocked': 1})
+        self.assertEqual(
+            payload['runtime']['external_execution']['status'],
+            'blocked',
+        )
+        self.assertEqual(
+            payload['runtime']['external_execution']['invocation_status'],
+            'completed',
+        )
+        self.assertEqual(
+            payload['runtime']['external_execution']['blocked_reason'],
+            blocked_reason,
+        )
+        phase_acceptance.assert_not_called()
+        pre_freeze.assert_not_called()
+        direct_closure.assert_not_called()
+        late_fill.assert_not_called()
 
     @patch(
         'ollmo_integrations.codex.runtime_target.probe_codex_access',
@@ -236,6 +350,10 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         forwarded_prompt = execute_codex.call_args.args[0]
+        self._assert_downstream_prompt(
+            forwarded_prompt,
+            'Continue from that answer.',
+        )
         self.assertIn('Prior conversation context promoted by Ollmo', forwarded_prompt)
         self.assertIn('[user]\nName this plan Atlas.', forwarded_prompt)
         self.assertIn('[assistant]\nThe plan is Atlas.', forwarded_prompt)
@@ -245,6 +363,53 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
             payload['runtime']['context_strategy']['mode'],
             'recent_history',
         )
+
+    @patch(
+        'ollmo_integrations.codex.runtime_target.probe_codex_access',
+        return_value=_access(),
+    )
+    @patch('ollmo_webserver._execute_codex_external_text')
+    def test_codex_marker_precedes_selected_message_reference_context(
+        self,
+        execute_codex,
+        _probe,
+    ):
+        self._enable_codex()
+        execute_codex.return_value = CodexExecutionResult(
+            status=CodexExecutionState.COMPLETED,
+            discovery=_discovery(),
+            output_text='REFERENCE_OK',
+            exit_code=0,
+        )
+
+        response = self.client.post(
+            '/api/responses',
+            json={
+                'instance_id': 'external:codex',
+                'prompt': 'Use the selected reply as a reference.',
+                'selected_reference_artifacts': [
+                    {
+                        'type': 'message',
+                        'message_role': 'assistant',
+                        'content': 'The bounded reference reply.',
+                    }
+                ],
+                'stream': False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        execute_codex.assert_called_once()
+        forwarded_prompt = execute_codex.call_args.args[0]
+        self.assertTrue(forwarded_prompt.startswith(_OLLMO_DOWNSTREAM_EXECUTION_MARKER))
+        self.assertIn('<ollmo_bounded_task>', forwarded_prompt)
+        self.assertIn('Selected prior assistant reply reference', forwarded_prompt)
+        self.assertIn('[assistant]\nThe bounded reference reply.', forwarded_prompt)
+        self.assertIn(
+            'Current user request:\nUse the selected reply as a reference.',
+            forwarded_prompt,
+        )
+        self.assertTrue(forwarded_prompt.endswith('</ollmo_bounded_task>'))
 
     @patch(
         'ollmo_integrations.codex.runtime_target.probe_codex_access',
@@ -289,7 +454,71 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
         body = response.get_data(as_text=True)
         self.assertIn('event: response.completed', body)
         self.assertIn('STREAMED_CODEX_OK', body)
-        execute_codex.assert_called_once_with('Return STREAMED_CODEX_OK.')
+        execute_codex.assert_called_once()
+        self._assert_downstream_prompt(
+            execute_codex.call_args.args[0],
+            'Return STREAMED_CODEX_OK.',
+        )
+
+    @patch(
+        'ollmo_integrations.codex.runtime_target.probe_codex_access',
+        return_value=_access(),
+    )
+    @patch('ollmo_webserver._execute_codex_external_text')
+    def test_codex_stream_preserves_explicit_block_without_late_fill(
+        self,
+        execute_codex,
+        _probe,
+    ):
+        self._enable_codex()
+        blocked_text = (
+            'BLOCKED: $OLLMO_HOME cannot be inspected by the downstream provider.'
+        )
+        execute_codex.return_value = CodexExecutionResult(
+            status=CodexExecutionState.COMPLETED,
+            discovery=_discovery(),
+            output_text=blocked_text,
+            exit_code=0,
+        )
+
+        with (
+            patch(
+                'ollmo_server.responses_request_runtime.phase_output_is_graph_preparation'
+            ) as phase_acceptance,
+            patch(
+                'ollmo_server.responses_request_runtime.ResponsesRequestRuntimeOwner.'
+                'attach_pre_freeze_closure_review'
+            ) as pre_freeze,
+            patch(
+                'ollmo_server.responses_request_runtime.ResponsesRequestRuntimeOwner.'
+                'apply_direct_artifact_materialization_closure'
+            ) as direct_closure,
+            patch('ollmo_webserver._schedule_response_late_fill') as late_fill,
+        ):
+            response = self.client.post(
+                '/api/responses',
+                json={
+                    'instance_id': 'external:codex',
+                    'prompt': 'Inspect $OLLMO_HOME.',
+                    'stream': True,
+                },
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, 'text/event-stream')
+        payload = self._completed_stream_response(body)
+        self.assertEqual(payload['lifecycle_state'], 'blocked')
+        self.assertEqual(payload['output_text'], blocked_text)
+        self.assertEqual(payload['outputs'][0]['status'], 'blocked')
+        self.assertEqual(payload['outputs'][0]['value'], blocked_text)
+        self.assertEqual(payload.get('artifacts', []), [])
+        self.assertEqual(payload['surface_state']['status'], 'blocked')
+        self.assertNotIn('late_fill', payload)
+        phase_acceptance.assert_not_called()
+        pre_freeze.assert_not_called()
+        direct_closure.assert_not_called()
+        late_fill.assert_not_called()
 
     @patch(
         'ollmo_integrations.codex.runtime_target.probe_codex_access',
@@ -419,9 +648,14 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
             payload['runtime']['external_execution']['input_count'],
             1,
         )
-        execute_codex.assert_called_once_with(
+        execute_codex.assert_called_once()
+        self._assert_downstream_prompt(
+            execute_codex.call_args.args[0],
             'Use the selected notes.',
-            inputs=[
+        )
+        self.assertEqual(
+            execute_codex.call_args.kwargs['inputs'],
+            [
                 CodexExecutionInput(
                     path=str(selected_file),
                     display_name=selected_file.name,
@@ -464,9 +698,14 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        execute_codex.assert_called_once_with(
+        execute_codex.assert_called_once()
+        self._assert_downstream_prompt(
+            execute_codex.call_args.args[0],
             'Use both selected files.',
-            inputs=[
+        )
+        self.assertEqual(
+            execute_codex.call_args.kwargs['inputs'],
+            [
                 CodexExecutionInput(
                     path=str(first),
                     display_name=first.name,
@@ -629,9 +868,14 @@ class CodexRuntimeBridgeTests(unittest.TestCase):
         self.assertEqual(payload['output_text'], 'GHOST_FILE_OK')
         self.assertEqual(payload['route_source'], 'ghost_carried')
         self.assertEqual(payload['lifecycle_state'], 'completed')
-        execute_codex.assert_called_once_with(
+        execute_codex.assert_called_once()
+        self._assert_downstream_prompt(
+            execute_codex.call_args.args[0],
             'Summarize the selected text file in one sentence.',
-            inputs=[
+        )
+        self.assertEqual(
+            execute_codex.call_args.kwargs['inputs'],
+            [
                 CodexExecutionInput(
                     path=str(selected_file),
                     display_name=selected_file.name,

@@ -23,9 +23,12 @@ from ollmo_core.inference import (
 )
 from ollmo_g.intent import (
     analyze_prompt_intent,
+    intent_span_is_literal_payload,
+    mask_intent_literal_payloads,
     materialization_negation_match_is_artifact_fulfillment_only,
     materialization_negation_match_is_output_contrast,
     normalize_intent_text,
+    visual_action_is_negated,
 )
 from ollmo_g.intent_obligations import (
     apply_intent_obligation_dependency_edges,
@@ -36,6 +39,7 @@ from ollmo_g.intent_obligations import (
 from ollmo_g.request_ir import build_request_ir
 from ollmo_g.request_meta import extract_request_meta
 from ollmo_services.responses import extract_responses_current_turn_prompt
+from ollmo_services.tts_source import resolve_explicit_tts_source
 
 REQUEST_PHASE_GRAPH_VERSION = 3
 _GHOST_PREPARE_FIRST_MATERIALIZATION_CAPABILITIES = {
@@ -226,6 +230,17 @@ _GENERATE_AUDIO_ACTION_RE = re.compile(
     r'\b(?:replace|ersetz(?:e|en|t|st)?)\b[^.;!?]{0,120}\b(?:audio[\s-]?branch|audiozweig(?:e)?)\b'
     r'[^.;!?]{0,80}\b(?:with|by|durch)\b[^.;!?]{0,80}\b(?:audio[\s-]?(?:version(?:s)?|variant(?:s)?|fassung(?:en)?))\b|'
     r'\b(?:audio generation|audiogenerierung)\b[^.;!?]{0,80}\b(?:start|starts|run|runs|starte|läuft|laeuft)\b',
+    re.IGNORECASE,
+)
+_DIRECT_IMAGE_DESCRIPTION_PREFIX_RE = re.compile(
+    r'(?i)^\s*(?:of|showing|depicting|featuring|with)\s+'
+)
+_DIRECT_MEDIA_DEICTIC_PAYLOAD_RE = re.compile(
+    r'^\s*(?:it|this|that|these|those|them|him|her|daraus|davon|dies(?:e|er|es|en|em)?|'
+    r'das|sie|es)(?:\b|$)|'
+    r'^\s*(?:(?:the\s+)?(?:previous|prepared|generated|written|described|referenced)\s+)?'
+    r'(?:story|text|description|prompt|reply|response|content)\b|'
+    r'^\s*the\s+(?:story|text|description|prompt|reply|response|content)\s+(?:above|before)\b',
     re.IGNORECASE,
 )
 _GERMAN_ORIGINAL_AUDIO_VARIANT_RE = re.compile(
@@ -621,6 +636,14 @@ _RESERVED_OPTION_ONLY_RE = re.compile(
     r'\b(?:reserved|reserve|keep|note|remember|option|optional|reserviert(?:e|en|er|es)?|'
     r'vormerk(?:e|en)?|merk(?:e|en)?|halte(?:n)?|festhalten)\b'
     r'[^.;!?]{0,120}\b(?:reserved|option|optional|candidate|kandidat(?:en)?|reserviert(?:e|en|er|es)?|option(?:en)?)\b',
+    re.IGNORECASE,
+)
+_REJECTED_IMAGE_CANDIDATE_PLANNING_RE = re.compile(
+    r'\b(?:do\s+not|don[\'’]?t|never|without|nicht|nie|ohne)\b'
+    r'[^.;!?]{0,120}\b(?:plan|queue|schedule|reserve|propose|plan(?:e|en|t)?|vormerk|reservier)\w*\b'
+    r'[^.;!?]{0,80}\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?)\b|'
+    r'\b(?:no|kein(?:e|en|er|es)?)\b[^.;!?]{0,32}'
+    r'\b(?:image|picture|photo|illustration|bild|foto)[\s-]?(?:plan|candidate|option|planung|kandidat|option)\w*\b',
     re.IGNORECASE,
 )
 _SELECTED_IMAGE_CANDIDATE_INDEX_RE = re.compile(
@@ -1431,6 +1454,133 @@ def _bind_current_predecessor_image_prompts(
     )
 
 
+def _bounded_directive_clause_end(prompt_text: str, offset: int) -> int:
+    tail = prompt_text[max(0, offset):]
+    boundaries = [
+        match.start()
+        for pattern in (
+            re.compile(r'[.;!?\n]'),
+            re.compile(r'(?i),\s*(?:and\s+)?then\b|\band\s+then\b|\bthen\b'),
+        )
+        for match in [pattern.search(tail)]
+        if match is not None
+    ]
+    return max(0, offset) + min(boundaries) if boundaries else len(prompt_text)
+
+
+def _direct_clause_local_media_payloads(
+    prompt_text: str,
+    *,
+    prompt_analysis: Mapping[str, Any],
+) -> dict[str, list[str]]:
+    """Extract only self-contained media payloads from their own action clauses."""
+
+    prompt = str(prompt_text or '').strip()
+    if not prompt:
+        return {'image_generation': [], 'text_to_speech': []}
+    masked_prompt = mask_intent_literal_payloads(prompt)
+
+    image_payloads: list[str] = []
+    for action in _GENERATE_IMAGE_ACTION_RE.finditer(masked_prompt):
+        clause_end = _bounded_directive_clause_end(masked_prompt, action.end())
+        tail = prompt[action.end():clause_end]
+        prefix = _DIRECT_IMAGE_DESCRIPTION_PREFIX_RE.match(tail)
+        if not prefix:
+            continue
+        description = tail[prefix.end():].strip(' \t,:-')
+        if description and not _DIRECT_MEDIA_DEICTIC_PAYLOAD_RE.match(description):
+            image_payloads.append(description)
+
+    tts_source = resolve_explicit_tts_source(prompt)
+    explicit_spoken_text = _clean_text(tts_source.get('text'))
+    spoken_payloads = (
+        [explicit_spoken_text]
+        if explicit_spoken_text
+        and bool(prompt_analysis.get('direct_audio_materialization_request'))
+        and not bool(prompt_analysis.get('text_preparation_before_audio_output'))
+        else []
+    )
+
+    return {
+        CAPABILITY_IMAGE_GENERATION: list(dict.fromkeys(image_payloads)),
+        CAPABILITY_TEXT_TO_SPEECH: list(dict.fromkeys(spoken_payloads)),
+    }
+
+
+def _bind_direct_clause_local_media_payloads(
+    branches: list[dict[str, Any]],
+    *,
+    prompt_text: str,
+    prompt_analysis: Mapping[str, Any],
+    graph_refinements: list[dict[str, Any]],
+) -> None:
+    payloads = _direct_clause_local_media_payloads(
+        prompt_text,
+        prompt_analysis=prompt_analysis,
+    )
+    bound: list[dict[str, str]] = []
+
+    image_branches = [
+        branch
+        for branch in branches
+        if not _is_unpromoted_candidate_record(branch)
+        if normalize_capability(branch.get('capability'))
+        == CAPABILITY_IMAGE_GENERATION
+    ]
+    image_payloads = payloads.get(CAPABILITY_IMAGE_GENERATION) or []
+    if (
+        len(image_branches) == 1
+        and len(image_payloads) == 1
+        and not _clean_text(image_branches[0].get('artifact_prompt'))
+    ):
+        image_branches[0]['artifact_prompt'] = image_payloads[0]
+        image_branches[0]['artifact_prompt_source'] = (
+            'current_turn_direct_image_clause'
+        )
+        bound.append(
+            {
+                'branch_id': _clean_text(image_branches[0].get('branch_id')),
+                'capability': CAPABILITY_IMAGE_GENERATION,
+                'payload_source': 'current_turn_direct_image_clause',
+            }
+        )
+
+    tts_branches = [
+        branch
+        for branch in branches
+        if not _is_unpromoted_candidate_record(branch)
+        if normalize_capability(branch.get('capability'))
+        == CAPABILITY_TEXT_TO_SPEECH
+    ]
+    spoken_payloads = payloads.get(CAPABILITY_TEXT_TO_SPEECH) or []
+    if (
+        len(tts_branches) == 1
+        and len(spoken_payloads) == 1
+        and not _clean_text(tts_branches[0].get('content_payload'))
+        and not _clean_text(tts_branches[0].get('selection_policy'))
+    ):
+        tts_branches[0]['content_payload'] = spoken_payloads[0]
+        tts_branches[0]['content_payload_source'] = (
+            'current_turn_direct_spoken_clause'
+        )
+        bound.append(
+            {
+                'branch_id': _clean_text(tts_branches[0].get('branch_id')),
+                'capability': CAPABILITY_TEXT_TO_SPEECH,
+                'payload_source': 'current_turn_direct_spoken_clause',
+            }
+        )
+
+    if bound:
+        graph_refinements.append(
+            {
+                'source': 'current_turn_direct_media_payload_binding',
+                'refinement': 'clause_local_media_payload_binding',
+                'bindings': bound,
+            }
+        )
+
+
 def _has_source_artifact_available(*payloads: Mapping[str, Any]) -> bool:
     return any(
         _clean_text(
@@ -2158,6 +2308,7 @@ def _post_artifact_continuation_sequence(prompt_analysis: Mapping[str, Any]) -> 
         or _VISUAL_EVIDENCE_TEXT_TRIGGER_RE.search(prompt_text)
     ):
         return []
+    action_prompt_text = mask_intent_literal_payloads(prompt_text)
 
     actions: list[tuple[int, int, str]] = []
     for capability, pattern in (
@@ -2170,12 +2321,31 @@ def _post_artifact_continuation_sequence(prompt_analysis: Mapping[str, Any]) -> 
         if _visual_execution_is_preserved(prompt_analysis, capability):
             continue
         if (
+            capability == CAPABILITY_IMAGE_GENERATION
+            and bool(prompt_analysis.get('explicit_visual_defer_materialization'))
+        ):
+            continue
+        if (
+            capability == CAPABILITY_TEXT_TO_SPEECH
+            and bool(prompt_analysis.get('explicit_audio_defer_materialization'))
+        ):
+            continue
+        if (
             capability == CAPABILITY_TEXT_TO_SPEECH
             and bool(prompt_analysis.get('audio_output_count_exceeds_bound'))
         ):
             continue
-        for match in pattern.finditer(prompt_text):
-            matched_text = match.group(0).lower()
+        for match in pattern.finditer(action_prompt_text):
+            matched_text = prompt_text[match.start():match.end()].lower()
+            if (
+                capability == CAPABILITY_IMAGE_GENERATION
+                and visual_action_is_negated(
+                    prompt_text,
+                    match.start(),
+                    match.end(),
+                )
+            ):
+                continue
             if _prompt_negates_materialization_capability(
                 {'normalized_prompt': matched_text},
                 capability,
@@ -2807,14 +2977,7 @@ def _structured_final_join_span_is_quoted(
 ) -> bool:
     """Return whether the exact matched join span sits inside one bounded quote."""
 
-    bounded_start = max(0, int(start or 0))
-    bounded_end = max(bounded_start, int(end or bounded_start))
-    return any(
-        quote_match.start() < bounded_start
-        and bounded_end < quote_match.end()
-        for pattern in _STRUCTURED_FINAL_QUOTE_SPAN_PATTERNS
-        for quote_match in pattern.finditer(prompt_text)
-    )
+    return intent_span_is_literal_payload(prompt_text, start, end)
 
 
 def _structured_final_join_binding_is_negated(
@@ -3947,19 +4110,24 @@ def _reserved_materialization_candidates(
         return []
     route_capability = normalize_capability(route_payload.get('capability'))
     candidates: list[dict[str, Any]] = []
+    rejects_image_candidate = bool(
+        _REJECTED_IMAGE_CANDIDATE_PLANNING_RE.search(prompt_text)
+    )
     preserves_image = _visual_execution_is_preserved(
         prompt_analysis,
         CAPABILITY_IMAGE_GENERATION,
     )
     reserves_image = bool(
-        not preserves_image
+        not rejects_image_candidate
+        and not preserves_image
         and _prompt_reserves_materialization_capability(
             prompt_analysis,
             CAPABILITY_IMAGE_GENERATION,
         )
     )
     negates_image = bool(
-        not preserves_image
+        not rejects_image_candidate
+        and not preserves_image
         and _prompt_negates_materialization_capability(
             prompt_analysis,
             CAPABILITY_IMAGE_GENERATION,
@@ -4454,6 +4622,12 @@ def build_request_phase_graph(
         current_predecessor_image_prompts,
         graph_refinements,
     )
+    _bind_direct_clause_local_media_payloads(
+        downstream_branches,
+        prompt_text=normalized_prompt,
+        prompt_analysis=prompt_analysis,
+        graph_refinements=graph_refinements,
+    )
     downstream_branches.extend(
         _text_artifact_request_branches(
             text_artifact_requests,
@@ -4866,6 +5040,13 @@ def build_request_phase_graph(
                 and 'phase-1' in depends_on
             ):
                 preparation_capabilities.add(capability)
+    direct_spoken_payload_bound = any(
+        normalize_capability(branch.get('capability')) == CAPABILITY_TEXT_TO_SPEECH
+        and _clean_text(branch.get('content_payload'))
+        and _clean_text(branch.get('content_payload_source'))
+        == 'current_turn_direct_spoken_clause'
+        for branch in downstream_branch_records
+    )
 
     prompt_intent = {
         'primary_capability': normalize_capability(prompt_analysis.get('primary_capability')),
@@ -4953,7 +5134,10 @@ def build_request_phase_graph(
         ),
         'text_preparation_before_audio_output': bool(
             prompt_analysis.get('text_preparation_before_audio_output')
-            or CAPABILITY_TEXT_TO_SPEECH in preparation_capabilities
+            or (
+                CAPABILITY_TEXT_TO_SPEECH in preparation_capabilities
+                and not direct_spoken_payload_bound
+            )
         ),
         'text_preparation_before_visual_output': bool(
             prompt_analysis.get('text_preparation_before_visual_output')

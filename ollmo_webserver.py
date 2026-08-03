@@ -4776,6 +4776,7 @@ def _build_late_fill_retry_wave_branch(
     recovery_context = _recovery_mapping(target_branch, 'recovery_context')
     recovery_state = _recovery_mapping(target_branch, 'recovery_state')
     attempt = _recovery_mapping(target_branch, 'attempt')
+    error = _recovery_mapping(target_branch, 'error')
     branch_id = _branch_id(target_branch)
     capability = _branch_capability(target_branch) or ''
     action = _late_fill_branch_recovery_action(
@@ -4805,6 +4806,11 @@ def _build_late_fill_retry_wave_branch(
         or recovery_state.get('failed_instance_id')
         or ''
     ).strip()
+    prior_error_code = str(
+        error.get('code')
+        or recovery_state.get('prior_error_code')
+        or ''
+    ).strip().upper()
     excluded_instance_ids: list[str] = []
     for item in [*branch_excluded, *recovery_excluded, *body_excluded, failed_instance_id]:
         token = str(item or '').strip()
@@ -4818,6 +4824,7 @@ def _build_late_fill_retry_wave_branch(
         'preserve_intent': True,
         'auto_execute': False,
         'failed_instance_id': failed_instance_id or None,
+        'prior_error_code': prior_error_code or None,
         'excluded_instance_ids': excluded_instance_ids,
         'retry_wave_anchor_branch_id': anchor_branch_id if anchor_branch_id and anchor_branch_id != branch_id else None,
     }
@@ -4838,6 +4845,7 @@ def _build_late_fill_retry_wave_branch(
         'retry_scope': _late_fill_branch_recovery_scope(target_branch, action=action),
         'suggested_action': action,
         'failed_instance_id': failed_instance_id or None,
+        'prior_error_code': prior_error_code or None,
         'exclude_instance_ids': excluded_instance_ids,
         'retry_wave_anchor_branch_id': anchor_branch_id if anchor_branch_id and anchor_branch_id != branch_id else None,
     }
@@ -5900,6 +5908,23 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             value = raw_branch.get(key)
             if value not in (None, '', [], {}):
                 branch[key] = value
+        if capability == 'text_to_speech':
+            for key in (
+                'suggested_action',
+                'repair_work_policy',
+                'repair_work_available',
+                'materialization_blocked',
+                'needs_external_input',
+                'blocked_scope',
+                'blocked_prerequisite',
+                'auto_execute',
+                'auto_executable_repair_retry_count',
+                'auto_executable_repair_max_attempts',
+                'recovery_policy_id',
+            ):
+                value = raw_branch.get(key)
+                if value not in (None, '', [], {}):
+                    branch[key] = value
         batch_prompts = [
             str(item).strip()
             for item in (raw_branch.get('batch_prompts') or [])
@@ -5977,6 +6002,16 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 branch_error['failed_dependency_ids'] = list(
                     dict.fromkeys(failed_dependency_ids)
                 )
+            if capability == 'text_to_speech':
+                defect_codes = [
+                    str(item or '').strip()
+                    for item in (error.get('defect_codes') or [])
+                    if str(item or '').strip()
+                ] if isinstance(error.get('defect_codes'), list) else []
+                if defect_codes:
+                    branch_error['defect_codes'] = list(
+                        dict.fromkeys(defect_codes)
+                    )
             semantic_evidence = error.get('semantic_evidence')
             if isinstance(semantic_evidence, Mapping) and semantic_evidence:
                 branch_error['semantic_evidence'] = dict(semantic_evidence)
@@ -5988,6 +6023,10 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 branch_error['audio_integrity_evidence'] = dict(
                     audio_integrity_evidence
                 )
+            for key in ('tts_generation_budget', 'tts_sampling_profile'):
+                value = error.get(key)
+                if isinstance(value, Mapping) and value:
+                    branch_error[key] = dict(value)
             diagnostic_artifact = error.get('diagnostic_artifact')
             if isinstance(diagnostic_artifact, Mapping) and diagnostic_artifact:
                 branch_error['diagnostic_artifact'] = {
@@ -6044,6 +6083,17 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 text = str(value or '').strip()
                 if text:
                     branch_recovery[target_key] = text
+            if capability == 'text_to_speech':
+                for source_key, target_key in (
+                    ('error_code', 'error_code'),
+                    ('errorCode', 'error_code'),
+                    ('reason_code', 'reason_code'),
+                    ('reasonCode', 'reason_code'),
+                ):
+                    value = recovery_context.get(source_key)
+                    text = str(value or '').strip()
+                    if text:
+                        branch_recovery[target_key] = text
             for source_key, target_key in (
                 ('can_retry', 'can_retry'),
                 ('canRetry', 'can_retry'),
@@ -6081,6 +6131,26 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             ]
             if exclude_instance_ids:
                 branch_recovery['exclude_instance_ids'] = exclude_instance_ids
+            if capability == 'text_to_speech':
+                recovery_defect_codes = [
+                    str(item or '').strip()
+                    for item in (recovery_context.get('defect_codes') or [])
+                    if str(item or '').strip()
+                ] if isinstance(recovery_context.get('defect_codes'), list) else []
+                if recovery_defect_codes:
+                    branch_recovery['defect_codes'] = list(
+                        dict.fromkeys(recovery_defect_codes)
+                    )
+                recovery_integrity = recovery_context.get(
+                    'audio_integrity_evidence'
+                )
+                if (
+                    isinstance(recovery_integrity, Mapping)
+                    and recovery_integrity
+                ):
+                    branch_recovery['audio_integrity_evidence'] = dict(
+                        recovery_integrity
+                    )
             if branch_recovery:
                 branch['recovery_context'] = branch_recovery
         recovery_state = (
@@ -6105,6 +6175,8 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 ('suggestedAction', 'suggested_action'),
                 ('failed_instance_id', 'failed_instance_id'),
                 ('failedInstanceId', 'failed_instance_id'),
+                ('prior_error_code', 'prior_error_code'),
+                ('priorErrorCode', 'prior_error_code'),
                 ('retry_wave_anchor_branch_id', 'retry_wave_anchor_branch_id'),
                 ('retryWaveAnchorBranchId', 'retry_wave_anchor_branch_id'),
                 ('blocked_scope', 'blocked_scope'),
@@ -6118,6 +6190,17 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 text = str(value or '').strip()
                 if text:
                     branch_recovery_state[target_key] = normalize_capability(text) if target_key == 'capability' else text
+            if capability == 'text_to_speech':
+                for source_key, target_key in (
+                    ('recovery_policy_id', 'recovery_policy_id'),
+                    ('recoveryPolicyId', 'recovery_policy_id'),
+                    ('prior_reason_code', 'prior_reason_code'),
+                    ('priorReasonCode', 'prior_reason_code'),
+                ):
+                    value = recovery_state.get(source_key)
+                    text = str(value or '').strip()
+                    if text:
+                        branch_recovery_state[target_key] = text
             for source_key, target_key in (
                 ('promotion_required', 'promotion_required'),
                 ('promotionRequired', 'promotion_required'),
@@ -6157,6 +6240,28 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             ]
             if recovery_exclude_instance_ids:
                 branch_recovery_state['exclude_instance_ids'] = recovery_exclude_instance_ids
+            if capability == 'text_to_speech':
+                for source_key, target_key in (
+                    ('attempt_number', 'attempt_number'),
+                    ('attemptNumber', 'attempt_number'),
+                    ('maximum_attempts', 'maximum_attempts'),
+                    ('maximumAttempts', 'maximum_attempts'),
+                ):
+                    try:
+                        value = int(recovery_state.get(source_key))
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        branch_recovery_state[target_key] = value
+                prior_defect_codes = [
+                    str(item or '').strip()
+                    for item in (recovery_state.get('prior_defect_codes') or [])
+                    if str(item or '').strip()
+                ] if isinstance(recovery_state.get('prior_defect_codes'), list) else []
+                if prior_defect_codes:
+                    branch_recovery_state['prior_defect_codes'] = list(
+                        dict.fromkeys(prior_defect_codes)
+                    )
             if branch_recovery_state:
                 branch['recovery_state'] = branch_recovery_state
         recovery_attempt = (
@@ -6176,6 +6281,8 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 ('capability', 'capability'),
                 ('failed_instance_id', 'failed_instance_id'),
                 ('failedInstanceId', 'failed_instance_id'),
+                ('prior_error_code', 'prior_error_code'),
+                ('priorErrorCode', 'prior_error_code'),
                 ('retry_wave_anchor_branch_id', 'retry_wave_anchor_branch_id'),
                 ('retryWaveAnchorBranchId', 'retry_wave_anchor_branch_id'),
             ):
@@ -6183,6 +6290,17 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 text = str(value or '').strip()
                 if text:
                     branch_recovery_attempt[target_key] = normalize_capability(text) if target_key == 'capability' else text
+            if capability == 'text_to_speech':
+                for source_key, target_key in (
+                    ('recovery_policy_id', 'recovery_policy_id'),
+                    ('recoveryPolicyId', 'recovery_policy_id'),
+                    ('prior_reason_code', 'prior_reason_code'),
+                    ('priorReasonCode', 'prior_reason_code'),
+                ):
+                    value = recovery_attempt.get(source_key)
+                    text = str(value or '').strip()
+                    if text:
+                        branch_recovery_attempt[target_key] = text
             for source_key, target_key in (
                 ('auto_execute', 'auto_execute'),
                 ('autoExecute', 'auto_execute'),
@@ -6206,6 +6324,38 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             ]
             if attempt_excluded_instance_ids:
                 branch_recovery_attempt['excluded_instance_ids'] = attempt_excluded_instance_ids
+            if capability == 'text_to_speech':
+                for source_key, target_key in (
+                    ('attempt_number', 'attempt_number'),
+                    ('attemptNumber', 'attempt_number'),
+                    ('maximum_attempts', 'maximum_attempts'),
+                    ('maximumAttempts', 'maximum_attempts'),
+                ):
+                    try:
+                        value = int(recovery_attempt.get(source_key))
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        branch_recovery_attempt[target_key] = value
+                prior_attempt_defect_codes = [
+                    str(item or '').strip()
+                    for item in (recovery_attempt.get('prior_defect_codes') or [])
+                    if str(item or '').strip()
+                ] if isinstance(recovery_attempt.get('prior_defect_codes'), list) else []
+                if prior_attempt_defect_codes:
+                    branch_recovery_attempt['prior_defect_codes'] = list(
+                        dict.fromkeys(prior_attempt_defect_codes)
+                    )
+                prior_audio_integrity = recovery_attempt.get(
+                    'prior_audio_integrity_evidence'
+                )
+                if (
+                    isinstance(prior_audio_integrity, Mapping)
+                    and prior_audio_integrity
+                ):
+                    branch_recovery_attempt[
+                        'prior_audio_integrity_evidence'
+                    ] = dict(prior_audio_integrity)
             if branch_recovery_attempt:
                 branch['recovery_attempt'] = branch_recovery_attempt
         branches.append(branch)

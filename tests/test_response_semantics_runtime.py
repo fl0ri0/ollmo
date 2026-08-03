@@ -16,7 +16,10 @@ from ollmo_server.response_semantics_runtime import (
     phase_output_acceptance_metadata,
 )
 from ollmo_services.responses import build_canonical_response_artifacts
-from ollmo_services.tts_audio_integrity import TTS_AUDIO_INTEGRITY_POLICY_ID
+from ollmo_services.tts_audio_integrity import (
+    TTS_AUDIO_INTEGRITY_POLICY_ID,
+    build_tts_semantic_source,
+)
 
 
 def _normalize_capability_list(values):
@@ -53,6 +56,11 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         ).strip()
         self.late_fill_owner.branch_capability = lambda branch: str(branch.get('capability') or '').strip().lower() or None
         self.late_fill_owner.build_canonical_response_artifacts = build_canonical_response_artifacts
+        self.late_fill_owner.normalize_late_fill_branches = lambda value: [
+            dict(item)
+            for item in (value if isinstance(value, list) else [])
+            if isinstance(item, dict)
+        ]
 
     @staticmethod
     def _structured_dependency_join_fixture(
@@ -3503,6 +3511,83 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(updated['runtime']['truth_guard']['kind'], 'ungrounded_text_artifact_reference')
         self.assertEqual(updated['runtime']['truth_guard']['status'], 'clarification_required')
 
+    def test_truth_gate_preserves_self_contained_deictic_tts_sources(self):
+        cases = (
+            (
+                'english_this_text',
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Speak this text exactly: "At sunrise, the harbor slowly came alive."',
+                'At sunrise, the harbor slowly came alive.',
+            ),
+            (
+                'german_den_text',
+                'Erzeuge genau ein deutsches Audio-Artefakt mit lokaler Text-zu-Sprache. '
+                'Sprich den Text genau: „Bei Sonnenaufgang erwachte der Hafen langsam.“',
+                'Bei Sonnenaufgang erwachte der Hafen langsam.',
+            ),
+            (
+                'german_diesen_text',
+                'Erzeuge genau ein deutsches Audio-Artefakt mit lokaler Text-zu-Sprache. '
+                'Sprich diesen Text genau: „Bei Sonnenaufgang erwachte der Hafen langsam.“',
+                'Bei Sonnenaufgang erwachte der Hafen langsam.',
+            ),
+            (
+                'german_output_first_inline_text',
+                'Erstelle ein Audio aus diesem Text: '
+                '„Bei Sonnenaufgang erwachte der Hafen langsam.“',
+                'Bei Sonnenaufgang erwachte der Hafen langsam.',
+            ),
+            (
+                'english_output_first_unquoted_inline_text',
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Speak this text exactly: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+        )
+
+        for case_name, prompt, spoken_text in cases:
+            with self.subTest(case=case_name):
+                updated = self.owner.truth_gate_response_output_claims(
+                    {
+                        'id': f'resp_self_contained_tts_{case_name}',
+                        'output_text': spoken_text,
+                    },
+                    request_payload={'prompt': prompt},
+                )
+
+                self.assertEqual(updated['output_text'], spoken_text)
+                self.assertNotIn('truth_guard', updated.get('runtime') or {})
+
+    def test_truth_gate_keeps_ungrounded_text_and_html_transforms_fail_closed(self):
+        prompts = (
+            'Save this text.',
+            'Transform this text into an HTML artifact.',
+            'Mach daraus ein HTML und ein Audio.',
+            'Create this image, then speak this text exactly: "Hello."',
+            'Speak this text exactly: "Hello." Then turn this image into audio.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                updated = self.owner.truth_gate_response_output_claims(
+                    {
+                        'id': 'resp_ungrounded_text_transform',
+                        'output_text': '<!DOCTYPE html><html><body>Invented source</body></html>',
+                    },
+                    request_payload={'prompt': prompt},
+                )
+
+                self.assertIn('need the source/content', updated['output_text'])
+                self.assertNotIn('<!DOCTYPE html>', updated['output_text'])
+                self.assertEqual(
+                    updated['runtime']['truth_guard']['kind'],
+                    'ungrounded_text_artifact_reference',
+                )
+                self.assertEqual(
+                    updated['runtime']['truth_guard']['status'],
+                    'clarification_required',
+                )
+
     def test_truth_gate_does_not_treat_loose_reference_history_as_current_source(self):
         payload = {
             'id': 'resp_loose_history_this_artifact',
@@ -4870,6 +4955,46 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(updated['output_text'], payload['output_text'])
         self.assertNotIn('truth_guard', updated.get('runtime') or {})
 
+    def test_truth_gate_allows_direct_relative_media_content_clauses(self):
+        prompts = (
+            (
+                'Create one image of a lighthouse at sunrise. Then create one English audio '
+                'artifact that says, "The lighthouse welcomes the morning."'
+            ),
+            (
+                'Create one image of a lighthouse at sunrise. Then create one English audio '
+                'artifact that says "The lighthouse welcomes the morning."'
+            ),
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                payload = {
+                    'id': 'resp_direct_relative_media_content',
+                    'output_text': 'The two direct media payloads are ready for their branches.',
+                }
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={'capability': 'chat'},
+                )
+
+                self.assertFalse(
+                    _request_requires_current_source_for_transform(
+                        prompt,
+                        request_payload={'prompt': prompt},
+                        route_payload={'runtime': {'request_phase_graph': graph}},
+                        response_payload=payload,
+                    )
+                )
+                updated = self.owner.truth_gate_response_output_claims(
+                    payload,
+                    route_payload={'runtime': {'request_phase_graph': graph}},
+                    request_payload={'prompt': prompt},
+                )
+
+                self.assertEqual(updated['output_text'], payload['output_text'])
+                self.assertNotIn('truth_guard', updated.get('runtime') or {})
+
     def test_truth_gate_binds_show_pronoun_to_same_turn_generated_description(self):
         prompt = (
             'Describe a place of your dream in vivid detail, '
@@ -5370,6 +5495,66 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(error['code'], 'UPSTREAM_CLARIFICATION_REQUIRED')
         self.assertEqual(error['stage'], 'truth_guard_gate')
         self.assertFalse(error['retryable'])
+
+    def test_late_fill_preserves_narrow_direct_media_payloads_over_bad_phase_one_text(self):
+        current_payload = {
+            'output_text': (
+                'I need the source/content for the referenced file before I can create that artifact.'
+            ),
+            'runtime': {
+                'truth_guard': {
+                    'kind': 'ungrounded_text_artifact_reference',
+                    'status': 'clarification_required',
+                }
+            },
+        }
+        branches = (
+            {
+                'branch_id': 'branch-image_generation-1',
+                'phase_id': 'phase-2',
+                'capability': 'image_generation',
+                'depends_on': ['phase-1'],
+                'artifact_prompt': 'a lighthouse at sunrise',
+                'artifact_prompt_source': 'current_turn_direct_image_clause',
+            },
+            {
+                'branch_id': 'branch-text_to_speech-1',
+                'phase_id': 'phase-3',
+                'capability': 'text_to_speech',
+                'depends_on': ['phase-1'],
+                'content_payload': 'The lighthouse welcomes the morning.',
+                'content_payload_source': 'current_turn_direct_spoken_clause',
+            },
+        )
+
+        for branch in branches:
+            with self.subTest(capability=branch['capability']):
+                self.assertFalse(
+                    LateFillRuntimeOwner._branch_depends_on_rejected_current_payload(
+                        self.late_fill_owner,
+                        branch,
+                        current_payload=current_payload,
+                    )
+                )
+                self.assertIsNone(
+                    LateFillRuntimeOwner.repair_branch_execution_error(
+                        self.late_fill_owner,
+                        branch,
+                        current_payload=current_payload,
+                    )
+                )
+                self.assertEqual(
+                    LateFillRuntimeOwner.branch_dependency_payload(
+                        self.late_fill_owner,
+                        branch,
+                        current_payload=current_payload,
+                    ),
+                    {
+                        'dependency_payload_policy': (
+                            'preserve_current_turn_direct_media_payload'
+                        )
+                    },
+                )
 
     def test_late_fill_blocks_materialization_from_repair_required_control_payload(self):
         control_payload = json.dumps(
@@ -6264,16 +6449,27 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             'phase_id': 'phase-2',
             'capability': 'text_to_speech',
         }
+        failed_evidence = self._tts_integrity_evidence(
+            source_text=source_text,
+            path='/tmp/truncated.wav',
+            status='failed',
+            reason_code='TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+        )
+        failed_evidence['defect_codes'] = [
+            'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+            'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+            'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+        ]
         result = {
             'capability': 'text_to_speech',
             'saved_audio_path': '/tmp/truncated.wav',
             'tts_semantic_source': source,
-            'tts_audio_integrity_evidence': self._tts_integrity_evidence(
-                source_text=source_text,
-                path='/tmp/truncated.wav',
-                status='failed',
-                reason_code='TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
-            ),
+            'tts_generation_budget': {
+                'kind': 'ollmo.tts_generation_budget',
+                'policy_id': 'qwen3_tts_adaptive_audio_tokens_v1',
+                'max_tokens': 192,
+            },
+            'tts_audio_integrity_evidence': failed_evidence,
         }
 
         error = self.late_fill_owner.dependency_evidence_error_for_branch_result(
@@ -6291,6 +6487,20 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(error.get('materialization_blocked'))
         self.assertEqual(
+            error.get('defect_codes'),
+            [
+                'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+                'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+            ],
+        )
+        self.assertTrue(error.get('repair_work_available'))
+        self.assertFalse(error.get('needs_external_input'))
+        self.assertEqual(
+            error.get('tts_generation_budget', {}).get('max_tokens'),
+            192,
+        )
+        self.assertEqual(
             error.get('diagnostic_artifact', {}).get('path'),
             '/tmp/truncated.wav',
         )
@@ -6299,6 +6509,98 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                 'materialization_eligible'
             )
         )
+
+    def test_qwen_generation_ceiling_failure_remains_an_integrity_repair(self):
+        source_text = 'The full lighthouse message must be spoken.'
+        source = self.late_fill_owner.tts_source_evidence_from_effective_data(
+            {'content_payload': source_text},
+            infer_payload={'prompt': source_text},
+        )
+        failed_integrity = self._tts_integrity_evidence(
+            source_text=source_text,
+            path='/tmp/qwen-at-generation-cap.wav',
+            status='failed',
+            reason_code='TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+        )
+        failed_integrity['chunking_evidence'] = {
+            'kind': 'ollmo.tts_chunking_plan',
+            'policy_id': 'qwen3_tts_sentence_chunks_v1',
+            'status': 'failed',
+            'generation_limit_recovery_attempt_count': 1,
+            'chunks': [
+                {
+                    'index': 3,
+                    'status': 'failed',
+                    'attempt_count': 2,
+                    'generation_limit_recovery': {
+                        'kind': 'ollmo.tts_generation_limit_recovery',
+                        'policy_id': (
+                            'qwen3_tts_single_sequence_generation_limit_retry_v2'
+                        ),
+                        'trigger_reason_code': (
+                            'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED'
+                        ),
+                        'status': 'failed',
+                        'initial_max_tokens': 269,
+                        'recovery_max_tokens': 404,
+                    },
+                    'attempts': [
+                        {
+                            'attempt_index': 1,
+                            'role': 'initial',
+                            'selected': False,
+                        },
+                        {
+                            'attempt_index': 2,
+                            'role': 'generation_limit_recovery',
+                            'selected': True,
+                        },
+                    ],
+                }
+            ],
+        }
+        result = {
+            'capability': 'text_to_speech',
+            'saved_audio_path': '/tmp/qwen-at-generation-cap.wav',
+            'tts_semantic_source': source,
+            'tts_generation_budget': {
+                'kind': 'ollmo.tts_generation_budget',
+                'policy_id': 'qwen3_tts_adaptive_audio_tokens_v2',
+                'model_family': 'qwen3_tts',
+                'tts_model_type': 'voice_design',
+                'generation_scope': 'single_sequence',
+                'max_tokens': 579,
+            },
+            'tts_audio_integrity_evidence': failed_integrity,
+        }
+
+        error = self.late_fill_owner.dependency_evidence_error_for_branch_result(
+            {
+                'branch_id': 'branch-text_to_speech-cap',
+                'phase_id': 'phase-2',
+                'capability': 'text_to_speech',
+            },
+            result,
+        )
+
+        self.assertEqual(error['code'], 'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED')
+        self.assertEqual(
+            error['reason_code'],
+            'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+        )
+        self.assertTrue(error['materialization_blocked'])
+        self.assertFalse(
+            error['audio_integrity_evidence']['materialization_eligible']
+        )
+        recovery = error['audio_integrity_evidence']['chunking_evidence'][
+            'chunks'
+        ][0]['generation_limit_recovery']
+        self.assertEqual(
+            recovery['policy_id'],
+            'qwen3_tts_single_sequence_generation_limit_retry_v2',
+        )
+        self.assertEqual(recovery['initial_max_tokens'], 269)
+        self.assertEqual(recovery['recovery_max_tokens'], 404)
 
     def test_direct_audio_closure_blocks_failed_integrity_despite_saved_wav(self):
         source_text = 'Dies ist die vollständige Audiofassung.'
@@ -6362,6 +6664,16 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             'retry_same_branch',
         )
         self.assertTrue(audio_check['materialization_blocked'])
+        self.assertFalse(
+            any(
+                item.get('capability') == 'image_generation'
+                for item in review['checks']
+            )
+        )
+        self.assertNotIn(
+            'image_generation',
+            review.get('graph_capability_counts', {}),
+        )
 
     def test_direct_audio_closure_accepts_passed_integrity(self):
         source_text = 'Dies ist die vollständige Audiofassung.'
@@ -6459,6 +6771,160 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(
             integrity['source_sha256'],
             source['tts_source_text_sha256'],
+        )
+
+    def test_execute_prepared_tts_branch_preserves_runtime_backend_source(self):
+        cases = (
+            (
+                'quoted',
+                'Generate audio for: "Exakter Backend-Text aus dem Zitat."',
+                'Exakter Backend-Text aus dem Zitat.',
+            ),
+            (
+                'fenced',
+                '```txt\nExakter Backend-Text aus dem Block.\n```\nPosterbeschreibung.',
+                'Exakter Backend-Text aus dem Block.',
+            ),
+            (
+                'file-backed',
+                'Generate audio for: "Erster Backend-Satz."',
+                'Erster Backend-Satz.\n\nZweiter Satz aus der Textdatei.',
+            ),
+        )
+        for label, planned_prompt, backend_text in cases:
+            with self.subTest(label=label):
+                audio_path = f'/tmp/{label}-exact-source.wav'
+                semantic_source = build_tts_semantic_source(
+                    backend_text,
+                    source_text_source='inference_final_spoken_prompt',
+                    lang_code='de',
+                )
+                self.late_fill_owner.invoke_internal_api_json_route = (
+                    lambda **kwargs: (
+                        {
+                            'mode': 'text_to_speech',
+                            'saved_audio_path': audio_path,
+                            'tts_semantic_source': semantic_source,
+                            'tts_audio_integrity_evidence': self._tts_integrity_evidence(
+                                source_text=backend_text,
+                                path=audio_path,
+                            ),
+                        },
+                        200,
+                    )
+                )
+                self.late_fill_owner.filter_responses_infer_result = (
+                    lambda result, **kwargs: dict(result)
+                )
+
+                result = self.late_fill_owner.execute_prepared_late_fill_branch(
+                    {
+                        'capability': 'text_to_speech',
+                        'effective_data': {
+                            'content_payload': 'Veraltete Zwischenfassung.',
+                        },
+                        'infer_payload': {'prompt': planned_prompt},
+                        'execution_contract': {
+                            'branch_id': f'branch-text_to_speech-{label}',
+                            'phase_id': 'phase-2',
+                            'capability': 'text_to_speech',
+                        },
+                    }
+                )
+
+                infer_result = result['infer_result']
+                preserved_source = infer_result['tts_semantic_source']
+                self.assertEqual(
+                    preserved_source['tts_source_text'],
+                    backend_text,
+                )
+                self.assertEqual(
+                    preserved_source['tts_source_text_sha256'],
+                    hashlib.sha256(backend_text.encode('utf-8')).hexdigest(),
+                )
+                self.assertNotEqual(
+                    preserved_source['tts_source_text_sha256'],
+                    hashlib.sha256(planned_prompt.encode('utf-8')).hexdigest(),
+                )
+                self.assertEqual(
+                    preserved_source['branch_id'],
+                    f'branch-text_to_speech-{label}',
+                )
+                self.assertEqual(preserved_source['phase_id'], 'phase-2')
+                self.assertEqual(preserved_source['lang_code'], 'de')
+                self.assertEqual(
+                    infer_result['tts_audio_integrity_evidence']['source_sha256'],
+                    preserved_source['tts_source_text_sha256'],
+                )
+                self.assertIsNone(
+                    self.late_fill_owner.dependency_evidence_error_for_branch_result(
+                        {
+                            'branch_id': f'branch-text_to_speech-{label}',
+                            'phase_id': 'phase-2',
+                            'capability': 'text_to_speech',
+                        },
+                        infer_result,
+                    )
+                )
+
+    def test_execute_prepared_tts_branch_blocks_runtime_source_hash_mismatch(self):
+        planned_prompt = 'Generate audio for: "Exakter Backend-Text."'
+        backend_text = 'Exakter Backend-Text.'
+        audio_path = '/tmp/mismatched-exact-source.wav'
+        semantic_source = build_tts_semantic_source(
+            backend_text,
+            source_text_source='inference_final_spoken_prompt',
+        )
+        self.late_fill_owner.invoke_internal_api_json_route = lambda **kwargs: (
+            {
+                'mode': 'text_to_speech',
+                'saved_audio_path': audio_path,
+                'tts_semantic_source': semantic_source,
+                'tts_audio_integrity_evidence': self._tts_integrity_evidence(
+                    source_text=planned_prompt,
+                    path=audio_path,
+                ),
+            },
+            200,
+        )
+        self.late_fill_owner.filter_responses_infer_result = (
+            lambda result, **kwargs: dict(result)
+        )
+
+        result = self.late_fill_owner.execute_prepared_late_fill_branch(
+            {
+                'capability': 'text_to_speech',
+                'effective_data': {
+                    'content_payload': 'Veraltete Zwischenfassung.',
+                },
+                'infer_payload': {'prompt': planned_prompt},
+                'execution_contract': {
+                    'branch_id': 'branch-text_to_speech-mismatch',
+                    'phase_id': 'phase-2',
+                    'capability': 'text_to_speech',
+                },
+            }
+        )
+
+        infer_result = result['infer_result']
+        error = self.late_fill_owner.dependency_evidence_error_for_branch_result(
+            {
+                'branch_id': 'branch-text_to_speech-mismatch',
+                'phase_id': 'phase-2',
+                'capability': 'text_to_speech',
+            },
+            infer_result,
+        )
+        self.assertEqual(error['code'], 'TTS_AUDIO_INTEGRITY_REPAIR_REQUIRED')
+        self.assertEqual(
+            error['reason_code'],
+            'TTS_AUDIO_SOURCE_BINDING_MISMATCH',
+        )
+        self.assertTrue(error['materialization_blocked'])
+        self.assertFalse(
+            infer_result['tts_audio_integrity_evidence'][
+                'materialization_eligible'
+            ]
         )
 
     def test_standalone_stt_remains_outside_tts_semantic_policy(self):
@@ -10900,6 +11366,127 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual(image_checks, [])
 
+    def test_intent_adequacy_keeps_spoken_poem_request_audio_only(self):
+        prompt = (
+            'Write a short original poem in English inspired by Ollmo – by open possibilities, '
+            'intentions taking form, unfinished work remaining visible, and truth resting in what '
+            'was actually made. Let it feel reflective and lyrical rather than technical.\n\n'
+            'Save the poem as a Markdown file and generate a spoken version using local '
+            'text-to-speech with a calm, confident, deep voice.\n\nNo image.'
+        )
+        phase_graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        review = self.owner.build_intent_graph_adequacy_review(
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            request_phase_graph=phase_graph,
+        )
+
+        self.assertEqual(review['expected_output_counts'], {'audio': 1})
+        self.assertNotIn('image', review['expected_output_counts'])
+        self.assertFalse(
+            any(
+                item.get('capability') == 'image_generation'
+                or item.get('obligation_id') == 'missing-obligation-image'
+                for item in review['checks']
+            )
+        )
+
+    def test_intent_adequacy_does_not_repair_image_from_quoted_tts_sequence_word(self):
+        prompt = (
+            'Create exactly one English audio artifact using local text-to-speech. '
+            'Read only the quoted passage. Do not create or plan an image. '
+            '"At sunrise, the harbor slowly came alive. Nothing was finished, '
+            'but everything was finally moving."'
+        )
+        phase_graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        review = self.owner.build_intent_graph_adequacy_review(
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            request_phase_graph=phase_graph,
+        )
+
+        self.assertEqual(review['expected_output_counts'], {'audio': 1})
+        self.assertNotIn('image', review['expected_output_counts'])
+        self.assertFalse(
+            any(
+                item.get('capability') == 'image_generation'
+                or item.get('obligation_id') == 'missing-obligation-image'
+                for item in review['checks']
+            )
+        )
+        self.assertNotIn(
+            'image_generation',
+            [branch.get('capability') for branch in phase_graph['downstream_branches']],
+        )
+
+    def test_intent_adequacy_requires_graph_authority_before_image_repair(self):
+        prompt = 'Write a poem and generate a spoken version.'
+        phase_graph = {
+            'current_phase_id': 'phase-1',
+            'current_phase_capability': 'chat',
+            'prompt': prompt,
+            'prompt_intent': {
+                'requests_visual_output': True,
+                'requested_visual_output_count': 1,
+                'counted_visual_output_obligation': True,
+                'downstream_follow_up_capabilities': ['image_generation'],
+            },
+            'intent_obligations': [],
+            'output_obligations': [],
+            'downstream_branches': [
+                {
+                    'branch_id': 'branch-image_generation-reserved-1',
+                    'phase_id': 'phase-image_generation-reserved-1',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'contract_state': 'reserved',
+                    'required': False,
+                },
+            ],
+            'phases': [
+                {
+                    'phase_id': 'phase-1',
+                    'branch_id': 'phase-1',
+                    'capability': 'chat',
+                    'output_type': 'text',
+                    'status': 'completed',
+                },
+            ],
+        }
+
+        review = self.owner.build_intent_graph_adequacy_review(
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            request_phase_graph=phase_graph,
+        )
+
+        self.assertNotIn('image', review['expected_output_counts'])
+        self.assertFalse(
+            any(item.get('obligation_id') == 'missing-obligation-image' for item in review['checks'])
+        )
+
+    def test_intent_adequacy_preserves_explicit_promoted_image_work(self):
+        prompt = 'Create one image of a green ghost.'
+        phase_graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        review = self.owner.build_intent_graph_adequacy_review(
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            request_phase_graph=phase_graph,
+        )
+
+        self.assertEqual(review['expected_output_counts'], {'image': 1})
+
     def test_intent_adequacy_current_preservation_overrides_stale_visual_graph_cues(self):
         prompt = (
             'Beziehe dich ausdrücklich auf das Observatorium-Bild, seine Bildanalyse, '
@@ -11225,7 +11812,7 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             )
         )
 
-    def test_intent_adequacy_keeps_exact_count_when_legacy_graph_only_has_reserved_images(self):
+    def test_intent_adequacy_does_not_promote_legacy_reserved_images_from_prompt_flags(self):
         prompt = (
             'Erstelle genau drei Bilder und zwei Dateien: index.html und styles.css. '
             'Keine Platzhalter, erfundenen Dateipfade oder externen Bilder.'
@@ -11306,15 +11893,14 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             request_phase_graph=phase_graph,
         )
 
-        image_check = next(
-            item for item in review['checks']
-            if item.get('check_kind') == 'intent_graph_adequacy'
-            and item.get('output_type') == 'image'
+        self.assertNotIn('image', review['expected_output_counts'])
+        self.assertFalse(
+            any(
+                item.get('output_type') == 'image'
+                or item.get('obligation_id') == 'missing-obligation-image'
+                for item in review['checks']
+            )
         )
-        self.assertEqual(review['expected_output_counts']['image'], 3)
-        self.assertEqual(image_check['expected_count'], 3)
-        self.assertEqual(image_check['actual_count'], 0)
-        self.assertEqual(image_check['missing_count'], 3)
 
     def test_intent_adequacy_reports_missing_ledger_dependency_edge_as_repairable(self):
         prompt = (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import io
 import json
 import logging
 import mimetypes
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
@@ -495,6 +497,76 @@ def persist_audio_bytes_locally(
         return None
 
 
+def join_pcm_wav_bytes(chunks: list[bytes]) -> tuple[bytes, dict[str, Any]]:
+    """Join compatible uncompressed PCM WAV responses without transcoding."""
+
+    if not chunks:
+        raise ValueError('At least one PCM WAV chunk is required.')
+
+    expected_format: Optional[tuple[int, int, int, str, str]] = None
+    pcm_parts: list[bytes] = []
+    chunk_frame_counts: list[int] = []
+    for index, raw_chunk in enumerate(chunks, start=1):
+        if not isinstance(raw_chunk, (bytes, bytearray)) or not raw_chunk:
+            raise ValueError(f'PCM WAV chunk {index} is empty.')
+        try:
+            with wave.open(io.BytesIO(bytes(raw_chunk)), 'rb') as audio:
+                chunk_format = (
+                    audio.getnchannels(),
+                    audio.getsampwidth(),
+                    audio.getframerate(),
+                    audio.getcomptype(),
+                    audio.getcompname(),
+                )
+                if chunk_format[3] != 'NONE':
+                    raise ValueError(
+                        f'PCM WAV chunk {index} uses unsupported compression {chunk_format[3]!r}.'
+                    )
+                if min(chunk_format[:3]) <= 0:
+                    raise ValueError(f'PCM WAV chunk {index} has an invalid audio format.')
+                if expected_format is None:
+                    expected_format = chunk_format
+                elif chunk_format != expected_format:
+                    raise ValueError(
+                        f'PCM WAV chunk {index} does not match the first chunk format.'
+                    )
+                frame_count = audio.getnframes()
+                frames = audio.readframes(frame_count)
+                bytes_per_frame = chunk_format[0] * chunk_format[1]
+                if frame_count <= 0 or len(frames) != frame_count * bytes_per_frame:
+                    raise ValueError(f'PCM WAV chunk {index} has incomplete frame data.')
+        except (EOFError, OSError, wave.Error) as exc:
+            raise ValueError(f'PCM WAV chunk {index} is unreadable.') from exc
+        pcm_parts.append(frames)
+        chunk_frame_counts.append(frame_count)
+
+    assert expected_format is not None
+    channel_count, sample_width, sample_rate, compression_type, compression_name = expected_format
+    joined_buffer = io.BytesIO()
+    with wave.open(joined_buffer, 'wb') as output:
+        output.setnchannels(channel_count)
+        output.setsampwidth(sample_width)
+        output.setframerate(sample_rate)
+        output.setcomptype(compression_type, compression_name)
+        for frames in pcm_parts:
+            output.writeframesraw(frames)
+        output.writeframes(b'')
+    joined = joined_buffer.getvalue()
+    total_frames = sum(chunk_frame_counts)
+    return joined, {
+        'kind': 'ollmo.pcm_wav_join',
+        'version': 1,
+        'chunk_count': len(chunks),
+        'channel_count': channel_count,
+        'sample_width_bytes': sample_width,
+        'sample_rate_hz': sample_rate,
+        'compression_type': compression_type,
+        'chunk_frame_counts': chunk_frame_counts,
+        'total_frame_count': total_frames,
+        'duration_seconds': round(total_frames / sample_rate, 6),
+    }
+
+
 def persist_text_markdown_locally(
     content: Optional[str],
     *,
@@ -793,6 +865,10 @@ def mlx_audio_speech(
     pitch: float = 1.0,
     lang_code: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    repetition_penalty: Optional[float] = None,
     timeout_sec: int = 600,
 ) -> dict:
     resolved_response_format = str(response_format or '').strip().lower() or 'wav'
@@ -806,6 +882,14 @@ def mlx_audio_speech(
     }
     if max_tokens is not None:
         payload['max_tokens'] = int(max_tokens)
+    if temperature is not None:
+        payload['temperature'] = float(temperature)
+    if top_p is not None:
+        payload['top_p'] = float(top_p)
+    if top_k is not None:
+        payload['top_k'] = int(top_k)
+    if repetition_penalty is not None:
+        payload['repetition_penalty'] = float(repetition_penalty)
     if instruct:
         payload['instruct'] = instruct
     if voice:

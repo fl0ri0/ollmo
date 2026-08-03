@@ -1,10 +1,17 @@
+import hashlib
+import io
+import math
 import tempfile
 import unittest
+import wave
 from pathlib import Path
+from unittest.mock import patch
 
 from ollmo_core.inference import (
     InferArtifacts,
     InferContext,
+    build_qwen3_tts_chunk_plan,
+    build_qwen3_tts_generation_budget,
     detect_text_artifact_request,
     detect_text_artifact_requests,
     dispatch_infer_request,
@@ -13,11 +20,153 @@ from ollmo_core.inference import (
     generated_text_is_artifact_self_claim,
     text_artifact_request_is_ungrounded_reference,
 )
+import ollmo_core.inference as inference_service
 import ollmo_core.transports as transports
 from ollmo_core.transports import persist_text_artifact_locally
 
 
+def _pcm_wav_bytes(duration_seconds: float, *, sample_rate: int = 8000) -> bytes:
+    frame_count = int(round(duration_seconds * sample_rate))
+    pcm = b''.join(
+        int(
+            12000 * math.sin((2 * math.pi * 220 * index) / sample_rate)
+        ).to_bytes(2, 'little', signed=True)
+        for index in range(frame_count)
+    )
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def _pcm_wav_segment_bytes(
+    segments: list[tuple[float, bool]],
+    *,
+    sample_rate: int = 8000,
+) -> bytes:
+    samples: list[int] = []
+    phase = 0
+    for duration_seconds, active in segments:
+        frame_count = int(round(duration_seconds * sample_rate))
+        for _ in range(frame_count):
+            sample = (
+                int(
+                    12000
+                    * math.sin((2 * math.pi * 220 * phase) / sample_rate)
+                )
+                if active
+                else 0
+            )
+            samples.append(sample)
+            phase += 1
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(
+            b''.join(
+                sample.to_bytes(2, 'little', signed=True)
+                for sample in samples
+            )
+        )
+    return buffer.getvalue()
+
+
 class InferenceServiceTests(unittest.TestCase):
+    def test_qwen3_tts_generation_budget_scales_and_clamps(self):
+        short_budget = build_qwen3_tts_generation_budget('Hallo Welt.')
+        medium_budget = build_qwen3_tts_generation_budget(
+            ' '.join(f'Wort{index}' for index in range(1, 81))
+        )
+        long_budget = build_qwen3_tts_generation_budget(
+            ' '.join(f'Wort{index}' for index in range(1, 1001))
+        )
+
+        self.assertEqual(short_budget['max_tokens'], 256)
+        self.assertEqual(short_budget['clamp'], 'minimum')
+        self.assertGreater(medium_budget['max_tokens'], short_budget['max_tokens'])
+        self.assertLess(medium_budget['max_tokens'], 1200)
+        self.assertEqual(long_budget['max_tokens'], 1200)
+        self.assertEqual(long_budget['clamp'], 'maximum')
+        self.assertEqual(
+            medium_budget['policy_id'],
+            'qwen3_tts_adaptive_audio_tokens_v2',
+        )
+        self.assertEqual(medium_budget['policy']['audio_tokens_per_second'], 12.5)
+        self.assertEqual(medium_budget['policy']['fixed_buffer_seconds'], 8.0)
+        self.assertEqual(medium_budget['policy']['minimum_tokens'], 256)
+
+    def test_qwen3_single_sequence_generation_limit_recovery_scales_and_clamps(self):
+        initial_budget = build_qwen3_tts_generation_budget(
+            'Mara stood beside the old lighthouse and listened to the waves.'
+        )
+        initial_budget.update(
+            {
+                'max_tokens': 269,
+                'tts_model_type': 'voice_design',
+                'generation_scope': 'single_sequence',
+            }
+        )
+
+        recovery = inference_service._build_qwen3_tts_generation_limit_recovery(
+            initial_budget
+        )
+
+        self.assertTrue(recovery['applied'])
+        self.assertEqual(recovery['initial_max_tokens'], 269)
+        self.assertEqual(recovery['recovery_max_tokens'], 404)
+        self.assertEqual(recovery['clamp'], 'none')
+        self.assertEqual(
+            recovery['generation_budget']['policy_id'],
+            'qwen3_tts_single_sequence_generation_limit_retry_v2',
+        )
+        self.assertEqual(recovery['generation_budget']['max_tokens'], 404)
+
+        near_max_budget = dict(initial_budget, max_tokens=1000)
+        clamped = inference_service._build_qwen3_tts_generation_limit_recovery(
+            near_max_budget
+        )
+        self.assertTrue(clamped['applied'])
+        self.assertEqual(clamped['recovery_max_tokens'], 1200)
+        self.assertEqual(clamped['clamp'], 'maximum')
+
+        max_budget = dict(initial_budget, max_tokens=1200)
+        unavailable = inference_service._build_qwen3_tts_generation_limit_recovery(
+            max_budget
+        )
+        self.assertFalse(unavailable['applied'])
+        self.assertEqual(unavailable['status'], 'not_eligible')
+        self.assertEqual(unavailable['recovery_max_tokens'], 1200)
+
+    def test_qwen3_tts_long_form_chunk_plan_preserves_ordered_source(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+
+        plan = build_qwen3_tts_chunk_plan(passage)
+
+        self.assertTrue(plan['applied'])
+        self.assertTrue(plan['ordered_span_coverage'])
+        self.assertGreater(plan['chunk_count'], 1)
+        self.assertEqual(plan['source_sha256'], hashlib.sha256(passage.encode()).hexdigest())
+        self.assertEqual(
+            ' '.join(' '.join(chunk['text'].split()) for chunk in plan['chunks']),
+            ' '.join(passage.split()),
+        )
+        self.assertTrue(
+            all(
+                chunk['estimated_speech_seconds'] <= plan['target_chunk_speech_seconds']
+                for chunk in plan['chunks']
+            )
+        )
+
     def test_detect_text_artifact_request_from_explicit_filename(self):
         request = detect_text_artifact_request('Create an index.html artifact with a simple landing page.')
 
@@ -386,6 +535,23 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertTrue(text_artifact_request_is_ungrounded_reference(prompt))
         self.assertIsNone(detect_text_artifact_request(prompt))
         self.assertIsNotNone(detect_text_artifact_request(prompt, source_available=True))
+
+    def test_relative_media_content_clause_is_not_an_ungrounded_file_reference(self):
+        prompts = (
+            'Create one English audio artifact that says, "The lighthouse welcomes the morning."',
+            'Create one English audio artifact that reads "The harbor is awake."',
+            'Create one image that shows a lighthouse at sunrise.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(text_artifact_request_is_ungrounded_reference(prompt))
+
+        self.assertTrue(
+            text_artifact_request_is_ungrounded_reference(
+                'Generate me this html file as artifact'
+            )
+        )
 
     def test_detect_text_artifact_request_carries_selected_source_target_path(self):
         request = detect_text_artifact_request(
@@ -1236,8 +1402,12 @@ class InferenceServiceTests(unittest.TestCase):
             self.assertEqual(kwargs['response_format'], 'wav')
             self.assertEqual(kwargs['speed'], 0.95)
             self.assertEqual(kwargs['pitch'], 1.1)
-            self.assertEqual(kwargs['lang_code'], 'de')
-            self.assertNotIn('max_tokens', kwargs)
+            self.assertEqual(kwargs['lang_code'], 'german')
+            self.assertEqual(kwargs['max_tokens'], 256)
+            self.assertEqual(kwargs['temperature'], 0.9)
+            self.assertEqual(kwargs['top_p'], 1.0)
+            self.assertEqual(kwargs['top_k'], 50)
+            self.assertEqual(kwargs['repetition_penalty'], 1.05)
             return {
                 'audio_bytes': b'RIFFfakewav',
                 'content_type': 'audio/wav',
@@ -1263,7 +1433,794 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload['mode'], 'text_to_speech')
         self.assertEqual(payload['saved_audio_path'], '/tmp/artifacts/audio/qwen3-tts.wav')
-        self.assertEqual(payload['lang_code'], 'de')
+        self.assertEqual(payload['lang_code'], 'german')
+        self.assertEqual(
+            payload['lang_code_source'],
+            'explicit_qwen3_alias_canonicalized',
+        )
+        self.assertEqual(payload['tts_generation_budget']['max_tokens'], 256)
+        self.assertEqual(
+            payload['tts_generation_budget']['policy_id'],
+            'qwen3_tts_adaptive_audio_tokens_v2',
+        )
+        self.assertEqual(
+            payload['tts_sampling_profile'],
+            {
+                'kind': 'ollmo.tts_sampling_profile',
+                'version': 1,
+                'policy_id': 'qwen3_tts_model_native_sampling_v1',
+                'model_family': 'qwen3_tts',
+                'source': 'mlx_audio_qwen3_tts_model_defaults',
+                'temperature': 0.9,
+                'top_p': 1.0,
+                'top_k': 50,
+                'repetition_penalty': 1.05,
+            },
+        )
+
+    def test_text_to_speech_runs_backend_persistence_then_integrity_analysis(self):
+        ctx = InferContext(
+            instance_id='tts-order-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            port=11504,
+            prompt='Guten Tag aus Ollmo.',
+            user_prompt='Guten Tag aus Ollmo.',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+        )
+        call_order = []
+        backend_audio_bytes = b'RIFFbackend-bytes'
+        integrity_evidence = {
+            'kind': 'ollmo.tts_audio_integrity_evidence',
+            'status': 'passed',
+            'materialization_eligible': True,
+        }
+
+        def mlx_audio_speech(_port, _model_name, _prompt, **_kwargs):
+            call_order.append('backend')
+            return {
+                'audio_bytes': backend_audio_bytes,
+                'content_type': 'audio/wav',
+                'result': {'bytes': len(backend_audio_bytes)},
+            }
+
+        def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+            self.assertEqual(call_order, ['backend'])
+            self.assertIs(audio_bytes, backend_audio_bytes)
+            call_order.append('persist')
+            return '/tmp/artifacts/audio/ordered.wav'
+
+        def build_integrity_evidence(
+            saved_audio_path,
+            spoken_text,
+            *,
+            source_sha256=None,
+            generation_budget=None,
+            model_family=None,
+            tts_model_type=None,
+        ):
+            self.assertEqual(call_order, ['backend', 'persist'])
+            self.assertEqual(saved_audio_path, '/tmp/artifacts/audio/ordered.wav')
+            self.assertEqual(spoken_text, 'Guten Tag aus Ollmo.')
+            self.assertEqual(
+                source_sha256,
+                hashlib.sha256(spoken_text.encode('utf-8')).hexdigest(),
+            )
+            self.assertEqual(model_family, 'qwen3_tts')
+            self.assertEqual(tts_model_type, 'base')
+            self.assertEqual(generation_budget['generation_scope'], 'single_sequence')
+            self.assertEqual(generation_budget['max_tokens'], 256)
+            call_order.append('integrity')
+            return integrity_evidence
+
+        with patch(
+            'ollmo_core.inference.build_tts_audio_integrity_evidence',
+            side_effect=build_integrity_evidence,
+        ):
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(call_order, ['backend', 'persist', 'integrity'])
+        self.assertIs(payload['tts_audio_integrity_evidence'], integrity_evidence)
+        self.assertEqual(
+            payload['tts_semantic_source']['tts_source_text'],
+            'Guten Tag aus Ollmo.',
+        )
+
+    def test_long_qwen_voice_design_synthesizes_verified_chunks_and_persists_once(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+        ctx = InferContext(
+            instance_id='tts-long-chunked-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16',
+            port=11504,
+            prompt=passage,
+            user_prompt=passage,
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            instruct='Warm, steady English narration.',
+            response_format='wav',
+            lang_code='english',
+            tts_model_type='voice_design',
+        )
+        backend_calls = []
+        persistence_calls = []
+
+        def mlx_audio_speech(_port, _model_name, chunk_text, **kwargs):
+            backend_calls.append((chunk_text, dict(kwargs)))
+            expected_budget = build_qwen3_tts_generation_budget(chunk_text)
+            self.assertEqual(kwargs['max_tokens'], expected_budget['max_tokens'])
+            self.assertEqual(kwargs['instruct'], 'Warm, steady English narration.')
+            self.assertEqual(kwargs['lang_code'], 'english')
+            return {
+                'audio_bytes': _pcm_wav_bytes(5.0),
+                'content_type': 'audio/wav',
+                'result': {'bytes': 80044},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_path = Path(temp_dir) / 'joined.wav'
+
+            def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                persistence_calls.append(bytes(audio_bytes))
+                saved_path.write_bytes(audio_bytes)
+                return str(saved_path)
+
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertGreater(len(backend_calls), 1)
+        self.assertEqual(len(persistence_calls), 1)
+        self.assertEqual(
+            ' '.join(' '.join(call[0].split()) for call in backend_calls),
+            ' '.join(passage.split()),
+        )
+        self.assertEqual(payload['tts_generation_budget']['generation_scope'], 'chunked_sequence')
+        self.assertEqual(payload['tts_generation_budget']['chunk_count'], len(backend_calls))
+        self.assertEqual(payload['tts_audio_integrity_evidence']['status'], 'passed')
+        chunking = payload['tts_audio_integrity_evidence']['chunking_evidence']
+        self.assertEqual(chunking['status'], 'passed')
+        self.assertEqual(chunking['completed_chunk_count'], len(backend_calls))
+        self.assertEqual(chunking['join_evidence']['chunk_count'], len(backend_calls))
+        self.assertEqual(
+            payload['tts_semantic_source']['tts_source_text_sha256'],
+            hashlib.sha256(passage.encode()).hexdigest(),
+        )
+
+    def test_long_qwen_voice_design_retries_only_the_exhausted_chunk_once(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+        planned_chunks = build_qwen3_tts_chunk_plan(passage)['chunks']
+        exhausted_chunk = planned_chunks[2]['text']
+        ctx = InferContext(
+            instance_id='tts-long-chunk-recovery-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16',
+            port=11504,
+            prompt=passage,
+            user_prompt=passage,
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            instruct='Warm, steady English narration.',
+            response_format='wav',
+            lang_code='english',
+            tts_model_type='voice_design',
+        )
+        backend_calls = []
+        persistence_calls = []
+        exhausted_attempt_count = 0
+
+        def mlx_audio_speech(_port, _model_name, chunk_text, **kwargs):
+            nonlocal exhausted_attempt_count
+            backend_calls.append((chunk_text, dict(kwargs)))
+            if chunk_text == exhausted_chunk:
+                exhausted_attempt_count += 1
+                if exhausted_attempt_count == 1:
+                    duration_seconds = kwargs['max_tokens'] / 12.5
+                    return {
+                        'audio_bytes': _pcm_wav_segment_bytes(
+                            [(1.5, True), (duration_seconds - 1.5, False)]
+                        ),
+                        'content_type': 'audio/wav',
+                        'result': {'exact_generation_limit': True},
+                    }
+            return {
+                'audio_bytes': _pcm_wav_bytes(5.0),
+                'content_type': 'audio/wav',
+                'result': {'exact_generation_limit': False},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_path = Path(temp_dir) / 'joined-recovered.wav'
+
+            def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                persistence_calls.append(bytes(audio_bytes))
+                saved_path.write_bytes(audio_bytes)
+                return str(saved_path)
+
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(backend_calls), len(planned_chunks) + 1)
+        self.assertEqual(
+            [item[0] for item in backend_calls],
+            [
+                planned_chunks[0]['text'],
+                planned_chunks[1]['text'],
+                exhausted_chunk,
+                exhausted_chunk,
+                planned_chunks[3]['text'],
+            ],
+        )
+        initial_kwargs = backend_calls[2][1]
+        recovery_kwargs = backend_calls[3][1]
+        self.assertEqual(initial_kwargs['max_tokens'], 269)
+        self.assertEqual(recovery_kwargs['max_tokens'], 404)
+        self.assertEqual(
+            {key: value for key, value in initial_kwargs.items() if key != 'max_tokens'},
+            {key: value for key, value in recovery_kwargs.items() if key != 'max_tokens'},
+        )
+        self.assertEqual(len(persistence_calls), 1)
+        integrity = payload['tts_audio_integrity_evidence']
+        self.assertEqual(integrity['status'], 'passed')
+        chunking = integrity['chunking_evidence']
+        self.assertEqual(chunking['status'], 'passed')
+        self.assertEqual(chunking['backend_call_count'], len(planned_chunks) + 1)
+        self.assertEqual(chunking['passed_chunk_count'], len(planned_chunks))
+        self.assertEqual(chunking['recovered_chunk_count'], 1)
+        self.assertEqual(chunking['generation_limit_recovery_attempt_count'], 1)
+        recovered = chunking['chunks'][2]
+        self.assertEqual(recovered['status'], 'recovered')
+        self.assertEqual(recovered['attempt_count'], 2)
+        self.assertEqual(
+            [attempt['role'] for attempt in recovered['attempts']],
+            ['initial', 'generation_limit_recovery'],
+        )
+        self.assertEqual(
+            [attempt['selected'] for attempt in recovered['attempts']],
+            [False, True],
+        )
+        self.assertEqual(
+            recovered['attempts'][0]['integrity_evidence']['reason_code'],
+            'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+        )
+        self.assertEqual(
+            recovered['attempts'][0]['integrity_evidence']['defect_codes'],
+            [
+                'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+                'TTS_AUDIO_EXCESSIVE_TRAILING_SILENCE',
+                'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+            ],
+        )
+        self.assertEqual(
+            recovered['attempts'][1]['integrity_evidence']['reason_code'],
+            'TTS_AUDIO_INTEGRITY_PASSED',
+        )
+        recovery = recovered['generation_limit_recovery']
+        self.assertEqual(
+            recovery['policy_id'],
+            'qwen3_tts_single_sequence_generation_limit_retry_v2',
+        )
+        self.assertEqual(recovery['trigger_reason_code'], 'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED')
+        self.assertEqual(recovery['status'], 'passed')
+        self.assertEqual(recovery['initial_max_tokens'], 269)
+        self.assertEqual(recovery['recovery_max_tokens'], 404)
+        self.assertEqual(
+            recovery['trigger_primary_reason_code'],
+            'TTS_AUDIO_EFFECTIVE_DURATION_TOO_SHORT',
+        )
+        self.assertIn(
+            'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+            recovery['trigger_defect_codes'],
+        )
+        self.assertEqual(
+            payload['tts_semantic_source']['tts_source_text_sha256'],
+            hashlib.sha256(passage.encode()).hexdigest(),
+        )
+
+    def test_long_qwen_voice_design_blocks_when_the_single_recovery_also_exhausts(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+        planned_chunks = build_qwen3_tts_chunk_plan(passage)['chunks']
+        exhausted_chunk = planned_chunks[2]['text']
+        ctx = InferContext(
+            instance_id='tts-long-chunk-recovery-failure-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16',
+            port=11504,
+            prompt=passage,
+            user_prompt=passage,
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            instruct='Warm, steady English narration.',
+            response_format='wav',
+            lang_code='english',
+            tts_model_type='voice_design',
+        )
+        backend_calls = []
+        persistence_calls = []
+
+        def mlx_audio_speech(_port, _model_name, chunk_text, **kwargs):
+            backend_calls.append((chunk_text, dict(kwargs)))
+            duration_seconds = (
+                kwargs['max_tokens'] / 12.5
+                if chunk_text == exhausted_chunk
+                else 5.0
+            )
+            return {
+                'audio_bytes': _pcm_wav_bytes(duration_seconds),
+                'content_type': 'audio/wav',
+                'result': {'bytes': 1},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_path = Path(temp_dir) / 'failed-recovery.wav'
+
+            def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                persistence_calls.append(bytes(audio_bytes))
+                saved_path.write_bytes(audio_bytes)
+                return str(saved_path)
+
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(backend_calls), 4)
+        self.assertEqual(
+            [item[0] for item in backend_calls],
+            [
+                planned_chunks[0]['text'],
+                planned_chunks[1]['text'],
+                exhausted_chunk,
+                exhausted_chunk,
+            ],
+        )
+        self.assertEqual(backend_calls[2][1]['max_tokens'], 269)
+        self.assertEqual(backend_calls[3][1]['max_tokens'], 404)
+        self.assertEqual(len(persistence_calls), 1)
+        integrity = payload['tts_audio_integrity_evidence']
+        self.assertEqual(integrity['status'], 'failed')
+        self.assertFalse(integrity['materialization_eligible'])
+        self.assertEqual(
+            integrity['reason_code'],
+            'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+        )
+        chunking = integrity['chunking_evidence']
+        self.assertEqual(chunking['status'], 'failed')
+        self.assertEqual(chunking['failed_chunk_index'], 3)
+        self.assertEqual(chunking['passed_chunk_count'], 2)
+        self.assertEqual(chunking['backend_call_count'], 4)
+        failed = chunking['chunks'][2]
+        self.assertEqual(failed['status'], 'failed')
+        self.assertEqual(failed['attempt_count'], 2)
+        self.assertEqual(
+            [
+                attempt['integrity_evidence']['reason_code']
+                for attempt in failed['attempts']
+            ],
+            [
+                'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+                'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+            ],
+        )
+        self.assertEqual(failed['generation_limit_recovery']['status'], 'failed')
+
+    def test_generation_limit_retry_applies_to_supported_qwen_model_types(self):
+        passage = 'The lighthouse welcomes every boat returning safely before dawn.'
+        for label, model_name, model_type in (
+            (
+                'base',
+                'mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+                'base',
+            ),
+            (
+                'custom-voice',
+                'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16',
+                'custom_voice',
+            ),
+        ):
+            with self.subTest(model_type=label), tempfile.TemporaryDirectory() as temp_dir:
+                ctx = InferContext(
+                    instance_id=f'tts-no-generation-limit-retry-{label}',
+                    backend='mlx',
+                    capability='text_to_speech',
+                    model_name=model_name,
+                    port=11504,
+                    prompt=passage,
+                    user_prompt=passage,
+                    infer_timeout_sec=1200,
+                    pdf_page_timeout_sec=240,
+                    pdf_max_image_side=2400,
+                    pdf_synthesize=False,
+                    voice=(
+                        'serena'
+                        if model_type == 'custom_voice'
+                        else 'Chelsie'
+                    ),
+                    instruct='Warm, steady English narration.',
+                    response_format='wav',
+                    lang_code='english',
+                    tts_model_type=model_type,
+                )
+                backend_calls = []
+                saved_path = Path(temp_dir) / f'{label}-recovered.wav'
+
+                def mlx_audio_speech(_port, _model_name, chunk_text, **kwargs):
+                    backend_calls.append((chunk_text, dict(kwargs)))
+                    duration_seconds = (
+                        kwargs['max_tokens'] / 12.5
+                        if len(backend_calls) == 1
+                        else 4.0
+                    )
+                    return {
+                        'audio_bytes': _pcm_wav_bytes(duration_seconds),
+                        'content_type': 'audio/wav',
+                        'result': {'bytes': 1},
+                    }
+
+                def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                    saved_path.write_bytes(audio_bytes)
+                    return str(saved_path)
+
+                payload, status = dispatch_infer_request(
+                    ctx,
+                    InferArtifacts(),
+                    {
+                        'mlx_audio_speech': mlx_audio_speech,
+                        'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                    },
+                )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(len(backend_calls), 2)
+                self.assertLess(
+                    backend_calls[0][1]['max_tokens'],
+                    backend_calls[1][1]['max_tokens'],
+                )
+                integrity = payload['tts_audio_integrity_evidence']
+                self.assertEqual(integrity['status'], 'passed')
+                recovery = integrity['generation_limit_recovery']
+                self.assertEqual(recovery['attempt_count'], 2)
+                self.assertEqual(
+                    recovery['policy_id'],
+                    'qwen3_tts_single_sequence_generation_limit_retry_v2',
+                )
+                self.assertEqual(
+                    recovery['tts_model_type'],
+                    model_type,
+                )
+
+    def test_long_qwen_voice_design_stops_after_failed_chunk_and_stays_blocked(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+        ctx = InferContext(
+            instance_id='tts-long-chunk-failure-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16',
+            port=11504,
+            prompt=passage,
+            user_prompt=passage,
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            instruct='Warm, steady English narration.',
+            response_format='wav',
+            lang_code='english',
+            tts_model_type='voice_design',
+        )
+        backend_calls = []
+        persistence_calls = []
+
+        def mlx_audio_speech(_port, _model_name, chunk_text, **_kwargs):
+            backend_calls.append(chunk_text)
+            raw = _pcm_wav_bytes(5.0) if len(backend_calls) == 1 else b'RIFF-broken'
+            return {
+                'audio_bytes': raw,
+                'content_type': 'audio/wav',
+                'result': {'bytes': len(raw)},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_path = Path(temp_dir) / 'failed-chunk.wav'
+
+            def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                persistence_calls.append(bytes(audio_bytes))
+                saved_path.write_bytes(audio_bytes)
+                return str(saved_path)
+
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(backend_calls), 2)
+        self.assertEqual(len(persistence_calls), 1)
+        integrity = payload['tts_audio_integrity_evidence']
+        self.assertEqual(integrity['status'], 'failed')
+        self.assertFalse(integrity['materialization_eligible'])
+        self.assertEqual(integrity['reason_code'], 'TTS_AUDIO_WAV_UNREADABLE')
+        self.assertIn('TTS_AUDIO_WAV_UNREADABLE', integrity['defect_codes'])
+        chunking = integrity['chunking_evidence']
+        self.assertEqual(chunking['status'], 'failed')
+        self.assertEqual(chunking['failed_chunk_index'], 2)
+        self.assertEqual(chunking['completed_chunk_count'], 2)
+
+    def test_long_qwen_base_uses_the_same_verified_chunk_pipeline(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+        ctx = InferContext(
+            instance_id='tts-long-base-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            port=11504,
+            prompt=passage,
+            user_prompt=passage,
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            voice='Chelsie',
+            response_format='wav',
+            lang_code='english',
+        )
+        backend_calls = []
+        persistence_calls = []
+
+        def mlx_audio_speech(_port, _model_name, chunk_text, **kwargs):
+            backend_calls.append((chunk_text, dict(kwargs)))
+            self.assertEqual(
+                kwargs['max_tokens'],
+                build_qwen3_tts_generation_budget(chunk_text)['max_tokens'],
+            )
+            self.assertEqual(kwargs['voice'], 'Chelsie')
+            return {
+                'audio_bytes': _pcm_wav_bytes(5.0),
+                'content_type': 'audio/wav',
+                'result': {'bytes': 80044},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_path = Path(temp_dir) / 'joined-base.wav'
+
+            def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                persistence_calls.append(bytes(audio_bytes))
+                saved_path.write_bytes(audio_bytes)
+                return str(saved_path)
+
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertGreater(len(backend_calls), 1)
+        self.assertEqual(len(persistence_calls), 1)
+        self.assertEqual(payload['tts_model_type'], 'base')
+        self.assertEqual(
+            payload['tts_generation_budget']['generation_scope'],
+            'chunked_sequence',
+        )
+        self.assertEqual(payload['tts_audio_integrity_evidence']['status'], 'passed')
+        self.assertEqual(
+            payload['tts_audio_integrity_evidence']['chunking_evidence']['status'],
+            'passed',
+        )
+
+    def test_text_to_speech_qwen_canonicalizes_explicit_language_aliases(self):
+        for lang_code, expected_lang_code in (('en', 'english'), ('de', 'german')):
+            with self.subTest(lang_code=lang_code):
+                observed_kwargs = {}
+                ctx = InferContext(
+                    instance_id=f'tts-language-alias-{lang_code}',
+                    backend='mlx',
+                    capability='text_to_speech',
+                    model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+                    port=11504,
+                    prompt='A short language alias test.',
+                    user_prompt='',
+                    infer_timeout_sec=1200,
+                    pdf_page_timeout_sec=240,
+                    pdf_max_image_side=2400,
+                    pdf_synthesize=False,
+                    lang_code=lang_code,
+                )
+
+                def mlx_audio_speech(_port, _model_name, _prompt, **kwargs):
+                    observed_kwargs.update(kwargs)
+                    return {
+                        'audio_bytes': b'RIFFfakewav',
+                        'content_type': 'audio/wav',
+                        'result': {'bytes': 11},
+                    }
+
+                payload, status = dispatch_infer_request(
+                    ctx,
+                    InferArtifacts(),
+                    {
+                        'mlx_audio_speech': mlx_audio_speech,
+                        'persist_audio_bytes_locally': (
+                            lambda *_args, **_kwargs: '/tmp/artifacts/audio/alias.wav'
+                        ),
+                    },
+                )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(observed_kwargs['lang_code'], expected_lang_code)
+                self.assertEqual(payload['lang_code'], expected_lang_code)
+                self.assertEqual(
+                    payload['lang_code_source'],
+                    'explicit_qwen3_alias_canonicalized',
+                )
+                self.assertEqual(
+                    payload['tts_semantic_source']['lang_code'],
+                    expected_lang_code,
+                )
+
+    def test_text_to_speech_qwen_preserves_canonical_auto_and_unsupported_languages(self):
+        cases = (
+            ('english', 'english', 'explicit'),
+            ('English', 'English', 'explicit'),
+            ('auto', 'auto', 'qwen3_model_default'),
+            ('elvish', 'elvish', 'explicit'),
+        )
+        for lang_code, expected_lang_code, expected_source in cases:
+            with self.subTest(lang_code=lang_code):
+                observed_kwargs = {}
+                ctx = InferContext(
+                    instance_id=f'tts-language-pass-through-{lang_code.lower()}',
+                    backend='mlx',
+                    capability='text_to_speech',
+                    model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+                    port=11504,
+                    prompt='Hello.',
+                    user_prompt='',
+                    infer_timeout_sec=1200,
+                    pdf_page_timeout_sec=240,
+                    pdf_max_image_side=2400,
+                    pdf_synthesize=False,
+                    lang_code=lang_code,
+                )
+
+                def mlx_audio_speech(_port, _model_name, _prompt, **kwargs):
+                    observed_kwargs.update(kwargs)
+                    return {
+                        'audio_bytes': b'RIFFfakewav',
+                        'content_type': 'audio/wav',
+                        'result': {'bytes': 11},
+                    }
+
+                payload, status = dispatch_infer_request(
+                    ctx,
+                    InferArtifacts(),
+                    {
+                        'mlx_audio_speech': mlx_audio_speech,
+                        'persist_audio_bytes_locally': (
+                            lambda *_args, **_kwargs: '/tmp/artifacts/audio/pass-through.wav'
+                        ),
+                    },
+                )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(observed_kwargs['lang_code'], expected_lang_code)
+                self.assertEqual(payload['lang_code'], expected_lang_code)
+                self.assertEqual(payload['lang_code_source'], expected_source)
+
+    def test_text_to_speech_non_qwen_preserves_explicit_language_alias(self):
+        observed_kwargs = {}
+        ctx = InferContext(
+            instance_id='tts-language-non-qwen',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/kitten-tts-mini-0.8-bf16',
+            port=11504,
+            prompt='Hello from Ollmo.',
+            user_prompt='',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            lang_code='en',
+            tts_model_type='kitten_tts',
+            tts_speakers=['Bella'],
+        )
+
+        def mlx_audio_speech(_port, _model_name, _prompt, **kwargs):
+            observed_kwargs.update(kwargs)
+            return {
+                'audio_bytes': b'RIFFfakewav',
+                'content_type': 'audio/wav',
+                'result': {'bytes': 11},
+            }
+
+        payload, status = dispatch_infer_request(
+            ctx,
+            InferArtifacts(),
+            {
+                'mlx_audio_speech': mlx_audio_speech,
+                'persist_audio_bytes_locally': (
+                    lambda *_args, **_kwargs: '/tmp/artifacts/audio/non-qwen.wav'
+                ),
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(observed_kwargs['lang_code'], 'en')
+        self.assertEqual(payload['lang_code'], 'en')
+        self.assertEqual(payload['lang_code_source'], 'explicit')
+        self.assertNotIn('tts_generation_budget', payload)
 
     def test_text_to_speech_infers_supported_language_from_spoken_text(self):
         ctx = InferContext(
@@ -1329,7 +2286,7 @@ class InferenceServiceTests(unittest.TestCase):
 
         def mlx_audio_speech(_port, _model_name, prompt, **kwargs):
             self.assertEqual(prompt, 'Lokale KI läuft effizient, da sie Daten direkt verarbeitet.')
-            self.assertEqual(kwargs['lang_code'], 'de')
+            self.assertEqual(kwargs['lang_code'], 'german')
             return {
                 'audio_bytes': b'RIFFfakewav',
                 'content_type': 'audio/wav',
@@ -1346,8 +2303,50 @@ class InferenceServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload['lang_code'], 'de')
-        self.assertEqual(payload['lang_code_source'], 'inferred_from_text')
+        self.assertEqual(payload['lang_code'], 'german')
+        self.assertEqual(
+            payload['lang_code_source'],
+            'inferred_from_text_qwen3_alias_canonicalized',
+        )
+
+    def test_text_to_speech_qwen_uses_model_native_auto_for_ambiguous_text(self):
+        ctx = InferContext(
+            instance_id='tts-language-auto-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            port=11504,
+            prompt='Hello.',
+            user_prompt='',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            tts_languages=['auto', 'english', 'german'],
+        )
+
+        def mlx_audio_speech(_port, _model_name, prompt, **kwargs):
+            self.assertEqual(prompt, 'Hello.')
+            self.assertEqual(kwargs['lang_code'], 'auto')
+            return {
+                'audio_bytes': b'RIFFfakewav',
+                'content_type': 'audio/wav',
+                'result': {'bytes': 11},
+            }
+
+        payload, status = dispatch_infer_request(
+            ctx,
+            InferArtifacts(),
+            {
+                'mlx_audio_speech': mlx_audio_speech,
+                'persist_audio_bytes_locally': lambda *_args, **_kwargs: '/tmp/artifacts/audio/auto.wav',
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload['lang_code'], 'auto')
+        self.assertEqual(payload['lang_code_source'], 'qwen3_model_default')
+        self.assertEqual(payload['tts_semantic_source']['lang_code'], 'auto')
 
     def test_text_to_speech_extracts_quoted_target_text_from_wrapper_prompt(self):
         ctx = InferContext(
@@ -1367,10 +2366,19 @@ class InferenceServiceTests(unittest.TestCase):
             pdf_synthesize=False,
         )
 
-        def mlx_audio_speech(_port, _model_name, prompt, **_kwargs):
+        expected_spoken_text = (
+            'This appears to be a sophisticated AI model management and orchestration system '
+            'designed for complex multi-modal AI workflows.'
+        )
+
+        def mlx_audio_speech(_port, _model_name, prompt, **kwargs):
             self.assertEqual(
                 prompt,
-                'This appears to be a sophisticated AI model management and orchestration system designed for complex multi-modal AI workflows.',
+                expected_spoken_text,
+            )
+            self.assertEqual(
+                kwargs['max_tokens'],
+                build_qwen3_tts_generation_budget(expected_spoken_text)['max_tokens'],
             )
             return {
                 'audio_bytes': b'RIFFfakewav',
@@ -1389,6 +2397,16 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload['saved_audio_path'], '/tmp/artifacts/audio/quoted.wav')
+        semantic_source = payload['tts_semantic_source']
+        self.assertEqual(semantic_source['tts_source_text'], expected_spoken_text)
+        self.assertEqual(
+            semantic_source['tts_source_text_sha256'],
+            hashlib.sha256(expected_spoken_text.encode('utf-8')).hexdigest(),
+        )
+        self.assertEqual(
+            semantic_source['tts_source_text_source'],
+            'inference_final_spoken_prompt',
+        )
 
     def test_text_to_speech_extracts_fenced_text_from_mixed_materialization_payload(self):
         ctx = InferContext(
@@ -1413,8 +2431,12 @@ class InferenceServiceTests(unittest.TestCase):
             tts_model_type='voice_design',
         )
 
+        expected_spoken_text = (
+            'Eispanzer: Die Kälte ist unerbittlich. Bleib auf Kurs.'
+        )
+
         def mlx_audio_speech(_port, _model_name, prompt, **_kwargs):
-            self.assertEqual(prompt, 'Eispanzer: Die Kälte ist unerbittlich. Bleib auf Kurs.')
+            self.assertEqual(prompt, expected_spoken_text)
             return {
                 'audio_bytes': b'RIFFfakewav',
                 'content_type': 'audio/wav',
@@ -1432,6 +2454,100 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload['saved_audio_path'], '/tmp/artifacts/audio/fenced.wav')
+        semantic_source = payload['tts_semantic_source']
+        self.assertEqual(semantic_source['tts_source_text'], expected_spoken_text)
+        self.assertEqual(
+            semantic_source['tts_source_text_sha256'],
+            hashlib.sha256(expected_spoken_text.encode('utf-8')).hexdigest(),
+        )
+
+    def test_text_to_speech_preserves_quotes_in_semantic_materializer_payload(self):
+        spoken_text = (
+            'Mara said, "At sunrise, we leave." Then she closed the harbor door.'
+        )
+        ctx = InferContext(
+            instance_id='tts-semantic-payload-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            port=11504,
+            prompt=spoken_text,
+            user_prompt='',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            prompt_is_semantic_materializer_payload=True,
+        )
+
+        def mlx_audio_speech(_port, _model_name, prompt, **_kwargs):
+            self.assertEqual(prompt, spoken_text)
+            return {
+                'audio_bytes': b'RIFFfakewav',
+                'content_type': 'audio/wav',
+                'result': {'bytes': 11},
+            }
+
+        payload, status = dispatch_infer_request(
+            ctx,
+            InferArtifacts(),
+            {
+                'mlx_audio_speech': mlx_audio_speech,
+                'persist_audio_bytes_locally': lambda *_args, **_kwargs: '/tmp/artifacts/audio/semantic.wav',
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload['tts_semantic_source']['tts_source_text'], spoken_text)
+
+    def test_text_to_speech_semantic_source_includes_file_backed_spoken_text(self):
+        wrapper_prompt = (
+            'Generate an audio of the following sentence:\n\n'
+            '"Der erste Satz kommt aus dem vorbereiteten Branch."'
+        )
+        file_text = 'Der zweite Satz stammt aus der lokalen Textdatei.'
+        expected_spoken_text = (
+            'Der erste Satz kommt aus dem vorbereiteten Branch.\n\n'
+            f'{file_text}'
+        )
+        ctx = InferContext(
+            instance_id='tts-file-source-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            port=11504,
+            prompt=wrapper_prompt,
+            user_prompt='',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+        )
+
+        def mlx_audio_speech(_port, _model_name, prompt, **_kwargs):
+            self.assertEqual(prompt, expected_spoken_text)
+            return {
+                'audio_bytes': b'RIFFfakewav',
+                'content_type': 'audio/wav',
+                'result': {'bytes': 11},
+            }
+
+        payload, status = dispatch_infer_request(
+            ctx,
+            InferArtifacts(file_kind='text', text_from_file=file_text),
+            {
+                'mlx_audio_speech': mlx_audio_speech,
+                'persist_audio_bytes_locally': lambda *_args, **_kwargs: '/tmp/artifacts/audio/file-backed.wav',
+            },
+        )
+
+        self.assertEqual(status, 200)
+        semantic_source = payload['tts_semantic_source']
+        self.assertEqual(semantic_source['tts_source_text'], expected_spoken_text)
+        self.assertEqual(
+            semantic_source['tts_source_text_sha256'],
+            hashlib.sha256(expected_spoken_text.encode('utf-8')).hexdigest(),
+        )
 
     def test_text_to_speech_blank_format_uses_local_wav_default(self):
         ctx = InferContext(
@@ -1615,6 +2731,12 @@ class InferenceServiceTests(unittest.TestCase):
         def mlx_audio_speech(_port, _model_name, prompt, **kwargs):
             self.assertEqual(prompt, 'Hello from Ollmo.')
             self.assertEqual(kwargs['voice'], 'Bella')
+            self.assertIsNone(kwargs['lang_code'])
+            self.assertNotIn('max_tokens', kwargs)
+            self.assertNotIn('temperature', kwargs)
+            self.assertNotIn('top_p', kwargs)
+            self.assertNotIn('top_k', kwargs)
+            self.assertNotIn('repetition_penalty', kwargs)
             return {
                 'audio_bytes': b'RIFFfakewav',
                 'content_type': 'audio/wav',
@@ -1632,6 +2754,8 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload['saved_audio_path'], '/tmp/artifacts/audio/kitten.wav')
+        self.assertNotIn('tts_generation_budget', payload)
+        self.assertNotIn('tts_sampling_profile', payload)
 
     def test_text_to_speech_kitten_rejects_unknown_speaker(self):
         ctx = InferContext(

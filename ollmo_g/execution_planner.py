@@ -21,13 +21,11 @@ from ollmo_g.request_phase_graph import (
 )
 from ollmo_g.request_meta import attach_request_meta, compact_request_meta, extract_request_meta
 from ollmo_g.router import select_router_instance
+from ollmo_services.tts_source import extract_explicit_tts_source_text
 
 CAPABILITY_TEXT_TO_SPEECH = 'text_to_speech'
 CAPABILITY_IMAGE_GENERATION = 'image_generation'
 
-_DOUBLE_QUOTE_RE = re.compile(r'"([^"]{2,})"')
-_SMART_QUOTE_RE = re.compile(r'[“„«](.{2,}?)[”»]')
-_COLON_SUFFIX_RE = re.compile(r':\s*(.+)$')
 _FENCED_JSON_RE = re.compile(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', re.IGNORECASE)
 _JSON_OBJECT_RE = re.compile(r'(\{[\s\S]*\})')
 _TTS_COMPOUND_RE = re.compile(
@@ -70,6 +68,15 @@ _TTS_REFERENCE_TARGET_RE = re.compile(
     r'pinned reply|pinned response|pinned reference|referenced reply|referenced response|'
     r'that reply|that response|that answer|that summary|the summary|'
     r'this|it|that story|that text|that message|that one'
+    r')\b',
+    re.IGNORECASE,
+)
+_TTS_PRIOR_ASSISTANT_REFERENCE_RE = re.compile(
+    r'\b('
+    r'last reply|last response|last answer|previous reply|previous response|previous answer|'
+    r'pinned reply|pinned response|pinned reference|referenced reply|referenced response|'
+    r'that(?:\s+exact)? reply|that(?:\s+exact)? response|that(?:\s+exact)? answer|'
+    r'that message|that text'
     r')\b',
     re.IGNORECASE,
 )
@@ -584,26 +591,6 @@ def split_visible_image_payload(display_text: str) -> dict[str, Optional[str]]:
     return payload
 
 
-def _extract_explicit_spoken_content(prompt: str) -> Optional[str]:
-    raw = str(prompt or '').strip()
-    if not raw:
-        return None
-    quoted: list[str] = []
-    for pattern in (_DOUBLE_QUOTE_RE, _SMART_QUOTE_RE):
-        for match in pattern.findall(raw):
-            candidate = str(match or '').strip()
-            if candidate:
-                quoted.append(candidate)
-    if quoted:
-        return ' '.join(quoted).strip()
-    colon_match = _COLON_SUFFIX_RE.search(raw)
-    if colon_match:
-        candidate = str(colon_match.group(1) or '').strip()
-        if candidate:
-            return candidate
-    return None
-
-
 def _recent_context_messages(messages: Any, *, limit: int = 6) -> list[dict[str, str]]:
     if not isinstance(messages, list):
         return []
@@ -681,16 +668,22 @@ def _extract_tts_reference_prompt(
     prompt: str,
     *,
     context_messages: Optional[list[dict[str, Any]]] = None,
+    require_prior_assistant_reference: bool = False,
 ) -> Optional[str]:
     raw = str(prompt or '').strip()
-    if not raw or _extract_explicit_spoken_content(raw):
+    if not raw or extract_explicit_tts_source_text(raw):
         return None
     if not _TTS_READ_REFERENCE_RE.search(raw):
         return None
     pinned_reference = _extract_pinned_assistant_reference(context_messages)
     if pinned_reference:
         return pinned_reference
-    if not _TTS_REFERENCE_TARGET_RE.search(raw):
+    reference_pattern = (
+        _TTS_PRIOR_ASSISTANT_REFERENCE_RE
+        if require_prior_assistant_reference
+        else _TTS_REFERENCE_TARGET_RE
+    )
+    if not reference_pattern.search(raw):
         return None
     return _extract_latest_assistant_content(context_messages)
 
@@ -777,7 +770,7 @@ def _requires_voice_design_instruct(instance: dict[str, Any]) -> bool:
 
 def _needs_tts_detail_refinement(prompt: str, payload: dict[str, Any], instance: dict[str, Any]) -> bool:
     raw = str(prompt or '').strip()
-    if not raw or not _extract_explicit_spoken_content(raw):
+    if not raw or not extract_explicit_tts_source_text(raw):
         return False
     analysis = analyze_prompt_intent(raw)
     requested_languages = [
@@ -827,7 +820,9 @@ def _needs_compound_planning(
             return 'text_first_image_follow_up'
         return 'text_preparation_before_visual_output'
     if capability == CAPABILITY_TEXT_TO_SPEECH:
-        if _extract_explicit_spoken_content(raw):
+        if analysis.get('text_preparation_before_audio_output'):
+            return 'compound_tts_prompt'
+        if extract_explicit_tts_source_text(raw):
             if _needs_tts_detail_refinement(raw, payload or {}, instance or {}):
                 return 'tts_detail_refinement'
             return None
@@ -916,12 +911,36 @@ def _apply_phase_graph_follow_up_result(
             applied_fields.append('request_meta.capability_hint')
     planned_prompt = None
     if primary_follow_up == CAPABILITY_TEXT_TO_SPEECH:
+        branch_payloads = list(
+            dict.fromkeys(
+                str(branch.get('content_payload') or '').strip()
+                for branch in deferred_branches
+                if normalize_capability(branch.get('capability'))
+                == CAPABILITY_TEXT_TO_SPEECH
+                and str(branch.get('content_payload') or '').strip()
+            )
+        )
+        waits_for_phase_output = any(
+            normalize_capability(branch.get('capability'))
+            == CAPABILITY_TEXT_TO_SPEECH
+            and not str(branch.get('content_payload') or '').strip()
+            and bool(branch.get('depends_on'))
+            for branch in deferred_branches
+        )
         planned_prompt = (
             _extract_payload_content_payload(updated)
-            or _extract_explicit_spoken_content(str(prompt or '').strip())
-            or _extract_tts_reference_prompt(str(prompt or '').strip(), context_messages=context_messages)
-            or _extract_latest_assistant_content(context_messages)
+            or (branch_payloads[0] if len(branch_payloads) == 1 else None)
+            or _extract_tts_reference_prompt(
+                str(prompt or '').strip(),
+                context_messages=context_messages,
+                require_prior_assistant_reference=waits_for_phase_output,
+            )
         )
+        if not planned_prompt and not waits_for_phase_output:
+            planned_prompt = (
+                extract_explicit_tts_source_text(str(prompt or '').strip())
+                or _extract_latest_assistant_content(context_messages)
+            )
         if planned_prompt and str(updated.get('content_payload') or '').strip() != planned_prompt:
             updated['content_payload'] = planned_prompt
             applied_fields.append('content_payload')
@@ -971,8 +990,8 @@ def _apply_ghost_carried_deferred_result(
     if normalized_follow_up == CAPABILITY_TEXT_TO_SPEECH:
         planned_prompt = (
             _extract_payload_content_payload(updated)
-            or _extract_explicit_spoken_content(prompt)
             or _extract_tts_reference_prompt(prompt, context_messages=context_messages)
+            or extract_explicit_tts_source_text(prompt)
             or _extract_latest_assistant_content(context_messages)
         )
         if planned_prompt and str(updated.get('content_payload') or '').strip() != planned_prompt:

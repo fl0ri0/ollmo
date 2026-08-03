@@ -12,6 +12,7 @@ from helpers.model_capabilities import (
     CAPABILITY_TEXT_TO_SPEECH,
     CAPABILITY_VISION_ANALYSIS,
 )
+from ollmo_services.tts_source import resolve_explicit_tts_source
 
 _INTENT_PROMPT_NORMALIZATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r'\bimgae\b', re.IGNORECASE), 'image'),
@@ -77,12 +78,22 @@ _AUDIO_FORMAT_HINTS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\b(flac)\b', re.IGNORECASE), 'flac'),
 ]
 
-_EXPLICIT_SPOKEN_QUOTE_RE = re.compile(r'["“„«][^"\n”»]{2,}["”»]', re.IGNORECASE)
-_EXPLICIT_SPOKEN_COLON_RE = re.compile(r':\s*[^:\n]{3,}$', re.IGNORECASE)
+_LITERAL_PAYLOAD_MASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'```[\s\S]*?```'),
+    re.compile(r'"[^"\n]*"'),
+    re.compile(r'“[^”\n]*”'),
+    re.compile(r'„[^“\n]*“'),
+    re.compile(r'«[^»\n]*»'),
+    re.compile(r'‹[^›\n]*›'),
+    re.compile(r'(?<!`)`[^`\n]*`(?!`)'),
+    re.compile(r"(?<![\\\w])'[^'\n]*'(?!\w)"),
+)
 _TEXT_PREPARATION_HINTS: list[re.Pattern[str]] = [
     re.compile(r'\b(extract|pull out|read the text|read the quoted text|ocr)\b', re.IGNORECASE),
     re.compile(r'\b(translate|translation|übersetz(?:e|ung)|uebersetz(?:e|ung))\b', re.IGNORECASE),
     re.compile(r'\b(summarize|summarise|summary|rewrite|rephrase|clean(?:\s+up)?|refine|prepare|draft)\b', re.IGNORECASE),
+    re.compile(r'\b(condense|shorten|paraphrase|abridge|adapt|convert|transform)\b', re.IGNORECASE),
+    re.compile(r'\b(make|create|write|give|produce|prepare)\b[\s\S]{0,72}\b(summary|version|sentence|paraphrase|rewrite|result)\b', re.IGNORECASE),
     re.compile(r'\b(write|compose|create|generate|invent|make up|come up with)\b[\s\S]{0,48}\b(story|script|narration|voiceover|poem|essay|caption|summary|prompt(?:s)?)\b', re.IGNORECASE),
     re.compile(r'\b(write|compose|create|generate|invent|make up|come up with)\b[\s\S]{0,64}\b(text|paragraph(?:s)?|section(?:s)?|stanza(?:s)?|verse(?:s)?)\b', re.IGNORECASE),
     re.compile(r'\b(schreib(?:e|st)?|verfass(?:e|t)?|dicht(?:e|est)?|erzahl(?:e|st)?|formulier(?:e|st)?|entwirf(?:st)?)\b[\s\S]{0,72}\b(geschichte(?:n)?|gedicht(?:e)?|text(?:e)?|witz(?:e)?|joke(?:s)?|aufsatz|essay|zusammenfassung|prompt(?:s)?|absatz(?:e|en)?|abschnitt(?:e|en)?|strophe(?:n)?)\b', re.IGNORECASE),
@@ -126,6 +137,18 @@ _AUDIO_OUTPUT_NEGATION_HINTS: list[re.Pattern[str]] = [
         re.IGNORECASE,
     ),
 ]
+_AUDIO_MATERIALIZATION_ACTION_RE = re.compile(
+    r'\b(?:generate|create|make|produce|render|voice|narrate|'
+    r'generier(?:e|en|st|t)?|erzeug(?:e|en|st|t)?|erstell(?:e|en|st|t)?|'
+    r'mach(?:e|en|st|t)?|verton(?:e|en|st|t)?)\b'
+    r'(?:(?!\b(?:but|however|instead|yet|aber|sondern|jedoch|stattdessen)\b)[^.;!?]){0,96}'
+    r'\b(?:audio|audio[\s-]?file|voice\s+clip|speech|tts|mp3|wav|'
+    r'audio[\s-]?datei|sprachversion|horversion|hoerversion)\b|'
+    r'\b(?:read|say|speak|lies|lese|sprich|sag(?:e)?)\b'
+    r'(?:(?!\b(?:but|however|instead|yet|aber|sondern|jedoch|stattdessen)\b)[^.;!?]){0,72}'
+    r'\b(?:aloud|out\s+loud|vor|laut)\b',
+    re.IGNORECASE,
+)
 _VISUAL_FOLLOW_UP_HINTS: list[re.Pattern[str]] = [
     re.compile(r'\b(show|display|visuali[sz]e|illustrate|render)\b[\s\S]{0,48}\b(it|them|this|that)\b[\s\S]{0,40}\b(as|into)?[\s\S]{0,20}\b(image|picture|photo|illustration|scene)\b', re.IGNORECASE),
     re.compile(r'\b(show (?:it|them|this|that) to me)\b[\s\S]{0,24}\b(as|into)?[\s\S]{0,20}\b(image|picture|photo|illustration|scene)\b', re.IGNORECASE),
@@ -235,6 +258,12 @@ _MATERIALIZATION_ONLY_OUTPUT_CONTRAST_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_DEFER_MATERIALIZATION_RE: list[re.Pattern[str]] = [
+    re.compile(
+        r'(?:^|[.;!?\n])\s*(?:no|without)\s+(?:an?\s+)?'
+        r'(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?)'
+        r'(?:\s+(?:please|required|needed|now|yet))?\s*(?=$|[.;!?\n])',
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b[\s\S]{0,96}\b"
         r'(?:generate|create|make|render|produce|materiali[sz]e|show|display|read(?:\s+\w+){0,3}\s+aloud|'
@@ -547,6 +576,23 @@ _VISUAL_ACTION_NEGATION_RE = re.compile(
     r'\b(?:do\s+not|don[\'’]?t|never|without|not|no|nicht|nie|ohne|kein(?:e|en|er|es)?)\b',
     re.IGNORECASE,
 )
+_VISUAL_ACTION_POLARITY_RESET_RE = re.compile(
+    r'\b(?:but|however|instead|yet|aber|sondern|jedoch|stattdessen)\b',
+    re.IGNORECASE,
+)
+_VISUAL_ACTION_LEADING_NEGATION_RE = re.compile(
+    r'\b(?:do\s+not|don[\'’]?t|never|not|nicht|nie)\b[^.;!?\n]{0,120}$|'
+    r'\b(?:without|ohne|no|kein(?:e|en|er|es)?)\s*$',
+    re.IGNORECASE,
+)
+_VISUAL_ACTION_TRAILING_NEGATION_RE = re.compile(
+    r'^\s*(?:not|never|nicht|nie)\b',
+    re.IGNORECASE,
+)
+_ADDITIVE_MATERIALIZATION_RE = re.compile(
+    r"\b(?:(?:do\s+not|don[\'’]?t|dont|not)\s+just|not\s+only|nicht\s+nur)\b",
+    re.IGNORECASE,
+)
 _VISUAL_OUTPUT_NOUN_PATTERN = (
     r'(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|render(?:s)?|'
     r'variant(?:s)?|version(?:s)?|scene(?:s)?|bild(?:er)?|foto(?:s)?|'
@@ -721,6 +767,15 @@ _VISUAL_COUNT_TEXT_REVIEW_NOUN_RE = re.compile(
     r'detail(?:s)?|merkmal(?:e)?|fehler|defekt(?:e)?|beobachtung(?:en)?|'
     r'satz(?:e|en)?|saetze|satze|zeile(?:n)?'
     r')\b',
+    re.IGNORECASE,
+)
+_VISUAL_COUNT_AUDIO_VERSION_QUALIFIER_RE = re.compile(
+    r'\b(?:spoken|audio|voice|voiceover|speech|tts|text[\s-]?to[\s-]?speech|'
+    r'gesprochen\w*|sprach\w*|hoer\w*|hör\w*)\b',
+    re.IGNORECASE,
+)
+_VISUAL_AMBIGUOUS_VERSION_NOUN_RE = re.compile(
+    r'^(?:version(?:s)?|variant(?:s)?|version(?:en)?|variante(?:n)?)$',
     re.IGNORECASE,
 )
 _VISUAL_COUNT_LIST_BRIDGE_RE = re.compile(
@@ -1052,18 +1107,68 @@ def _audio_output_count_from_token(token: str) -> int:
     return int(_AUDIO_OUTPUT_COUNT_WORDS.get(normalized_token, 0))
 
 
-def _intent_span_is_quoted(text: str, start: int, end: int) -> bool:
+def intent_span_is_literal_payload(text: str, start: int, end: int) -> bool:
+    """Return whether a matched intent span is data inside a quote or code fence."""
+
     prompt = str(text or '')
-    for opening, closing in (("\"", "\""), ('“', '”'), ('„', '“'), ('«', '»')):
-        opening_index = prompt.rfind(opening, 0, max(0, start) + 1)
+    bounded_start = max(0, int(start or 0))
+    bounded_end = min(len(prompt), max(bounded_start, int(end or bounded_start)))
+    for opening, closing in (
+        ('```', '```'),
+        ('"', '"'),
+        ('“', '”'),
+        ('„', '“'),
+        ('«', '»'),
+        ('‹', '›'),
+        ('`', '`'),
+    ):
+        opening_index = prompt.rfind(opening, 0, bounded_start + 1)
         if opening_index < 0:
             continue
-        if opening == closing and prompt[:max(0, start)].count(opening) % 2 == 0:
+        if opening == closing and prompt[:bounded_start].count(opening) % 2 == 0:
             continue
-        closing_index = prompt.find(closing, max(opening_index + 1, end))
-        if closing_index >= end:
+        closing_index = prompt.find(closing, max(opening_index + len(opening), bounded_end))
+        if closing_index >= bounded_end:
             return True
-    return False
+    return any(
+        match.start() < bounded_start and bounded_end < match.end()
+        for match in re.finditer(r"(?<![\\\w])'[^'\n]*'(?!\w)", prompt)
+    )
+
+
+def _intent_span_is_quoted(text: str, start: int, end: int) -> bool:
+    return intent_span_is_literal_payload(text, start, end)
+
+
+def _mask_literal_payloads(text: str) -> str:
+    """Preserve offsets while removing quoted/fenced data from command analysis."""
+
+    source = str(text or '')
+    masked = list(source)
+    spans = sorted(
+        {
+            (match.start(), match.end())
+            for pattern in _LITERAL_PAYLOAD_MASK_PATTERNS
+            for match in pattern.finditer(source)
+        }
+    )
+    spoken_source = resolve_explicit_tts_source(source)
+    if spoken_source:
+        spans.append(
+            (
+                int(spoken_source.get('start') or 0),
+                int(spoken_source.get('end') or 0),
+            )
+        )
+    for start, end in spans:
+        masked[start:end] = ' ' * (end - start)
+    return ''.join(masked)
+
+
+def mask_intent_literal_payloads(text: str) -> str:
+    """Expose the offset-preserving literal mask to phase-graph consumers."""
+
+    return _mask_literal_payloads(text)
 
 
 def _answer_as_audio_delivery_state(
@@ -1248,6 +1353,100 @@ def _visual_action_window(prompt: str, start: int, *, limit: int = 180) -> str:
     return tail[:boundary.start()] if boundary else tail
 
 
+def visual_action_is_negated(prompt: str, start: int, end: int) -> bool:
+    """Evaluate an action's polarity without dropping its governing clause prefix."""
+
+    text = str(prompt or '')
+    action_start = max(0, int(start or 0))
+    action_end = min(len(text), max(action_start, int(end or action_start)))
+    lower = max(0, action_start - 180)
+    upper = min(len(text), action_end + 180)
+    for boundary in ('.', '!', '?', ';', '\n'):
+        boundary_index = text.rfind(boundary, lower, action_start)
+        if boundary_index >= 0:
+            lower = max(lower, boundary_index + 1)
+    next_boundaries = [
+        index
+        for boundary in ('.', '!', '?', ';', '\n')
+        for index in [text.find(boundary, action_end, upper)]
+        if index >= 0
+    ]
+    if next_boundaries:
+        upper = min(upper, min(next_boundaries))
+    for reset in _VISUAL_ACTION_POLARITY_RESET_RE.finditer(text, lower, upper):
+        if reset.end() <= action_start:
+            lower = reset.end()
+        elif reset.start() >= action_end:
+            upper = reset.start()
+            break
+
+    prefix = text[lower:action_start]
+    # "not only/don't just create" is additive, not a materialization negation.
+    prefix = re.sub(
+        r"\b(?:(?:do\s+not|don[\'’]?t|dont|not)\s+just|not\s+only|nicht\s+nur)\b",
+        '',
+        prefix,
+        flags=re.IGNORECASE,
+    )
+    if _VISUAL_ACTION_LEADING_NEGATION_RE.search(prefix):
+        return True
+    if _VISUAL_ACTION_NEGATION_RE.search(text[action_start:action_end]):
+        return True
+    return bool(_VISUAL_ACTION_TRAILING_NEGATION_RE.search(text[action_end:upper]))
+
+
+def _latest_affirmative_visual_generation_action_start(prompt: str) -> int:
+    """Return the last executable image-creation action offset, or ``-1``."""
+
+    text = str(prompt or '')
+    latest_start = -1
+    for action in _VISUAL_GENERATION_ACTION_RE.finditer(text):
+        if intent_span_is_literal_payload(text, action.start(), action.end()):
+            continue
+        window = _visual_action_window(text, action.start())
+        target = _VISUAL_ACTION_TARGET_RE.search(window)
+        if not target:
+            continue
+        if not visual_action_is_negated(
+            text,
+            action.start(),
+            action.start() + target.end(),
+        ):
+            latest_start = action.start()
+    return latest_start
+
+
+def _has_affirmative_audio_materialization_action(prompt: str) -> bool:
+    """Return whether the current command scope contains executable TTS work."""
+
+    text = str(prompt or '')
+    return any(
+        not intent_span_is_literal_payload(text, match.start(), match.end())
+        and not visual_action_is_negated(text, match.start(), match.end())
+        for match in _AUDIO_MATERIALIZATION_ACTION_RE.finditer(text)
+    )
+
+
+def _audio_negation_match_governs_negated_action(
+    prompt: str,
+    match: re.Match[str],
+) -> bool:
+    """Keep broad negation matches only when they govern an audio action or noun."""
+
+    text = str(prompt or '')
+    overlapping_actions = [
+        action
+        for action in _AUDIO_MATERIALIZATION_ACTION_RE.finditer(text)
+        if action.start() < match.end() and match.start() < action.end()
+    ]
+    if overlapping_actions:
+        return any(
+            visual_action_is_negated(text, action.start(), action.end())
+            for action in overlapping_actions
+        )
+    return bool(_AUDIO_NEGATION_TARGET_RE.search(match.group(0)))
+
+
 def _separate_visual_work_flags(normalized_prompt: str) -> tuple[bool, bool, list[str]]:
     """Identify affirmative visual work aimed at a new/separate artifact scope."""
 
@@ -1257,12 +1456,14 @@ def _separate_visual_work_flags(normalized_prompt: str) -> tuple[bool, bool, lis
 
     separate_generation = False
     for action in _VISUAL_GENERATION_ACTION_RE.finditer(prompt):
+        if intent_span_is_literal_payload(prompt, action.start(), action.end()):
+            continue
         window = _visual_action_window(prompt, action.start())
         target = _VISUAL_ACTION_TARGET_RE.search(window)
         if not target:
             continue
         target_scope = window[:min(len(window), target.end() + 32)]
-        if _VISUAL_ACTION_NEGATION_RE.search(target_scope):
+        if visual_action_is_negated(prompt, action.start(), action.start() + target.end()):
             continue
         counted_target = any(
             _visual_output_count_from_token(match.group('count')) > 0
@@ -1274,11 +1475,13 @@ def _separate_visual_work_flags(normalized_prompt: str) -> tuple[bool, bool, lis
 
     separate_analysis = False
     for action in _VISUAL_ANALYSIS_ACTION_RE.finditer(prompt):
+        if intent_span_is_literal_payload(prompt, action.start(), action.end()):
+            continue
         window = _visual_action_window(prompt, action.start())
         target = _VISUAL_ACTION_TARGET_RE.search(window)
         target_end = target.end() if target else min(len(window), 64)
         target_scope = window[:min(len(window), target_end + 32)]
-        if _VISUAL_ACTION_NEGATION_RE.search(target_scope):
+        if visual_action_is_negated(prompt, action.start(), action.start() + target_end):
             continue
         if target and _VISUAL_SEPARATE_TARGET_RE.search(target_scope):
             separate_analysis = True
@@ -1297,9 +1500,14 @@ def _separate_visual_work_flags(normalized_prompt: str) -> tuple[bool, bool, lis
 
 def _visual_output_count_match_is_text_review_count(normalized_prompt: str, match: re.Match[str]) -> bool:
     between = str(normalized_prompt or '')[match.end('count'):match.start('noun')]
+    noun = str(match.group('noun') or '').strip()
     return bool(
         _VISUAL_COUNT_TEXT_REVIEW_NOUN_RE.search(between)
         or _VISUAL_COUNT_LIST_BRIDGE_RE.search(between)
+        or (
+            _VISUAL_AMBIGUOUS_VERSION_NOUN_RE.fullmatch(noun)
+            and _VISUAL_COUNT_AUDIO_VERSION_QUALIFIER_RE.search(between)
+        )
     )
 
 
@@ -1509,6 +1717,47 @@ def _has_explicit_materialization_deferal(
     return False
 
 
+def _latest_explicit_visual_defer_end(normalized_prompt: str) -> int:
+    """Return the last visual defer match end in command text, or ``-1``."""
+
+    prompt = str(normalized_prompt or '').strip()
+    latest_end = -1
+    for pattern in _EXPLICIT_DEFER_MATERIALIZATION_RE:
+        for match in pattern.finditer(prompt):
+            if materialization_negation_match_is_artifact_fulfillment_only(
+                prompt,
+                match.start(),
+                match.end(),
+            ):
+                continue
+            if _materialization_negation_match_is_cardinality_constraint(
+                prompt,
+                match.start(),
+                match.end(),
+            ):
+                continue
+            if materialization_negation_match_is_output_contrast(
+                prompt,
+                match.start(),
+                match.end(),
+            ):
+                continue
+            scope = _materialization_negation_scope(
+                prompt,
+                match.start(),
+                match.end(),
+            )
+            if _VISUAL_ACTION_TARGET_RE.search(scope):
+                contrast = _VISUAL_ACTION_POLARITY_RESET_RE.search(
+                    prompt,
+                    match.start(),
+                    match.end(),
+                )
+                governing_end = contrast.start() if contrast else match.end()
+                latest_end = max(latest_end, governing_end)
+    return latest_end
+
+
 def _is_text_revision_turn(
     prompt: str,
     normalized_prompt: str,
@@ -1531,37 +1780,64 @@ def _is_text_revision_turn(
 
 def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
     normalized = normalize_intent_text(prompt)
+    normalized_tts_source = resolve_explicit_tts_source(normalized)
+    explicit_tts_source = (
+        resolve_explicit_tts_source(str(prompt or ''))
+        or normalized_tts_source
+    )
+    preliminary_answer_as_audio_delivery_spans, _, _ = _answer_as_audio_delivery_state(normalized)
+    preliminary_tts_positive, _ = _score_rules(normalized, _TTS_POSITIVE_RULES)
+    direct_spoken_payload_request = bool(
+        normalized_tts_source
+        or preliminary_tts_positive >= 4
+        or preliminary_answer_as_audio_delivery_spans
+    )
+    command_text = (
+        _mask_literal_payloads(normalized)
+        if direct_spoken_payload_request
+        else normalized
+    )
+    raw_command_text = (
+        _mask_literal_payloads(str(prompt or ''))
+        if direct_spoken_payload_request
+        else str(prompt or '')
+    )
     (
         answer_as_audio_delivery_spans,
         answer_as_audio_delivery_negated,
         answer_as_audio_delivery_deferred,
-    ) = _answer_as_audio_delivery_state(normalized)
+    ) = _answer_as_audio_delivery_state(command_text)
     answer_as_audio_delivery_request = bool(answer_as_audio_delivery_spans)
-    tts_positive, tts_cues = _score_rules(normalized, _TTS_POSITIVE_RULES)
-    tts_negative, tts_negative_cues = _score_rules(normalized, _TTS_NEGATIVE_RULES)
-    image_positive, image_cues = _score_rules(normalized, _IMAGE_POSITIVE_RULES)
-    image_negative, image_negative_cues = _score_rules(normalized, _IMAGE_NEGATIVE_RULES)
-    vision_positive, vision_cues = _score_rules(normalized, _VISION_POSITIVE_RULES)
-    stt_positive, stt_cues = _score_rules(normalized, _STT_POSITIVE_RULES)
+    tts_positive, tts_cues = _score_rules(command_text, _TTS_POSITIVE_RULES)
+    if normalized_tts_source:
+        tts_positive = max(tts_positive, 5)
+        if 'direct_tts_source_contract' not in tts_cues:
+            tts_cues.append('direct_tts_source_contract')
+    tts_negative, tts_negative_cues = _score_rules(command_text, _TTS_NEGATIVE_RULES)
+    visual_command_text = command_text
+    image_positive, image_cues = _score_rules(visual_command_text, _IMAGE_POSITIVE_RULES)
+    image_negative, image_negative_cues = _score_rules(visual_command_text, _IMAGE_NEGATIVE_RULES)
+    vision_positive, vision_cues = _score_rules(visual_command_text, _VISION_POSITIVE_RULES)
+    stt_positive, stt_cues = _score_rules(command_text, _STT_POSITIVE_RULES)
     (
         requested_audio_output_count,
         counted_audio_output_obligation,
         audio_output_count_exceeds_bound,
         requested_audio_output_count_raw,
     ) = _infer_requested_audio_output_count(
-        normalized,
+        command_text,
         answer_as_audio_delivery_spans=answer_as_audio_delivery_spans,
     )
     (
         visual_artifact_preservation_without_regeneration,
         visual_analysis_preservation_without_reanalysis,
         visual_preservation_cues,
-    ) = _visual_preservation_flags(normalized)
+    ) = _visual_preservation_flags(visual_command_text)
     (
         separate_visual_generation_request,
         separate_visual_analysis_request,
         separate_visual_work_cues,
-    ) = _separate_visual_work_flags(normalized)
+    ) = _separate_visual_work_flags(visual_command_text)
     if answer_as_audio_delivery_request:
         tts_positive = max(tts_positive, 5)
         if 'answer_as_audio_delivery_request' not in tts_cues:
@@ -1607,61 +1883,87 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         CAPABILITY_VISION_ANALYSIS: 4,
         CAPABILITY_SPEECH_TO_TEXT: 4,
     }
-    has_explicit_spoken_content = bool(
-        _EXPLICIT_SPOKEN_QUOTE_RE.search(str(prompt or ''))
-        or _EXPLICIT_SPOKEN_COLON_RE.search(str(prompt or ''))
-    )
+    has_explicit_spoken_content = bool(normalized_tts_source)
     has_text_preparation_step = bool(
         answer_as_audio_delivery_request
-        or any(pattern.search(normalized) for pattern in _TEXT_PREPARATION_HINTS)
+        or any(pattern.search(command_text) for pattern in _TEXT_PREPARATION_HINTS)
+    )
+    source_followed_by_text_preparation = bool(
+        normalized_tts_source
+        and any(
+            pattern.search(
+                command_text[int(normalized_tts_source.get('end') or 0):]
+            )
+            for pattern in _TEXT_PREPARATION_HINTS
+        )
     )
     has_audio_follow_up_request = bool(
         answer_as_audio_delivery_request
-        or any(pattern.search(normalized) for pattern in _AUDIO_FOLLOW_UP_HINTS)
+        or any(pattern.search(command_text) for pattern in _AUDIO_FOLLOW_UP_HINTS)
     )
     audio_output_negation_matches = [
         match
         for pattern in _AUDIO_OUTPUT_NEGATION_HINTS
-        for match in pattern.finditer(normalized)
+        for match in pattern.finditer(command_text)
     ]
     audio_output_negation_matches = [
         match
         for match in audio_output_negation_matches
         if not materialization_negation_match_is_output_contrast(
-            normalized,
+            command_text,
             match.start(),
             match.end(),
         )
         and _AUDIO_NEGATION_TARGET_RE.search(match.group(0))
+        and _audio_negation_match_governs_negated_action(command_text, match)
     ]
     if answer_as_audio_delivery_request:
         audio_output_negation_matches = []
     if audio_output_negation_matches and all(
         _materialization_negation_match_is_cardinality_constraint(
-            normalized,
+            command_text,
             match.start(),
             match.end(),
         )
         for match in audio_output_negation_matches
     ):
         audio_output_negation_matches = []
+    affirmative_audio_materialization_action = _has_affirmative_audio_materialization_action(
+        command_text
+    )
     has_audio_output_negation = bool(
         audio_output_negation_matches
         or answer_as_audio_delivery_negated
+    ) and not affirmative_audio_materialization_action
+    has_visual_follow_up_request = any(
+        pattern.search(visual_command_text)
+        for pattern in _VISUAL_FOLLOW_UP_HINTS
     )
-    has_visual_follow_up_request = any(pattern.search(normalized) for pattern in _VISUAL_FOLLOW_UP_HINTS)
-    has_visual_text_preparation_step = any(pattern.search(normalized) for pattern in _VISUAL_TEXT_PREPARATION_HINTS)
-    has_visual_creative_delegation = any(pattern.search(normalized) for pattern in _VISUAL_CREATIVE_DELEGATION_HINTS)
-    has_visual_descriptor_request = bool(re.search(r'\b(describe|depict|portray|beschreibe|schildere|zeichne)\b', normalized))
-    has_narration_script_request = bool(_NARRATION_SCRIPT_HINT_RE.search(normalized))
-    requests_translation_output = any(pattern.search(normalized) for pattern in _TRANSLATION_OUTPUT_HINTS)
+    has_visual_text_preparation_step = any(
+        pattern.search(visual_command_text)
+        for pattern in _VISUAL_TEXT_PREPARATION_HINTS
+    )
+    has_visual_creative_delegation = any(
+        pattern.search(visual_command_text)
+        for pattern in _VISUAL_CREATIVE_DELEGATION_HINTS
+    )
+    has_visual_descriptor_request = bool(
+        re.search(
+            r'\b(describe|depict|portray|beschreibe|schildere|zeichne)\b',
+            visual_command_text,
+        )
+    )
+    has_narration_script_request = bool(_NARRATION_SCRIPT_HINT_RE.search(command_text))
+    requests_translation_output = any(pattern.search(command_text) for pattern in _TRANSLATION_OUTPUT_HINTS)
     meta_execution_explanation_request = _is_meta_execution_explanation_request(prompt, normalized)
-    requested_visual_output_count = _infer_requested_visual_output_count(normalized)
-    local_visual_asset_cues = _local_visual_asset_requirement_cues(normalized)
+    requested_visual_output_count = _infer_requested_visual_output_count(visual_command_text)
+    local_visual_asset_cues = _local_visual_asset_requirement_cues(visual_command_text)
     local_visual_asset_requirement = bool(local_visual_asset_cues)
     inferred_visual_output_count_source = ''
     if local_visual_asset_requirement:
-        local_visual_count, local_visual_count_source = _infer_local_visual_asset_output_count(normalized)
+        local_visual_count, local_visual_count_source = _infer_local_visual_asset_output_count(
+            visual_command_text
+        )
         if local_visual_count > requested_visual_output_count:
             requested_visual_output_count = local_visual_count
             inferred_visual_output_count_source = local_visual_count_source
@@ -1676,7 +1978,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
             if cue not in image_cues:
                 image_cues.append(cue)
     counted_visual_output_obligation = _has_counted_visual_output_obligation(
-        normalized,
+        visual_command_text,
         requested_visual_output_count,
     )
     if counted_visual_output_obligation:
@@ -1702,6 +2004,10 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
             'answer_as_audio_delivery_request',
         }
         & set(tts_cues)
+        or (
+            bool(explicit_tts_source)
+            and capability_scores.get(CAPABILITY_TEXT_TO_SPEECH, 0) >= 4
+        )
     )
     if (
         has_audio_output_negation
@@ -1709,7 +2015,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         and re.search(
             r'\b(?:kein(?:e|en|er|es)?|nicht|ohne|noch\s+kein)\b[^.;!?]{0,48}\b(?:bild(?:er)?|image(?:s)?|picture(?:s)?)\b'
             r'[^.;!?]{0,120}\b(?:lies|lese|sprich|read|speak|audio|vor)\b',
-            normalized,
+            command_text,
         )
     ):
         has_audio_output_negation = False
@@ -1726,18 +2032,35 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         or capability_scores[CAPABILITY_IMAGE_GENERATION] > 0
         or has_audio_follow_up_request
         or has_visual_follow_up_request
-        or _MATERIALIZATION_TARGET_RE.search(normalized)
+        or _MATERIALIZATION_TARGET_RE.search(command_text)
     )
     explicit_defer_materialization = _has_explicit_materialization_deferal(
-        prompt,
-        normalized,
+        raw_command_text,
+        command_text,
         mentions_materialization_targets=mentions_materialization_targets,
     )
     if answer_as_audio_delivery_deferred:
         explicit_defer_materialization = True
+    latest_affirmative_visual_action_start = (
+        _latest_affirmative_visual_generation_action_start(visual_command_text)
+    )
+    latest_explicit_visual_defer_end = _latest_explicit_visual_defer_end(
+        visual_command_text
+    )
+    affirmative_visual_action_overrides_defer = bool(
+        _ADDITIVE_MATERIALIZATION_RE.search(visual_command_text)
+        or (
+            latest_affirmative_visual_action_start >= 0
+            and latest_affirmative_visual_action_start >= latest_explicit_visual_defer_end
+        )
+    )
     explicit_visual_defer_materialization = bool(
         explicit_defer_materialization
-        and re.search(r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?|animation(?:en)?)\b', normalized)
+        and not affirmative_visual_action_overrides_defer
+        and re.search(
+            r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?|animation(?:en)?)\b',
+            visual_command_text,
+        )
     )
     target_scoped_visual_preservation = bool(
         visual_artifact_preservation_without_regeneration
@@ -1752,7 +2075,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
             and re.search(
                 r'\b(?:do\s+not|don[\'’]?t|dont|not\s+yet|not\s+now|kein(?:e|en|er|es)?|nicht|ohne|noch\s+kein)\b'
                 r'[^.;!?]{0,96}\b(?:audio|voice|voiceover|speech|tts|mp3|wav|stimme|sprachversion|horversion|hoerversion)\b',
-                normalized,
+                command_text,
             )
         )
     )
@@ -1763,7 +2086,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
                 r'hoerver(?:sion)?|hörver(?:sion)?)\b'
                 r'[^.;!?]{0,140}\b(?:later|future|possible|hold|keep|reserve|zur(?:ue|ü|u)ck|spaeter|später|spater|'
                 r'moegliche(?:n|r|s)?|mögliche(?:n|r|s)?|mogliche(?:n|r|s)?|option(?:en)?|schritt(?:e)?|phase(?:n)?)\b',
-                normalized,
+                command_text,
             )
         )
     if (
@@ -1774,9 +2097,11 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
             r'\b(?:do\s+not|don[\'’]?t|dont|not\s+yet|not\s+now|kein(?:e|en|er|es)?|nicht|ohne|noch\s+kein)\b'
             r'[^.;!?]{0,64}\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?)\b'
             r'[^.;!?]{0,140}\b(?:read|speak|lies|lese|sprich|audio|voice|vor)\b',
-            normalized,
+            command_text,
         )
     ):
+        targeted_audio_defer = False
+    if affirmative_audio_materialization_action and not answer_as_audio_delivery_deferred:
         targeted_audio_defer = False
     explicit_audio_defer_materialization = bool(
         has_audio_output_negation
@@ -1789,8 +2114,8 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
     ):
         explicit_defer_materialization = False
     text_revision_turn = _is_text_revision_turn(
-        prompt,
-        normalized,
+        raw_command_text,
+        command_text,
         direct_audio_materialization_request=direct_audio_materialization_request,
     )
     if text_revision_turn and not direct_audio_materialization_request:
@@ -1828,7 +2153,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         and (
             answer_as_audio_delivery_request
             or (
-                not has_explicit_spoken_content
+                (not has_explicit_spoken_content or source_followed_by_text_preparation)
                 and has_text_preparation_step
                 and (
                     capability_scores[CAPABILITY_TEXT_TO_SPEECH] > 0
@@ -1913,7 +2238,6 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
             if capability != CAPABILITY_TEXT_TO_SPEECH
         ]
     if explicit_visual_defer_materialization or explicit_audio_defer_materialization:
-        primary_capability = None
         if explicit_audio_defer_materialization:
             requests_audio_output = False
             requested_audio_output_count = 0
@@ -1943,7 +2267,6 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         ]
     
     temperament_hint, temperament_cues = infer_temperament_hint(prompt)
-
     return {
         'normalized_prompt': normalized,
         'capability_scores': capability_scores,
@@ -2008,3 +2331,18 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         'temperament_hint': temperament_hint,
         'temperament_cues': temperament_cues,
     }
+
+
+def prompt_has_self_contained_direct_tts_source(prompt: Any) -> bool:
+    """Return whether current-turn text fully binds one direct TTS source."""
+
+    if not resolve_explicit_tts_source(prompt):
+        return False
+    analysis = analyze_prompt_intent(str(prompt or ''))
+    return bool(
+        analysis.get('direct_audio_materialization_request')
+        and analysis.get('requests_audio_output')
+        and not analysis.get('text_preparation_before_audio_output')
+        and not analysis.get('requests_visual_output')
+        and not analysis.get('requests_speech_to_text_output')
+    )

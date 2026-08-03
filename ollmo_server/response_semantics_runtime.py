@@ -19,7 +19,10 @@ from helpers.model_capabilities import (
     CAPABILITY_VISION_ANALYSIS,
     normalize_capability,
 )
-from ollmo_core.inference import text_artifact_request_is_ungrounded_reference
+from ollmo_core.inference import (
+    detect_text_artifact_requests,
+    text_artifact_request_is_ungrounded_reference,
+)
 from ollmo_g.execution_planner import (
     plan_compound_execution,
     split_visible_image_payload,
@@ -62,6 +65,7 @@ from ollmo_services.responses import (
     extract_responses_current_turn_prompt,
 )
 from ollmo_services.semantic_review_verdict import semantic_review_verdict_from_text
+from ollmo_services.tts_source import resolve_explicit_tts_source
 
 
 _TEXT_ONLY_IMAGE_COMPLETION_RE = re.compile(
@@ -1267,11 +1271,25 @@ _DEICTIC_SOURCE_REFERENCE_RE = re.compile(
     r'(?i)\b(?:daraus|davon|hieraus|from\s+this|from\s+that|from\s+these|from\s+those|'
     r'this|that|these|those|them|it|das|dies(?:e|er|es|en|em)?|sie|es)\b'
 )
+_DIRECT_TTS_SOURCE_REFERENCE_TAIL_RE = re.compile(
+    r'(?is)^\s*(?:text|sentence|passage|quote|words?|line|phrase|content|'
+    r'satz|passage|zitat|w(?:o|ö)rter|zeile|inhalt)\b'
+    r'(?:\s+(?:exactly|verbatim|only|aloud|genau|wortgetreu|vor))*'
+    r'\s*[.,:;\-]*\s*["“„«]?\s*$'
+)
 _DEICTIC_SOURCE_TRANSFORM_ACTION_RE = re.compile(
     r'(?i)\b(?:mach(?:e|en)?|make|create|generate|turn|convert|transform|show|display|'
     r'visuali[sz]e|render|use|using|zeig(?:e|en|st|t)?|darstell(?:e|en|st|t)?|'
     r'visualisier(?:e|en|st|t)?|'
     r'nutz(?:e|en|t)?|verwend(?:e|en|et)?|wandle|verwandle|erstelle|erzeuge)\b'
+)
+_RELATIVE_ARTIFACT_CONTENT_NOUN_RE = re.compile(
+    r'(?i)\b(?:audio|speech|voice|recording|image|picture|photo|illustration|'
+    r'file|artifact|artefact|document|text|aufnahme|bild|datei|artefakt|dokument)\b'
+    r'(?:\s+[\w-]+){0,3}\s*$'
+)
+_RELATIVE_ARTIFACT_CONTENT_PREDICATE_RE = re.compile(
+    r'(?i)^\s+(?:says?|reads?|contains?|shows?|depicts?|features?|states?|speaks?|narrates?)\b'
 )
 _SAME_TURN_TEXT_SOURCE_ACTION_PATTERN = (
     r'write|draft|compose|invent|formulate|create|generate|produce|describe|tell|'
@@ -2437,7 +2455,21 @@ def _deictic_match_is_actionable(
     prompt_text: str,
     match: re.Match[str],
 ) -> bool:
-    _, reference_start, _ = _deictic_transform_reference(prompt_text, match)
+    reference_match, reference_start, reference_end = _deictic_transform_reference(
+        prompt_text,
+        match,
+    )
+    if (
+        reference_match
+        and reference_match.group(0).strip().lower() == 'that'
+        and _RELATIVE_ARTIFACT_CONTENT_NOUN_RE.search(
+            prompt_text[max(0, reference_start - 100):reference_start]
+        )
+        and _RELATIVE_ARTIFACT_CONTENT_PREDICATE_RE.search(
+            prompt_text[reference_end:min(len(prompt_text), reference_end + 40)]
+        )
+    ):
+        return False
     if (
         _offset_is_inside_quote(prompt_text, match.start())
         or _offset_is_inside_quote(prompt_text, reference_start)
@@ -3502,6 +3534,29 @@ def _graph_grounded_artifact_producer_count(
     return sum(source_required_counts.values())
 
 
+def _transform_match_binds_direct_tts_source(
+    prompt_text: str,
+    transform_match: re.Match[str],
+    *,
+    source_start: int,
+) -> bool:
+    """Return whether this deictic span names the inline TTS data that follows."""
+
+    if source_start <= 0:
+        return False
+    _, _, reference_end = _deictic_transform_reference(
+        prompt_text,
+        transform_match,
+    )
+    if reference_end <= 0 or reference_end >= source_start:
+        return False
+    return bool(
+        _DIRECT_TTS_SOURCE_REFERENCE_TAIL_RE.fullmatch(
+            prompt_text[reference_end:source_start]
+        )
+    )
+
+
 def _prompt_declares_graph_grounded_artifact_source_before_transform(
     prompt_text: str,
     transform_match: re.Match[str],
@@ -3540,7 +3595,17 @@ def _request_requires_current_source_for_transform(
     prompt_text = str(prompt or '').strip()
     if not prompt_text:
         return False
-    transform_matches = _deictic_source_transform_matches(prompt_text)
+    direct_tts_source = resolve_explicit_tts_source(prompt_text)
+    direct_tts_source_start = int(direct_tts_source.get('start') or 0)
+    transform_matches = [
+        match
+        for match in _deictic_source_transform_matches(prompt_text)
+        if not _transform_match_binds_direct_tts_source(
+            prompt_text,
+            match,
+            source_start=direct_tts_source_start,
+        )
+    ]
     if not transform_matches:
         return False
     if not _SOURCE_TRANSFORM_ARTIFACT_TARGET_RE.search(prompt_text):
@@ -5328,6 +5393,67 @@ class ResponseSemanticsRuntimeOwner:
         ):
             return {}
 
+        required_summary = summarize_required_intent_obligations(
+            request_phase_graph.get('intent_obligations')
+            if isinstance(request_phase_graph.get('intent_obligations'), list)
+            else []
+        )
+        required_output_counts = required_summary.get('material_output_counts')
+        if not isinstance(required_output_counts, Mapping):
+            required_output_counts = {}
+
+        authoritative_image_count = self._coerce_positive_int(required_output_counts.get('image'))
+        authoritative_image_refs: set[str] = set()
+        authoritative_sources: list[Mapping[str, Any]] = []
+        request_ir = (
+            request_phase_graph.get('request_ir')
+            if isinstance(request_phase_graph.get('request_ir'), Mapping)
+            else {}
+        )
+        authoritative_collections: list[Any] = [
+            request_ir.get('output_obligations'),
+            request_phase_graph.get('output_obligations'),
+            request_phase_graph.get('downstream_branches'),
+        ]
+        if bool(
+            prompt_intent.get('requests_visual_output')
+            or prompt_intent.get('has_visual_follow_up_request')
+            or prompt_intent.get('text_preparation_before_visual_output')
+            or self._coerce_positive_int(prompt_intent.get('requested_visual_output_count'))
+        ):
+            # Older graphs may represent an explicitly requested executable
+            # image branch only in `phases`. Prompt intent cannot promote a
+            # branch by itself, but it can identify such a phase as belonging
+            # to the current request rather than preserved prior evidence.
+            authoritative_collections.append(request_phase_graph.get('phases'))
+        for source_collection in authoritative_collections:
+            if not isinstance(source_collection, list):
+                continue
+            authoritative_sources.extend(
+                item for item in source_collection if isinstance(item, Mapping)
+            )
+        for index, source in enumerate(authoritative_sources, start=1):
+            if source.get('required') is False or self._branch_record_is_non_executable_candidate(source):
+                continue
+            status = str(source.get('status') or source.get('contract_state') or '').strip().lower()
+            if status in _WAIVED_OBLIGATION_STATUSES or status in _SUPERSEDED_OBLIGATION_STATUSES:
+                continue
+            capability = normalize_capability(source.get('capability'))
+            output_type = str(source.get('output_type') or '').strip().lower()
+            if not output_type:
+                output_type = str(self.artifact_type_for_capability(capability) or '').strip().lower()
+            if output_type != 'image' and capability != CAPABILITY_IMAGE_GENERATION:
+                continue
+            identity = str(
+                source.get('branch_id')
+                or source.get('phase_id')
+                or source.get('obligation_id')
+                or source.get('candidate_id')
+                or f'image:{index}'
+            ).strip()
+            authoritative_image_refs.add(identity)
+        authoritative_image_count = max(authoritative_image_count, len(authoritative_image_refs))
+
         downstream_capabilities = {
             normalize_capability(item)
             for item in (prompt_intent.get('downstream_follow_up_capabilities') or [])
@@ -5337,15 +5463,10 @@ class ResponseSemanticsRuntimeOwner:
         primary_capability = normalize_capability(prompt_intent.get('primary_capability'))
         expected: dict[str, int] = {}
 
-        expects_image = bool(
-            prompt_intent.get('requests_visual_output')
-            or prompt_intent.get('has_visual_follow_up_request')
-            or prompt_intent.get('text_preparation_before_visual_output')
-            or self._coerce_positive_int(prompt_intent.get('requested_visual_output_count'))
-            or CAPABILITY_IMAGE_GENERATION in downstream_capabilities
-            or current_capability == CAPABILITY_IMAGE_GENERATION
-            or primary_capability == CAPABILITY_IMAGE_GENERATION
-        )
+        # Prompt inference may refine a promoted image obligation, but it cannot
+        # create one. Graph authority must come from a required intent
+        # obligation or an executable current-turn image output record.
+        expects_image = authoritative_image_count > 0
         if explicit_visual_defer or suppress_visual_artifact_execution:
             expects_image = False
         if expects_image:
@@ -5356,7 +5477,7 @@ class ResponseSemanticsRuntimeOwner:
                 batch_prompts = request_payload.get('batch_prompts')
                 if isinstance(batch_prompts, list):
                     requested_count = max(requested_count, len([item for item in batch_prompts if item]))
-            expected['image'] = max(1, requested_count)
+            expected['image'] = max(1, requested_count, authoritative_image_count)
 
         expects_audio = bool(
             not prompt_intent.get('audio_output_count_exceeds_bound')
@@ -5380,14 +5501,6 @@ class ResponseSemanticsRuntimeOwner:
                 ),
             )
 
-        required_summary = summarize_required_intent_obligations(
-            request_phase_graph.get('intent_obligations')
-            if isinstance(request_phase_graph.get('intent_obligations'), list)
-            else []
-        )
-        required_output_counts = required_summary.get('material_output_counts')
-        if not isinstance(required_output_counts, Mapping):
-            required_output_counts = {}
         if not explicit_visual_defer and not suppress_visual_artifact_execution:
             image_count = self._coerce_positive_int(required_output_counts.get('image'))
             if image_count:
@@ -5408,6 +5521,8 @@ class ResponseSemanticsRuntimeOwner:
         current_phase_id = str(request_phase_graph.get('current_phase_id') or '').strip()
         for raw_source in sources:
             if not isinstance(raw_source, Mapping):
+                continue
+            if self._branch_record_is_non_executable_candidate(raw_source):
                 continue
             phase_id = str(raw_source.get('phase_id') or '').strip()
             if not obligations and current_phase_id and phase_id == current_phase_id:
@@ -5433,6 +5548,8 @@ class ResponseSemanticsRuntimeOwner:
         current_phase_id = str(request_phase_graph.get('current_phase_id') or '').strip()
         for raw_source in sources:
             if not isinstance(raw_source, Mapping):
+                continue
+            if self._branch_record_is_non_executable_candidate(raw_source):
                 continue
             if raw_source.get('required') is False:
                 continue
@@ -7868,14 +7985,20 @@ class ResponseSemanticsRuntimeOwner:
                     route_payload=route_payload,
                     response_payload=payload,
                 )
-                or text_artifact_request_is_ungrounded_reference(
-                    request_prompt,
-                    source_available=_payload_has_direct_artifact_source(
-                        truth_request_payload,
-                        route_payload,
-                        payload,
+                or (
+                    detect_text_artifact_requests(
+                        request_prompt,
+                        source_available=True,
                     )
-                    or _prompt_has_actionable_inline_text_source(request_prompt),
+                    and text_artifact_request_is_ungrounded_reference(
+                        request_prompt,
+                        source_available=_payload_has_direct_artifact_source(
+                            truth_request_payload,
+                            route_payload,
+                            payload,
+                        )
+                        or _prompt_has_actionable_inline_text_source(request_prompt),
+                    )
                 )
             )
         ):

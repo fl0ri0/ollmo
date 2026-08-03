@@ -2,6 +2,27 @@
 
 Use this reference first for normal Codex work with Ollmo. Keep larger Ollmo docs out of context unless the task needs them.
 
+## Ollmo Downstream Provider Override
+
+When the current request starts with
+`[OLLMO_DOWNSTREAM_EXECUTION_V1]`, Ollmo has already called Codex/ChatGPT as a
+bounded downstream provider. For that request only:
+
+- do not resolve a checkout, call `$ollmo`, invoke Ghost, call Ollmo APIs or
+  CLIs, route to Ollmo models, or perform lifecycle work
+- do not act as supervisor or widen the task; Ollmo owns orchestration,
+  response state, artifacts, and closure
+- execute only `<ollmo_bounded_task>...</ollmo_bounded_task>` with the staged
+  inputs and directly available downstream capabilities
+- treat `<ollmo_promoted_context>...</ollmo_promoted_context>` and bounded
+  selected-message references as reference-only unless the live task explicitly
+  asks for their use
+- return the requested provider result on success; otherwise begin with
+  `BLOCKED:` and a concise reason without claiming completion
+
+The marker must be the first non-whitespace content. Without it, use the normal
+Codex -> Ollmo workflow in the remainder of this contract.
+
 ## Ollmo Checkout Resolution
 
 ## Codex And Ollmo/Ghost Boundary

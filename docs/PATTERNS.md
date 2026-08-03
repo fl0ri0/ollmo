@@ -79,6 +79,16 @@ Route preview and route selection are not lifecycle actions. They must not start
   consent and data scope
 - runtime records the concrete input handoff; provider prose is not proof of
   which context or files were supplied
+- external execution of an already-shaped branch begins with
+  `[OLLMO_DOWNSTREAM_EXECUTION_V1]`; Ollmo remains supervisor while the provider
+  executes only `<ollmo_bounded_task>` under the supplied
+  `<ollmo_promoted_context>`, without recursively invoking Ollmo or widening the
+  task
+- Ghost planning itself is a separate Ollmo-internal role: it does not invoke
+  the Ollmo companion skill and receives runtime manifest, model, and capability
+  orientation directly from Ollmo. When Ghost subsequently resolves an
+  already-shaped branch to an external target, that target call is downstream
+  execution and does receive the marker
 
 ---
 
@@ -86,6 +96,9 @@ Route preview and route selection are not lifecycle actions. They must not start
 
 - a blocked obligation stays visible
 - runtime evidence explains why it is blocked
+- downstream provider output beginning with `BLOCKED:` is branch block truth;
+  preserve its reason in runtime state, but never accept that text as artifact
+  or materialization content or as fulfillment evidence
 - the next transition is the right-sized verified continuation, repair, explicit waiver, supersession, clarification, or truthful freeze
 - freeze captures the truthful state, including remaining blockage if needed
 - UI renders the block as runtime state, not as a stale spinner or false success
@@ -99,6 +112,9 @@ Route preview and route selection are not lifecycle actions. They must not start
 - possible outputs may exist as candidates or reserved vacancies
 - candidates do not count as pending obligations
 - unpromoted/reserved candidates may inform planning, but remain non-executable until promoted
+- a modality cue that is only reserved, negated, or inferred cannot create
+  executable work or Closure-repair work without a promoted current-turn
+  obligation
 - promotion records explain why a candidate became owed work
 - waiver records explain why owed work was released
 - supersession records explain why owed work was replaced by newer runtime truth

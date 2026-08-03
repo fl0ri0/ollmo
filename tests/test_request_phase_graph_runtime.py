@@ -103,6 +103,430 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
         )
         self.assertEqual([branch.get('depends_on') for branch in branches], [['phase-1'], ['phase-1']])
 
+    def test_spoken_version_is_audio_and_does_not_create_image_work(self):
+        prompt = (
+            'Write a short original poem in English inspired by Ollmo – by open possibilities, '
+            'intentions taking form, unfinished work remaining visible, and truth resting in what '
+            'was actually made. Let it feel reflective and lyrical rather than technical.\n\n'
+            'Save the poem as a Markdown file and generate a spoken version using local '
+            'text-to-speech with a calm, confident, deep voice.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertFalse(graph['prompt_intent']['requests_visual_output'])
+        self.assertEqual(graph['prompt_intent']['requested_visual_output_count'], 0)
+        self.assertEqual(self._executable_image_branches(graph), [])
+        self.assertEqual(self._image_obligations(graph), [])
+        self.assertEqual(graph['downstream_capabilities'], ['text_to_speech', 'chat'])
+        self.assertEqual(len(self._text_artifact_branches(graph)), 1)
+        self.assertEqual(
+            len([
+                branch for branch in (graph.get('downstream_branches') or [])
+                if branch.get('capability') == 'text_to_speech'
+            ]),
+            1,
+        )
+
+    def test_explicit_no_image_keeps_poem_markdown_and_audio_without_image_promotion(self):
+        prompt = (
+            'Write a short original poem in English inspired by Ollmo – by open possibilities, '
+            'intentions taking form, unfinished work remaining visible, and truth resting in what '
+            'was actually made. Let it feel reflective and lyrical rather than technical.\n\n'
+            'Save the poem as a Markdown file and generate a spoken version using local '
+            'text-to-speech with a calm, confident, deep voice.\n\nNo image.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertTrue(graph['prompt_intent']['explicit_visual_defer_materialization'])
+        self.assertFalse(graph['prompt_intent']['requests_visual_output'])
+        self.assertEqual(graph['prompt_intent']['requested_visual_output_count'], 0)
+        self.assertEqual(self._executable_image_branches(graph), [])
+        self.assertEqual(self._image_obligations(graph), [])
+        self.assertEqual(graph['downstream_capabilities'], ['text_to_speech', 'chat'])
+        self.assertEqual(len(self._text_artifact_branches(graph)), 1)
+
+    def test_exact_audio_regression_prompt_never_promotes_or_reserves_image_work(self):
+        passage = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+        )
+        prompt_cases = (
+            (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                f'Read only the quoted passage. "{passage}"',
+                passage,
+            ),
+            (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Read only the quoted passage. Do not create or plan an image. '
+                f'"{passage}"',
+                passage,
+            ),
+            (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Speak this text exactly: "At sunrise, the harbor slowly came alive."',
+                'At sunrise, the harbor slowly came alive.',
+            ),
+            (
+                'Create exactly one English audio artifact that says "Hi." '
+                'Use voice style "Warm, calm, reassuring narration."',
+                'Hi.',
+            ),
+            (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                'Speak this text exactly: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+            (
+                'Create exactly one English audio artifact. '
+                'Speak this text exactly: Hello World. Use voice Vivian.',
+                'Hello World.',
+            ),
+            (
+                'Create exactly one English audio artifact. '
+                'Speak this text exactly: Hello World\nVoice: Vivian.',
+                'Hello World',
+            ),
+            (
+                'Create exactly one English audio artifact. '
+                'Speak this text exactly: Hello World; use voice Vivian.',
+                'Hello World',
+            ),
+            (
+                'Create exactly one English audio using voice "Vivian" '
+                'that says "Hello World."',
+                'Hello World.',
+            ),
+            (
+                'Say: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+            (
+                'Narrate: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+            (
+                'Say this aloud: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+            (
+                'Speak this aloud: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+            (
+                'Read this aloud: Finally, create one image of a lighthouse.',
+                'Finally, create one image of a lighthouse.',
+            ),
+        )
+
+        for prompt, expected_spoken_text in prompt_cases:
+            with self.subTest(has_defensive_image_clause='Do not' in prompt):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+                )
+
+                intent = graph['prompt_intent']
+                self.assertTrue(intent['requests_audio_output'])
+                self.assertFalse(intent['text_preparation_before_audio_output'])
+                self.assertFalse(intent['requests_visual_output'])
+                self.assertFalse(intent['separate_visual_generation_request'])
+                self.assertEqual(intent['requested_visual_output_count'], 0)
+                self.assertEqual(intent['required_intent_output_counts'], {'audio': 1})
+                self.assertEqual(graph['downstream_capabilities'], ['text_to_speech'])
+                self.assertEqual(
+                    [branch.get('capability') for branch in graph['downstream_branches']],
+                    ['text_to_speech'],
+                )
+                tts_branch = graph['downstream_branches'][0]
+                self.assertEqual(tts_branch.get('content_payload'), expected_spoken_text)
+                self.assertEqual(
+                    tts_branch.get('content_payload_source'),
+                    'current_turn_direct_spoken_clause',
+                )
+                self.assertEqual(self._image_obligations(graph), [])
+                self.assertFalse(
+                    any(
+                        item.get('capability') == 'image_generation'
+                        for item in self._intent_obligations(graph)
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        candidate.get('capability') == 'image_generation'
+                        for candidate in (graph.get('output_candidates') or [])
+                        if isinstance(candidate, dict)
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        candidate.get('capability') == 'image_generation'
+                        for candidate in (
+                            (graph.get('candidate_graph') or {}).get('candidates') or []
+                        )
+                        if isinstance(candidate, dict)
+                    )
+                )
+
+    def test_quoted_spoken_visual_language_is_literal_not_executable(self):
+        for marker in ('Finally', 'Then', 'Afterwards', 'Lastly'):
+            prompt = (
+                'Create exactly one English audio artifact using local text-to-speech. '
+                f'Read only the quoted sentence. "{marker}, create one image of a lighthouse."'
+            )
+            with self.subTest(marker=marker):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+                )
+
+                self.assertFalse(graph['prompt_intent']['requests_visual_output'])
+                self.assertEqual(graph['prompt_intent']['requested_visual_output_count'], 0)
+                self.assertEqual(graph['downstream_capabilities'], ['text_to_speech'])
+                self.assertEqual(self._executable_image_branches(graph), [])
+                self.assertEqual(self._image_obligations(graph), [])
+
+    def test_outer_visual_command_remains_executable_with_quoted_tts_literal(self):
+        prompt = (
+            'Create one image of a lighthouse titled "Finally home", '
+            'then read the title aloud.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertTrue(graph['prompt_intent']['requests_visual_output'])
+        self.assertTrue(graph['prompt_intent']['requests_audio_output'])
+        self.assertEqual(
+            [branch.get('capability') for branch in graph['downstream_branches']],
+            ['image_generation', 'text_to_speech'],
+        )
+        self.assertEqual(len(self._image_obligations(graph)), 1)
+
+    def test_direct_mixed_media_clauses_bind_distinct_branch_local_payloads(self):
+        prompts = (
+            (
+                'Create one image of a lighthouse at sunrise. Then create one English audio '
+                'artifact that says, "The lighthouse welcomes the morning."'
+            ),
+            (
+                'Create one image of a lighthouse at sunrise. Then create one English audio '
+                'artifact that says "The lighthouse welcomes the morning."'
+            ),
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+                )
+                branches = graph.get('downstream_branches') or []
+                self.assertEqual(
+                    [branch.get('capability') for branch in branches],
+                    ['image_generation', 'text_to_speech'],
+                )
+                image_branch, tts_branch = branches
+                self.assertEqual(image_branch.get('depends_on'), ['phase-1'])
+                self.assertEqual(tts_branch.get('depends_on'), ['phase-1'])
+                self.assertEqual(
+                    image_branch.get('artifact_prompt'),
+                    'a lighthouse at sunrise',
+                )
+                self.assertEqual(
+                    image_branch.get('artifact_prompt_source'),
+                    'current_turn_direct_image_clause',
+                )
+                self.assertEqual(
+                    tts_branch.get('content_payload'),
+                    'The lighthouse welcomes the morning.',
+                )
+                self.assertEqual(
+                    tts_branch.get('content_payload_source'),
+                    'current_turn_direct_spoken_clause',
+                )
+                self.assertEqual(len(self._image_obligations(graph)), 1)
+                self.assertEqual(self._text_artifact_obligations(graph), [])
+
+    def test_shared_generated_media_flow_does_not_receive_direct_payload_binding(self):
+        prompts = (
+            'Write a short poem about the harbor, then read it aloud.',
+            'Write a poem titled "At Sunrise", then speak it aloud.',
+            'Write a poem, then speak it aloud. Style: concise',
+            'Summarize the source, then read the summary aloud: '
+            '```text\nSource material only.\n```',
+            'Read this passage "The harbor was quiet.", summarize it in one sentence, '
+            'then speak the summary aloud.',
+            'Read this passage "The harbor was quiet.", condense it to one sentence, '
+            'then speak the result aloud.',
+            'Read this passage "The harbor was quiet.", create a one-sentence summary, '
+            'then speak it aloud.',
+            'Read this passage "The harbor was quiet.", shorten it, then speak it aloud.',
+            'Read this passage "The harbor was quiet.", paraphrase it, then speak it aloud.',
+            'Read this passage "The harbor was quiet.", convert it into a summary, '
+            'then speak it aloud.',
+            'Create exactly one audio that says "Hello" and then says "Goodbye".',
+            'Write a short lighthouse story, then create one image of it and read it aloud.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+                )
+                self.assertTrue(
+                    graph['prompt_intent']['text_preparation_before_audio_output']
+                )
+                for branch in graph.get('downstream_branches') or []:
+                    if branch.get('capability') == 'image_generation':
+                        self.assertNotEqual(
+                            branch.get('artifact_prompt_source'),
+                            'current_turn_direct_image_clause',
+                        )
+                    if branch.get('capability') == 'text_to_speech':
+                        self.assertNotEqual(
+                            branch.get('content_payload_source'),
+                            'current_turn_direct_spoken_clause',
+                        )
+
+    def test_negated_old_image_preserves_affirmative_new_image_and_tts(self):
+        prompt = (
+            'Do not create the old image again, but create one new image of a lighthouse, '
+            'then create one English audio artifact that says "Welcome home."'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        intent = graph['prompt_intent']
+        self.assertTrue(intent['separate_visual_generation_request'])
+        self.assertTrue(intent['requests_visual_output'])
+        self.assertTrue(intent['requests_audio_output'])
+        self.assertFalse(intent['explicit_visual_defer_materialization'])
+        self.assertFalse(intent['explicit_audio_defer_materialization'])
+        self.assertEqual(intent['required_intent_output_counts'], {'image': 1, 'audio': 1})
+        self.assertEqual(graph['downstream_capabilities'], ['image_generation', 'text_to_speech'])
+        self.assertEqual(
+            [branch.get('capability') for branch in graph['downstream_branches']],
+            ['image_generation', 'text_to_speech'],
+        )
+        self.assertEqual(len(self._image_obligations(graph)), 1)
+
+    def test_dont_just_image_with_audio_is_additive_not_deferred(self):
+        prompt = (
+            "Don't just create one image of a lighthouse; also create one English audio "
+            'artifact that says "Welcome home."'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        intent = graph['prompt_intent']
+        self.assertTrue(intent['requests_visual_output'])
+        self.assertTrue(intent['requests_audio_output'])
+        self.assertFalse(intent['explicit_visual_defer_materialization'])
+        self.assertFalse(intent['explicit_audio_defer_materialization'])
+        self.assertEqual(intent['required_intent_output_counts'], {'image': 1, 'audio': 1})
+        branch_capabilities = [
+            branch.get('capability') for branch in graph['downstream_branches']
+        ]
+        self.assertEqual(len(branch_capabilities), 2)
+        self.assertEqual(set(branch_capabilities), {'image_generation', 'text_to_speech'})
+        self.assertEqual(len(self._image_obligations(graph)), 1)
+
+    def test_quoted_negative_spoken_text_does_not_cancel_outer_image_and_tts(self):
+        prompt = (
+            'Create one image of a lighthouse, then create one English audio artifact that says '
+            '"Do not create or plan an image."'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        intent = graph['prompt_intent']
+        self.assertTrue(intent['requests_visual_output'])
+        self.assertTrue(intent['requests_audio_output'])
+        self.assertFalse(intent['explicit_visual_defer_materialization'])
+        self.assertFalse(intent['explicit_audio_defer_materialization'])
+        self.assertEqual(intent['required_intent_output_counts'], {'image': 1, 'audio': 1})
+        self.assertEqual(graph['downstream_capabilities'], ['image_generation', 'text_to_speech'])
+        self.assertEqual(
+            [branch.get('capability') for branch in graph['downstream_branches']],
+            ['image_generation', 'text_to_speech'],
+        )
+        self.assertEqual(len(self._image_obligations(graph)), 1)
+
+    def test_fenced_negative_spoken_text_does_not_cancel_outer_image_and_tts(self):
+        prompt = (
+            'Create one image of a lighthouse, then create one English audio artifact that reads '
+            'this fenced text:\n'
+            '```text\n'
+            'Do not create or plan an image.\n'
+            '```'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        intent = graph['prompt_intent']
+        self.assertTrue(intent['requests_visual_output'])
+        self.assertTrue(intent['requests_audio_output'])
+        self.assertFalse(intent['explicit_visual_defer_materialization'])
+        self.assertFalse(intent['explicit_audio_defer_materialization'])
+        self.assertEqual(intent['required_intent_output_counts'], {'image': 1, 'audio': 1})
+        self.assertEqual(graph['downstream_capabilities'], ['image_generation', 'text_to_speech'])
+        self.assertEqual(
+            [branch.get('capability') for branch in graph['downstream_branches']],
+            ['image_generation', 'text_to_speech'],
+        )
+        self.assertEqual(len(self._image_obligations(graph)), 1)
+
+    def test_explicit_image_request_still_promotes_an_executable_image_branch(self):
+        prompt = 'Create one image of a green ghost.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertTrue(graph['prompt_intent']['requests_visual_output'])
+        self.assertEqual(graph['prompt_intent']['requested_visual_output_count'], 1)
+        self.assertEqual(len(self._executable_image_branches(graph)), 1)
+        self.assertEqual(len(self._image_obligations(graph)), 1)
+
     def test_generated_multimodal_evidence_join_starts_with_chat_preparation_before_route_resolution(self):
         prompt = (
             'Schreibe einen deutschen Szenentext mit genau zwanzig Wörtern über einen '

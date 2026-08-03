@@ -20,7 +20,11 @@ from helpers.model_capabilities import (
     supports_capability,
 )
 from ollmo_services.chat_history import read_chat_history
-from ollmo_g.intent import analyze_prompt_intent, normalize_intent_text
+from ollmo_g.intent import (
+    analyze_prompt_intent,
+    normalize_intent_text,
+    prompt_has_self_contained_direct_tts_source,
+)
 from ollmo_services.file_inputs import file_kind_from_name
 
 MAX_REFERENTIAL_ROUTE_USER_TURNS = 1
@@ -1458,13 +1462,14 @@ def infer_route_prompt_class(
 ) -> Optional[str]:
     if route_hint is None and isinstance(heuristic_route, dict):
         route_hint = heuristic_route
-    specific_prompt_class = _embedding_prompt_class(context, route_hint=route_hint)
-    if specific_prompt_class:
-        return specific_prompt_class
-
     prompt = str(context.get('prompt') or '').strip()
     if not prompt or _signals_fresh_task(prompt):
         return None
+    if prompt_has_self_contained_direct_tts_source(prompt):
+        return None
+    specific_prompt_class = _embedding_prompt_class(context, route_hint=route_hint)
+    if specific_prompt_class:
+        return specific_prompt_class
     normalized_prompt = normalize_intent_text(prompt)
     if _has_follow_up_reference_anchor(prompt, normalized_prompt):
         return 'artifact_follow_up'
@@ -2354,6 +2359,8 @@ def _has_follow_up_reference_anchor(raw_text: str, normalized_text: str) -> bool
 def _prompt_requests_thread_context(raw_text: str) -> bool:
     text = str(raw_text or '').strip()
     if not text or _signals_fresh_task(text):
+        return False
+    if prompt_has_self_contained_direct_tts_source(text):
         return False
     normalized_text = normalize_intent_text(text)
     if _references_existing_image(text) or _references_recent_text(text) or _references_recent_audio(text):

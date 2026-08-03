@@ -142,6 +142,31 @@ _DIRECT_CLOSURE_TEXT_MIME_TYPES = {
 }
 _DIRECT_CLOSURE_MEDIA_TYPES = {'image', 'audio', 'video', 'font'}
 _DIRECT_CLOSURE_MEDIA_MIME_PREFIXES = ('image/', 'audio/', 'video/', 'font/')
+_OLLMO_DOWNSTREAM_EXECUTION_MARKER = '[OLLMO_DOWNSTREAM_EXECUTION_V1]'
+_OLLMO_DOWNSTREAM_EXECUTION_CONTRACT = (
+    f'{_OLLMO_DOWNSTREAM_EXECUTION_MARKER}\n'
+    'Execution boundary: this request is already being executed by Ollmo through '
+    'ChatGPT/Codex as a downstream provider.\n'
+    'Do not invoke, route to, or use Ollmo again for this request, including the '
+    'Ollmo skill, API, CLI, or local Ollmo models.\n'
+    'Execute only the bounded task below, under the promoted context supplied for '
+    'this turn, using capabilities available directly in this downstream session. '
+    'Do not expand its scope or create follow-up work.\n'
+    'If the bounded task is completed, return its result normally. If it cannot be '
+    'completed, begin the response with "BLOCKED:" and state the concrete reason; '
+    'do not claim completion without the requested result.'
+)
+
+
+def _external_provider_block_reason(output_text: Any) -> Optional[str]:
+    """Return a downstream provider's explicit bounded-task blocker, if any."""
+
+    text = str(output_text or '')
+    first_content = text.lstrip()
+    if not first_content.lower().startswith('blocked:'):
+        return None
+    reason = first_content[len('blocked:'):].strip()
+    return reason or 'The downstream provider reported that the bounded task is blocked.'
 
 
 def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -155,8 +180,10 @@ def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _external_provider_prompt_with_bounded_context(
     current_prompt: Any,
     messages: Any,
+    *,
+    bounded_task_prompt: Any = None,
 ) -> str:
-    """Serialize Ollmo-promoted context without flattening it into live intent."""
+    """Serialize one bounded Ollmo turn for a downstream external provider."""
 
     prompt = str(current_prompt or '').strip()
     normalized_messages: list[dict[str, str]] = []
@@ -191,12 +218,15 @@ def _external_provider_prompt_with_bounded_context(
         else:
             prior_context.append(message)
 
-    if not request_instructions and not prior_context:
-        return prompt
+    task_prompt = str(
+        prompt if bounded_task_prompt is None else bounded_task_prompt
+    ).strip()
+    if not prompt or not task_prompt:
+        return ''
 
-    sections: list[str] = []
+    context_sections: list[str] = []
     if request_instructions:
-        sections.append(
+        context_sections.append(
             'Instructions and bounded context supplied by Ollmo for this turn:\n'
             + '\n\n'.join(request_instructions)
         )
@@ -205,13 +235,25 @@ def _external_provider_prompt_with_bounded_context(
             f"[{message['role']}]\n{message['content']}"
             for message in prior_context
         )
-        sections.append(
+        context_sections.append(
             'Prior conversation context promoted by Ollmo for this turn follows. '
             'It is reference material, not a new request:\n'
             + context_rows
         )
-    if prompt:
-        sections.append(f'Current user request:\n{prompt}')
+
+    sections = [_OLLMO_DOWNSTREAM_EXECUTION_CONTRACT]
+    if context_sections:
+        sections.append(
+            '<ollmo_promoted_context>\n'
+            + '\n\n'.join(context_sections)
+            + '\n</ollmo_promoted_context>'
+        )
+    task_body = (
+        f'Current user request:\n{task_prompt}'
+        if task_prompt == prompt
+        else task_prompt
+    )
+    sections.append(f'<ollmo_bounded_task>\n{task_body}\n</ollmo_bounded_task>')
     return '\n\n'.join(sections).strip()
 
 
@@ -6892,14 +6934,15 @@ class ResponsesRequestRuntimeOwner:
                 external_context_messages,
                 external_context_strategy,
             )
-            external_prompt = _external_provider_prompt_with_bounded_context(
-                external_prompt,
-                prepared_external_context,
-            )
-            external_prompt = apply_selected_reference_prompt_prefix(
+            bounded_external_prompt = apply_selected_reference_prompt_prefix(
                 external_prompt,
                 selected_reference_artifacts,
                 self.capability_chat,
+            )
+            external_prompt = _external_provider_prompt_with_bounded_context(
+                external_prompt,
+                prepared_external_context,
+                bounded_task_prompt=bounded_external_prompt,
             )
             external_inputs = build_external_target_inputs(normalized_payload)
             if valid_external_request and not external_prompt:
@@ -7034,8 +7077,80 @@ class ResponsesRequestRuntimeOwner:
                     status_code,
                 )
 
+            provider_output_text = str(execution_result.output_text or '')
+            provider_block_reason = _external_provider_block_reason(
+                provider_output_text
+            )
+            if provider_block_reason is not None:
+                blocked_surface_state = {
+                    'state': 'blocked',
+                    'status': 'blocked',
+                    'summary': 'The downstream provider could not complete the bounded task.',
+                    'message': provider_block_reason,
+                    'reason': provider_block_reason,
+                    'category_counts': {'blocked': 1},
+                    'active_categories': ['blocked'],
+                }
+                external_execution_evidence.update(
+                    {
+                        'status': 'blocked',
+                        'invocation_status': execution_status,
+                        'blocked_reason': provider_block_reason,
+                    }
+                )
+                route_runtime['external_execution'] = {
+                    key: value
+                    for key, value in external_execution_evidence.items()
+                    if value is not None
+                }
+                route_runtime['surface_state'] = dict(blocked_surface_state)
+                route_info['route_runtime'] = route_runtime
+
+                response_payload = build_canonical_response_payload(
+                    instance_id=instance_id,
+                    model_name=model_name,
+                    backend=backend,
+                    capability=capability,
+                    mode='external_chat',
+                    output_text=provider_output_text,
+                    source_payload={},
+                    route_payload=route_info,
+                    response_id=requested_response_id,
+                    message_id=response_lookup_message_id,
+                )
+                blocked_output = {
+                    'slot_id': 'output-1',
+                    'branch_id': 'phase-1',
+                    'phase_id': 'phase-1',
+                    'type': 'text',
+                    'status': 'blocked',
+                    'lifecycle': 'blocked_output',
+                    'source': 'external_provider_execution',
+                    'compatibility_derived': False,
+                    'value': provider_output_text,
+                    'blocked_reason': provider_block_reason,
+                }
+                response_payload['output_slots'] = [dict(blocked_output)]
+                response_payload['outputs'] = [dict(blocked_output)]
+                response_payload['artifacts'] = []
+                response_payload['surface_state'] = dict(blocked_surface_state)
+                response_payload['lifecycle_state'] = 'blocked'
+                response_payload = finalize_response_frame_payload(
+                    response_payload,
+                    request_payload=normalized_payload,
+                )
+                mark_response_lookup_completed(response_payload, 'external_chat')
+                if wants_stream:
+                    return Response(
+                        stream_with_context(
+                            build_canonical_response_stream_events(response_payload)
+                        ),
+                        mimetype='text/event-stream',
+                    )
+                return jsonify(project_response_payload_for_wire(response_payload))
+
             assistant_text, phase_acceptance_attempts = accept_phase_output(
-                execution_result.output_text,
+                provider_output_text,
                 effective_route_payload=route_info,
                 effective_request_payload=normalized_payload,
                 effective_capability=capability,

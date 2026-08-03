@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import re
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from helpers.model_capabilities import (
     CAPABILITY_IMAGE_GENERATION,
@@ -17,10 +20,17 @@ from helpers.model_capabilities import (
     CAPABILITY_VISION_ANALYSIS,
 )
 from helpers.ocr_modes import GENERIC_OCR_FALLBACK_PROMPT, resolve_ocr_prompt
-from ollmo_core.transports import text_artifact_content_is_materializer_instruction_echo
-from ollmo_services.tts_audio_integrity import (
-    build_tts_audio_integrity_evidence,
+from ollmo_core.transports import (
+    join_pcm_wav_bytes,
+    text_artifact_content_is_materializer_instruction_echo,
 )
+from ollmo_services.tts_audio_integrity import (
+    TTS_QWEN_SENTENCE_CHUNK_INTEGRITY_PROFILE,
+    build_tts_audio_integrity_evidence,
+    build_tts_semantic_source,
+    tts_audio_has_qwen_generation_limit_exhaustion,
+)
+from ollmo_services.tts_source import extract_legacy_tts_wrapper_text
 
 TEXT_ARTIFACT_EXTENSIONS = {
     'txt',
@@ -347,6 +357,13 @@ _TEXT_ARTIFACT_DEMONSTRATIVE_REFERENCE_RE = re.compile(
     r'.{0,96}\b(?:file|artifact|artefact|artefakt|datei|document|dokument|html|css|js|markdown|text)\b|'
     r'\b(?:file|artifact|artefact|artefakt|datei|document|dokument|html|css|js|markdown|text)\b'
     r'.{0,96}\b(?:this|that|it|these|those|dies|diese|dieser|dieses|das|den|dem|ihn|sie|es|daraus|davon)\b',
+    re.IGNORECASE,
+)
+_RELATIVE_ARTIFACT_CONTENT_THAT_RE = re.compile(
+    r'\b(?:audio|speech|voice|recording|image|picture|photo|illustration|'
+    r'file|artifact|artefact|document|text|aufnahme|bild|datei|artefakt|dokument)\b'
+    r'(?:\s+[\w-]+){0,3}\s+(?P<relative>that)\b'
+    r'(?=\s+(?:says?|reads?|contains?|shows?|depicts?|features?|states?|speaks?|narrates?)\b)',
     re.IGNORECASE,
 )
 _TEXT_ARTIFACT_SELF_CONTAINED_SOURCE_RE = re.compile(
@@ -989,7 +1006,15 @@ def text_artifact_request_is_ungrounded_reference(prompt: str, *, source_availab
         or _TEXT_ARTIFACT_ACTION_CUE_RE.search(text)
     ):
         return False
-    return bool(_TEXT_ARTIFACT_DEMONSTRATIVE_REFERENCE_RE.search(text))
+    reference_text = list(text)
+    for match in _RELATIVE_ARTIFACT_CONTENT_THAT_RE.finditer(text):
+        for index in range(match.start('relative'), match.end('relative')):
+            reference_text[index] = ' '
+    return bool(
+        _TEXT_ARTIFACT_DEMONSTRATIVE_REFERENCE_RE.search(
+            ''.join(reference_text)
+        )
+    )
 
 
 def detect_text_artifact_request(
@@ -1840,20 +1865,6 @@ def extract_text_artifact_payloads(
         return [{'artifact_request': artifact_request, 'content': text}]
     return []
 
-_TTS_WRAPPER_INTENT_RE = re.compile(
-    r'\b('
-    r'read aloud|read this aloud|say this|speak this|generate (?:me )?(?:an )?audio|'
-    r'generate audio|create audio|make audio|text to speech|voiceover|'
-    r'vorlesen|lies .* vor|sprich .* vor|vertonen|generiere .* audio|erzeuge .* audio'
-    r')\b',
-    re.IGNORECASE,
-)
-_TTS_FOLLOWING_MARKER_RE = re.compile(
-    r'\b(?:following|below|this)\s+(?:english\s+|german\s+|french\s+|spanish\s+)?'
-    r'(?:sentence|text|quote|quoted text|words?)\b',
-    re.IGNORECASE,
-)
-_TTS_QUOTED_BLOCK_RE = re.compile(r'["“](.+?)["”]', re.DOTALL)
 _TTS_AUTO_LANGUAGE_CODES = {'auto', 'autodetect', 'detect'}
 _TTS_LANGUAGE_ALIASES: dict[str, tuple[str, ...]] = {
     'english': ('english', 'en', 'eng'),
@@ -1914,6 +1925,41 @@ _TTS_LANGUAGE_CHARS: dict[str, str] = {
     'portuguese': 'áâãàçéêíóôõú',
 }
 _TTS_TOKEN_RE = re.compile(r"[a-zà-ÿ]+", re.IGNORECASE)
+_TTS_SPOKEN_WORD_RE = re.compile(
+    r"[^\W_]+(?:['\u2019][^\W_]+)?",
+    re.UNICODE,
+)
+_QWEN3_TTS_GENERATION_BUDGET_POLICY_ID = 'qwen3_tts_adaptive_audio_tokens_v2'
+_QWEN3_TTS_SAMPLING_PROFILE_POLICY_ID = 'qwen3_tts_model_native_sampling_v1'
+_QWEN3_TTS_AUDIO_TOKENS_PER_SECOND = 12.5
+_QWEN3_TTS_WORDS_PER_SECOND = 2.0
+_QWEN3_TTS_ORDINARY_CHARS_PER_SECOND = 12.0
+_QWEN3_TTS_CJK_CHARS_PER_SECOND = 4.0
+_QWEN3_TTS_DURATION_SAFETY_MULTIPLIER = 1.5
+_QWEN3_TTS_FIXED_BUFFER_SECONDS = 8.0
+_QWEN3_TTS_MIN_GENERATION_TOKENS = 256
+_QWEN3_TTS_MAX_GENERATION_TOKENS = 1200
+_QWEN3_TTS_TEMPERATURE = 0.9
+_QWEN3_TTS_TOP_P = 1.0
+_QWEN3_TTS_TOP_K = 50
+_QWEN3_TTS_REPETITION_PENALTY = 1.05
+_QWEN3_TTS_CHUNKING_POLICY_ID = 'qwen3_tts_sentence_chunks_v1'
+_QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS = 16.0
+_QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS = 10.0
+_QWEN3_TTS_GENERATION_LIMIT_RECOVERY_POLICY_ID = (
+    'qwen3_tts_single_sequence_generation_limit_retry_v2'
+)
+_QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MULTIPLIER = 1.5
+_QWEN3_TTS_GENERATION_LIMIT_RECOVERY_ADDITIONAL_TOKENS = 128
+_QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MODEL_TYPES = {
+    'base',
+    'custom_voice',
+    'voice_design',
+}
+_TTS_SENTENCE_END_RE = re.compile(
+    r'(?:[.!?…]+["\'’”»\)\]]*|\n{2,})(?=\s|$)'
+)
+_TTS_CHUNK_BOUNDARY_RE = re.compile(r'(?:[,;:—–-]\s+|\s+)')
 
 
 @dataclass
@@ -1945,6 +1991,7 @@ class InferContext:
     image_height: Optional[int] = None
     image_seed: Optional[int] = None
     text_artifact_requests: list[dict[str, str]] = field(default_factory=list)
+    prompt_is_semantic_materializer_payload: bool = False
 
 
 @dataclass
@@ -2076,37 +2123,6 @@ def _run_speech_to_text(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
     )
 
 
-def _extract_spoken_tts_text(prompt: str) -> str:
-    value = str(prompt or '').strip()
-    if not value:
-        return ''
-    fenced_text_blocks = [
-        (match.group('body') or '').strip()
-        for match in _TEXT_ARTIFACT_FENCED_BLOCK_RE.finditer(value)
-        if (match.group('body') or '').strip()
-        and _normalize_text_artifact_block_language(match.group('lang') or '') in {
-            'text',
-            'txt',
-            'markdown',
-            'md',
-        }
-    ]
-    if fenced_text_blocks:
-        return max(fenced_text_blocks, key=len)
-    quoted_matches = [
-        re.sub(r'\s+', ' ', str(match or '').strip())
-        for match in _TTS_QUOTED_BLOCK_RE.findall(value)
-        if str(match or '').strip()
-    ]
-    if quoted_matches and (
-        _TTS_WRAPPER_INTENT_RE.search(value)
-        or _TTS_FOLLOWING_MARKER_RE.search(value)
-        or len(quoted_matches) == 1
-    ):
-        return max(quoted_matches, key=len)
-    return value
-
-
 def _normalize_language_token(value: str) -> str:
     return re.sub(r'[^a-z0-9]+', '', str(value or '').strip().lower())
 
@@ -2179,6 +2195,502 @@ def _resolve_effective_tts_lang_code(
     return None, None
 
 
+def _is_qwen3_tts_model(model_name: Any) -> bool:
+    return bool(
+        re.search(
+            r'(?<![a-z0-9])qwen3[^a-z0-9]*tts(?![a-z0-9])',
+            str(model_name or '').strip().lower(),
+        )
+    )
+
+
+def _canonicalize_qwen3_tts_lang_code(
+    lang_code: Optional[str],
+) -> tuple[Optional[str], bool]:
+    """Map known aliases to the full language tokens accepted by Qwen3-TTS."""
+
+    value = str(lang_code or '').strip()
+    if not value:
+        return None, False
+    normalized = _normalize_language_token(value)
+    if normalized in _TTS_AUTO_LANGUAGE_CODES:
+        return value, False
+    for canonical_language, aliases in _TTS_LANGUAGE_ALIASES.items():
+        if normalized == _normalize_language_token(canonical_language):
+            return value, False
+        if normalized in {
+            _normalize_language_token(alias)
+            for alias in aliases
+        }:
+            return canonical_language, True
+    return value, False
+
+
+def _is_cjk_speech_character(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+    )
+
+
+def build_qwen3_tts_generation_budget(spoken_text: Any) -> dict[str, Any]:
+    """Return an observable, conservative Qwen3 audio-token safety budget."""
+
+    text = str(spoken_text or '')
+    word_count = len(_TTS_SPOKEN_WORD_RE.findall(text))
+    visible_characters = [character for character in text if not character.isspace()]
+    cjk_character_count = sum(
+        1
+        for character in visible_characters
+        if _is_cjk_speech_character(character)
+    )
+    ordinary_character_count = len(visible_characters) - cjk_character_count
+    word_estimate_seconds = word_count / _QWEN3_TTS_WORDS_PER_SECOND
+    character_estimate_seconds = (
+        ordinary_character_count / _QWEN3_TTS_ORDINARY_CHARS_PER_SECOND
+        + cjk_character_count / _QWEN3_TTS_CJK_CHARS_PER_SECOND
+    )
+    estimated_speech_seconds = max(
+        word_estimate_seconds,
+        character_estimate_seconds,
+    )
+    buffered_duration_seconds = (
+        estimated_speech_seconds * _QWEN3_TTS_DURATION_SAFETY_MULTIPLIER
+        + _QWEN3_TTS_FIXED_BUFFER_SECONDS
+    )
+    calculated_tokens = int(
+        math.ceil(
+            buffered_duration_seconds
+            * _QWEN3_TTS_AUDIO_TOKENS_PER_SECOND
+        )
+    )
+    max_tokens = min(
+        _QWEN3_TTS_MAX_GENERATION_TOKENS,
+        max(_QWEN3_TTS_MIN_GENERATION_TOKENS, calculated_tokens),
+    )
+    clamp = (
+        'minimum'
+        if max_tokens > calculated_tokens
+        else 'maximum'
+        if max_tokens < calculated_tokens
+        else 'none'
+    )
+    return {
+        'kind': 'ollmo.tts_generation_budget',
+        'version': 1,
+        'policy_id': _QWEN3_TTS_GENERATION_BUDGET_POLICY_ID,
+        'model_family': 'qwen3_tts',
+        'max_tokens': max_tokens,
+        'calculated_tokens_before_clamp': calculated_tokens,
+        'clamp': clamp,
+        'source_word_count': word_count,
+        'source_visible_character_count': len(visible_characters),
+        'source_cjk_character_count': cjk_character_count,
+        'estimated_speech_seconds': round(estimated_speech_seconds, 6),
+        'buffered_duration_seconds': round(buffered_duration_seconds, 6),
+        'policy': {
+            'audio_tokens_per_second': _QWEN3_TTS_AUDIO_TOKENS_PER_SECOND,
+            'words_per_second': _QWEN3_TTS_WORDS_PER_SECOND,
+            'ordinary_characters_per_second': _QWEN3_TTS_ORDINARY_CHARS_PER_SECOND,
+            'cjk_characters_per_second': _QWEN3_TTS_CJK_CHARS_PER_SECOND,
+            'duration_safety_multiplier': _QWEN3_TTS_DURATION_SAFETY_MULTIPLIER,
+            'fixed_buffer_seconds': _QWEN3_TTS_FIXED_BUFFER_SECONDS,
+            'minimum_tokens': _QWEN3_TTS_MIN_GENERATION_TOKENS,
+            'maximum_tokens': _QWEN3_TTS_MAX_GENERATION_TOKENS,
+        },
+    }
+
+
+def _build_qwen3_tts_sampling_profile() -> dict[str, Any]:
+    """Return the explicit Qwen3 sampling contract sent to MLX Audio."""
+
+    return {
+        'kind': 'ollmo.tts_sampling_profile',
+        'version': 1,
+        'policy_id': _QWEN3_TTS_SAMPLING_PROFILE_POLICY_ID,
+        'model_family': 'qwen3_tts',
+        'source': 'mlx_audio_qwen3_tts_model_defaults',
+        'temperature': _QWEN3_TTS_TEMPERATURE,
+        'top_p': _QWEN3_TTS_TOP_P,
+        'top_k': _QWEN3_TTS_TOP_K,
+        'repetition_penalty': _QWEN3_TTS_REPETITION_PENALTY,
+    }
+
+
+def _trim_text_span(text: str, start: int, end: int) -> tuple[int, int]:
+    bounded_start = max(0, min(len(text), start))
+    bounded_end = max(bounded_start, min(len(text), end))
+    while bounded_start < bounded_end and text[bounded_start].isspace():
+        bounded_start += 1
+    while bounded_end > bounded_start and text[bounded_end - 1].isspace():
+        bounded_end -= 1
+    return bounded_start, bounded_end
+
+
+def _qwen3_tts_estimated_speech_seconds(text: str) -> float:
+    return float(
+        build_qwen3_tts_generation_budget(text).get('estimated_speech_seconds')
+        or 0.0
+    )
+
+
+def _split_qwen3_tts_span_to_target(
+    text: str,
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    start, end = _trim_text_span(text, start, end)
+    if start >= end:
+        return []
+    if (
+        _qwen3_tts_estimated_speech_seconds(text[start:end])
+        <= _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS
+    ):
+        return [(start, end)]
+
+    spans: list[tuple[int, int]] = []
+    cursor = start
+    while cursor < end:
+        remaining_start, remaining_end = _trim_text_span(text, cursor, end)
+        if remaining_start >= remaining_end:
+            break
+        remaining = text[remaining_start:remaining_end]
+        if (
+            _qwen3_tts_estimated_speech_seconds(remaining)
+            <= _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS
+        ):
+            spans.append((remaining_start, remaining_end))
+            break
+
+        selected_cut = 0
+        first_oversized_cut = 0
+        for boundary in _TTS_CHUNK_BOUNDARY_RE.finditer(remaining):
+            cut = boundary.end()
+            candidate = remaining[:cut].strip()
+            if not candidate:
+                continue
+            estimate = _qwen3_tts_estimated_speech_seconds(candidate)
+            if estimate <= _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS:
+                selected_cut = cut
+                continue
+            first_oversized_cut = cut
+            break
+        if not selected_cut:
+            selected_cut = first_oversized_cut
+        if not selected_cut:
+            visible_limit = max(
+                1,
+                int(
+                    _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS
+                    * _QWEN3_TTS_CJK_CHARS_PER_SECOND
+                ),
+            )
+            selected_cut = min(len(remaining), visible_limit)
+        absolute_cut = min(remaining_end, remaining_start + selected_cut)
+        chunk_start, chunk_end = _trim_text_span(
+            text,
+            remaining_start,
+            absolute_cut,
+        )
+        if chunk_start >= chunk_end:
+            absolute_cut = min(remaining_end, remaining_start + 1)
+            chunk_start, chunk_end = _trim_text_span(
+                text,
+                remaining_start,
+                absolute_cut,
+            )
+        if chunk_start < chunk_end:
+            spans.append((chunk_start, chunk_end))
+        cursor = max(absolute_cut, remaining_start + 1)
+    return spans
+
+
+def build_qwen3_tts_chunk_plan(spoken_text: Any) -> dict[str, Any]:
+    """Return deterministic ordered sentence/clause spans for long Qwen speech."""
+
+    text = str(spoken_text or '')
+    source_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    full_estimated_seconds = _qwen3_tts_estimated_speech_seconds(text)
+    sentence_spans: list[tuple[int, int]] = []
+    cursor = 0
+    for boundary in _TTS_SENTENCE_END_RE.finditer(text):
+        span = _trim_text_span(text, cursor, boundary.end())
+        if span[0] < span[1]:
+            sentence_spans.append(span)
+        cursor = boundary.end()
+    trailing = _trim_text_span(text, cursor, len(text))
+    if trailing[0] < trailing[1]:
+        sentence_spans.append(trailing)
+    if not sentence_spans and text.strip():
+        sentence_spans = [_trim_text_span(text, 0, len(text))]
+
+    chunk_spans: list[tuple[int, int]] = []
+    pending: Optional[tuple[int, int]] = None
+    for sentence_start, sentence_end in sentence_spans:
+        if pending is None:
+            pending = (sentence_start, sentence_end)
+            continue
+        candidate = text[pending[0]:sentence_end]
+        if (
+            _qwen3_tts_estimated_speech_seconds(candidate)
+            <= _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS
+        ):
+            pending = (pending[0], sentence_end)
+            continue
+        chunk_spans.extend(
+            _split_qwen3_tts_span_to_target(text, pending[0], pending[1])
+        )
+        pending = (sentence_start, sentence_end)
+    if pending is not None:
+        chunk_spans.extend(
+            _split_qwen3_tts_span_to_target(text, pending[0], pending[1])
+        )
+
+    ordered_span_coverage = bool(chunk_spans)
+    previous_end = 0
+    for span_start, span_end in chunk_spans:
+        if (
+            span_start < previous_end
+            or text[previous_end:span_start].strip()
+            or not text[span_start:span_end].strip()
+        ):
+            ordered_span_coverage = False
+            break
+        previous_end = span_end
+    if text[previous_end:].strip():
+        ordered_span_coverage = False
+
+    applied = bool(
+        full_estimated_seconds > _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS
+        and len(chunk_spans) > 1
+        and ordered_span_coverage
+    )
+    chunks = [
+        {
+            'index': index,
+            'source_span_start': span_start,
+            'source_span_end': span_end,
+            'text': text[span_start:span_end],
+            'text_sha256': hashlib.sha256(
+                text[span_start:span_end].encode('utf-8')
+            ).hexdigest(),
+            'estimated_speech_seconds': round(
+                _qwen3_tts_estimated_speech_seconds(
+                    text[span_start:span_end]
+                ),
+                6,
+            ),
+        }
+        for index, (span_start, span_end) in enumerate(chunk_spans, start=1)
+    ]
+    return {
+        'kind': 'ollmo.tts_chunking_plan',
+        'version': 1,
+        'policy_id': _QWEN3_TTS_CHUNKING_POLICY_ID,
+        'model_family': 'qwen3_tts',
+        'status': 'planned' if applied else 'not_applied',
+        'applied': applied,
+        'reason': (
+            'estimated speech exceeds the single-request long-form threshold'
+            if applied
+            else 'source remains within the single-request long-form threshold'
+            if full_estimated_seconds <= _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS
+            else 'safe ordered multi-chunk coverage was not available'
+        ),
+        'source_sha256': source_sha256,
+        'source_character_count': len(text),
+        'estimated_speech_seconds': round(full_estimated_seconds, 6),
+        'trigger_speech_seconds': _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS,
+        'target_chunk_speech_seconds': _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS,
+        'ordered_span_coverage': ordered_span_coverage,
+        'chunk_count': len(chunks) if applied else 1,
+        'chunks': chunks if applied else [],
+    }
+
+
+def _build_qwen3_tts_generation_limit_recovery(
+    initial_budget: Mapping[str, Any],
+    *,
+    integrity_evidence: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return one bounded Qwen single-sequence retry budget after cap exhaustion."""
+
+    budget = dict(initial_budget)
+    model_family = str(budget.get('model_family') or '').strip().lower()
+    tts_model_type = str(budget.get('tts_model_type') or '').strip().lower()
+    generation_scope = str(budget.get('generation_scope') or '').strip().lower()
+    supported_sequence = bool(
+        model_family == 'qwen3_tts'
+        and tts_model_type
+        in _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MODEL_TYPES
+        and generation_scope == 'single_sequence'
+    )
+    try:
+        initial_max_tokens = int(budget.get('max_tokens') or 0)
+    except (TypeError, ValueError):
+        initial_max_tokens = 0
+    calculated_recovery_tokens = max(
+        initial_max_tokens
+        + _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_ADDITIONAL_TOKENS,
+        int(
+            math.ceil(
+                initial_max_tokens
+                * _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MULTIPLIER
+            )
+        ),
+    )
+    recovery_max_tokens = min(
+        _QWEN3_TTS_MAX_GENERATION_TOKENS,
+        calculated_recovery_tokens,
+    )
+    applied = bool(
+        supported_sequence
+        and initial_max_tokens > 0
+        and recovery_max_tokens > initial_max_tokens
+    )
+    recovery_budget = dict(budget)
+    recovery_budget.update(
+        {
+            'policy_id': _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_POLICY_ID,
+            'base_policy_id': str(budget.get('policy_id') or '').strip() or None,
+            'max_tokens': recovery_max_tokens,
+            'calculated_tokens_before_clamp': calculated_recovery_tokens,
+            'clamp': (
+                'maximum'
+                if recovery_max_tokens < calculated_recovery_tokens
+                else 'none'
+            ),
+            'recovery_trigger_reason_code': (
+                'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED'
+            ),
+            'recovery_initial_max_tokens': initial_max_tokens,
+        }
+    )
+    return {
+        'kind': 'ollmo.tts_generation_limit_recovery',
+        'version': 1,
+        'policy_id': _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_POLICY_ID,
+        'status': 'eligible' if applied else 'not_eligible',
+        'applied': applied,
+        'reason': (
+            'one larger bounded Qwen single-sequence retry budget is available'
+            if applied
+            else 'model scope is unsupported, the initial budget is invalid, or the hard maximum is already active'
+        ),
+        'trigger_reason_code': 'TTS_AUDIO_GENERATION_LIMIT_EXHAUSTED',
+        'model_family_scope': 'qwen3_tts',
+        'model_type_scope': sorted(
+            _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MODEL_TYPES
+        ),
+        'tts_model_type': tts_model_type or None,
+        'generation_scope': generation_scope or None,
+        'maximum_retry_count': 1,
+        'initial_max_tokens': initial_max_tokens,
+        'calculated_recovery_tokens_before_clamp': calculated_recovery_tokens,
+        'recovery_max_tokens': recovery_max_tokens,
+        'clamp': (
+            'maximum'
+            if recovery_max_tokens < calculated_recovery_tokens
+            else 'none'
+        ),
+        'policy': {
+            'multiplier': _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MULTIPLIER,
+            'additional_tokens': (
+                _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_ADDITIONAL_TOKENS
+            ),
+            'maximum_tokens': _QWEN3_TTS_MAX_GENERATION_TOKENS,
+        },
+        'trigger_primary_reason_code': str(
+            (integrity_evidence or {}).get('reason_code') or ''
+        ).strip() or None,
+        'trigger_defect_codes': [
+            str(item).strip()
+            for item in (integrity_evidence or {}).get('defect_codes') or []
+            if str(item).strip()
+        ] if isinstance((integrity_evidence or {}).get('defect_codes'), list) else [],
+        'trigger_generation_limit_evidence': dict(
+            (integrity_evidence or {}).get('generation_limit_evidence') or {}
+        ) if isinstance(
+            (integrity_evidence or {}).get('generation_limit_evidence'),
+            Mapping,
+        ) else {},
+        'generation_budget': recovery_budget if applied else None,
+    }
+
+
+def _qwen3_tts_budget_with_scope(
+    spoken_text: str,
+    *,
+    tts_model_type: str,
+    generation_scope: str,
+) -> dict[str, Any]:
+    budget = dict(build_qwen3_tts_generation_budget(spoken_text))
+    budget['tts_model_type'] = str(tts_model_type or '').strip().lower() or 'unknown'
+    budget['generation_scope'] = generation_scope
+    return budget
+
+
+def _qwen3_tts_generation_scope(
+    spoken_text: str,
+    *,
+    tts_model_type: str,
+) -> str:
+    model_type = str(tts_model_type or '').strip().lower()
+    if model_type in {'voice_design', 'custom_voice'}:
+        return 'single_sequence'
+    if model_type == 'base':
+        nonempty_line_count = len(
+            [line for line in str(spoken_text or '').splitlines() if line.strip()]
+        )
+        return (
+            'segmented_sequence'
+            if nonempty_line_count > 1
+            else 'single_sequence'
+        )
+    return 'unverified_sequence'
+
+
+def _tts_audio_bytes_integrity_evidence(
+    audio_bytes: Any,
+    source_text: str,
+    *,
+    source_sha256: str,
+    generation_budget: Mapping[str, Any],
+    tts_model_type: str,
+) -> dict[str, Any]:
+    raw = bytes(audio_bytes or b'')
+    if not raw:
+        return {
+            'kind': 'ollmo.tts_audio_integrity_evidence',
+            'version': 1,
+            'status': 'failed',
+            'reason_code': 'TTS_AUDIO_CHUNK_BYTES_MISSING',
+            'materialization_eligible': False,
+            'source_sha256': source_sha256,
+        }
+    with tempfile.NamedTemporaryFile(suffix='.wav') as handle:
+        handle.write(raw)
+        handle.flush()
+        evidence = build_tts_audio_integrity_evidence(
+            handle.name,
+            source_text,
+            source_sha256=source_sha256,
+            generation_budget=generation_budget,
+            model_family='qwen3_tts',
+            tts_model_type=tts_model_type,
+            integrity_profile=TTS_QWEN_SENTENCE_CHUNK_INTEGRITY_PROFILE,
+        )
+    evidence = dict(evidence)
+    evidence.pop('artifact_path', None)
+    evidence['artifact_scope'] = 'ephemeral_backend_chunk'
+    evidence['persisted'] = False
+    return evidence
+
+
 def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[str, Callable[..., Any]]) -> Tuple[dict, int]:
     if ctx.backend != 'mlx':
         return {'error': "text_to_speech is currently supported only for MLX."}, 400
@@ -2192,6 +2704,8 @@ def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
             tts_model_type = 'custom_voice'
         elif 'qwen3-tts' in model_name_lower and 'voicedesign' in model_name_lower:
             tts_model_type = 'voice_design'
+        elif 'qwen3-tts' in model_name_lower and 'base' in model_name_lower:
+            tts_model_type = 'base'
         elif 'kitten-tts' in model_name_lower:
             tts_model_type = 'kitten_tts'
     effective_voice = str(ctx.voice or '').strip()
@@ -2262,30 +2776,489 @@ def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
             400,
         )
 
-    prompt = _extract_spoken_tts_text(ctx.prompt)
+    prompt = (
+        str(ctx.prompt or '').strip()
+        if ctx.prompt_is_semantic_materializer_payload
+        else extract_legacy_tts_wrapper_text(ctx.prompt)
+    )
     if artifacts.text_from_file:
         prompt = f'{prompt}\n\n{artifacts.text_from_file}'.strip() if prompt else artifacts.text_from_file.strip()
     if not prompt:
         return {'error': 'text_to_speech requires a text prompt.'}, 400
 
+    is_qwen3_tts = _is_qwen3_tts_model(ctx.model_name)
     effective_lang_code, lang_code_source = _resolve_effective_tts_lang_code(
         ctx.lang_code,
         prompt,
         ctx.tts_languages,
     )
-
-    result = ops['mlx_audio_speech'](
-        ctx.port,
-        ctx.model_name,
+    if is_qwen3_tts and effective_lang_code:
+        effective_lang_code, lang_code_canonicalized = _canonicalize_qwen3_tts_lang_code(
+            effective_lang_code,
+        )
+        if lang_code_canonicalized:
+            lang_code_source = (
+                f'{lang_code_source or "resolved"}_qwen3_alias_canonicalized'
+            )
+    if is_qwen3_tts and not effective_lang_code:
+        effective_lang_code = 'auto'
+        lang_code_source = 'qwen3_model_default'
+    semantic_source = build_tts_semantic_source(
         prompt,
-        instruct=ctx.instruct,
-        voice=effective_voice or None,
-        response_format=ctx.response_format,
-        speed=ctx.speed,
-        pitch=ctx.pitch,
+        source_text_source='inference_final_spoken_prompt',
         lang_code=effective_lang_code,
-        timeout_sec=ctx.infer_timeout_sec,
     )
+
+    generation_budget = (
+        _qwen3_tts_budget_with_scope(
+            prompt,
+            tts_model_type=tts_model_type,
+            generation_scope=_qwen3_tts_generation_scope(
+                prompt,
+                tts_model_type=tts_model_type,
+            ),
+        )
+        if is_qwen3_tts
+        else None
+    )
+    sampling_profile = _build_qwen3_tts_sampling_profile() if is_qwen3_tts else None
+    base_speech_kwargs = {
+        'instruct': ctx.instruct,
+        'voice': effective_voice or None,
+        'response_format': ctx.response_format,
+        'speed': ctx.speed,
+        'pitch': ctx.pitch,
+        'lang_code': effective_lang_code,
+        'timeout_sec': ctx.infer_timeout_sec,
+    }
+    if sampling_profile:
+        base_speech_kwargs.update(
+            {
+                'temperature': sampling_profile['temperature'],
+                'top_p': sampling_profile['top_p'],
+                'top_k': sampling_profile['top_k'],
+                'repetition_penalty': sampling_profile['repetition_penalty'],
+            }
+        )
+
+    resolved_response_format = str(ctx.response_format or 'wav').strip().lower()
+    chunking_evidence: Optional[dict[str, Any]] = None
+    single_sequence_recovery_evidence: Optional[dict[str, Any]] = None
+    result: dict[str, Any]
+    chunk_failure_reason = ''
+    chunk_failure_bytes = b''
+    chunk_failure_content_type = 'audio/wav'
+    chunk_plan = (
+        build_qwen3_tts_chunk_plan(prompt)
+        if is_qwen3_tts
+        and tts_model_type in {'base', 'voice_design', 'custom_voice'}
+        and resolved_response_format in {'wav', 'wave', 'x-wav'}
+        else None
+    )
+    if chunk_plan and chunk_plan.get('applied') is True:
+        generation_budget = _qwen3_tts_budget_with_scope(
+            prompt,
+            tts_model_type=tts_model_type,
+            generation_scope='chunked_sequence',
+        )
+        generation_budget['chunk_count'] = int(chunk_plan.get('chunk_count') or 0)
+        chunk_diagnostics: list[dict[str, Any]] = []
+        chunk_audio_bytes: list[bytes] = []
+        passed_chunk_count = 0
+        recovered_chunk_count = 0
+        backend_call_count = 0
+        recovery_attempt_count = 0
+
+        def synthesize_chunk_attempt(
+            chunk_text: str,
+            *,
+            source_sha256: str,
+            attempt_index: int,
+            attempt_role: str,
+            attempt_budget: Mapping[str, Any],
+        ) -> tuple[bytes, str, dict[str, Any], dict[str, Any]]:
+            speech_kwargs = dict(base_speech_kwargs)
+            speech_kwargs['max_tokens'] = int(
+                attempt_budget.get('max_tokens') or 0
+            )
+            attempt_result = ops['mlx_audio_speech'](
+                ctx.port,
+                ctx.model_name,
+                chunk_text,
+                **speech_kwargs,
+            )
+            attempt_audio = bytes(attempt_result.get('audio_bytes') or b'')
+            attempt_content_type = str(
+                attempt_result.get('content_type') or 'audio/wav'
+            )
+            attempt_integrity = _tts_audio_bytes_integrity_evidence(
+                attempt_audio,
+                chunk_text,
+                source_sha256=source_sha256,
+                generation_budget=attempt_budget,
+                tts_model_type=tts_model_type,
+            )
+            attempt_record = {
+                key: value
+                for key, value in {
+                    'attempt_index': attempt_index,
+                    'role': attempt_role,
+                    'generation_budget': dict(attempt_budget),
+                    'audio_size_bytes': len(attempt_audio),
+                    'audio_sha256': (
+                        hashlib.sha256(attempt_audio).hexdigest()
+                        if attempt_audio
+                        else None
+                    ),
+                    'content_type': attempt_content_type,
+                    'integrity_evidence': attempt_integrity,
+                    'selected': False,
+                }.items()
+                if value not in (None, '', [], {})
+            }
+            return (
+                attempt_audio,
+                attempt_content_type,
+                attempt_integrity,
+                attempt_record,
+            )
+
+        for raw_chunk in chunk_plan.get('chunks') or []:
+            chunk_text = str(raw_chunk.get('text') or '')
+            chunk_source_sha256 = str(raw_chunk.get('text_sha256') or '').strip()
+            chunk_budget = _qwen3_tts_budget_with_scope(
+                chunk_text,
+                tts_model_type=tts_model_type,
+                generation_scope=_qwen3_tts_generation_scope(
+                    chunk_text,
+                    tts_model_type=tts_model_type,
+                ),
+            )
+            (
+                raw_audio,
+                chunk_content_type,
+                chunk_integrity,
+                initial_attempt,
+            ) = synthesize_chunk_attempt(
+                chunk_text,
+                source_sha256=chunk_source_sha256,
+                attempt_index=1,
+                attempt_role='initial',
+                attempt_budget=chunk_budget,
+            )
+            backend_call_count += 1
+            attempts = [initial_attempt]
+            terminal_budget = chunk_budget
+            generation_limit_recovery: Optional[dict[str, Any]] = None
+            chunk_passed = bool(
+                str(chunk_integrity.get('status') or '').strip().lower()
+                == 'passed'
+                and chunk_integrity.get('materialization_eligible') is True
+            )
+            if (
+                not chunk_passed
+                and tts_audio_has_qwen_generation_limit_exhaustion(
+                    chunk_integrity,
+                    generation_budget=chunk_budget,
+                )
+            ):
+                generation_limit_recovery = (
+                    _build_qwen3_tts_generation_limit_recovery(
+                        chunk_budget,
+                        integrity_evidence=chunk_integrity,
+                    )
+                )
+                if generation_limit_recovery.get('applied') is True:
+                    retry_budget = generation_limit_recovery.get(
+                        'generation_budget'
+                    )
+                    if isinstance(retry_budget, Mapping):
+                        (
+                            raw_audio,
+                            chunk_content_type,
+                            chunk_integrity,
+                            retry_attempt,
+                        ) = synthesize_chunk_attempt(
+                            chunk_text,
+                            source_sha256=chunk_source_sha256,
+                            attempt_index=2,
+                            attempt_role='generation_limit_recovery',
+                            attempt_budget=retry_budget,
+                        )
+                        backend_call_count += 1
+                        recovery_attempt_count += 1
+                        terminal_budget = dict(retry_budget)
+                        attempts.append(retry_attempt)
+                        chunk_passed = bool(
+                            str(
+                                chunk_integrity.get('status') or ''
+                            ).strip().lower()
+                            == 'passed'
+                            and chunk_integrity.get(
+                                'materialization_eligible'
+                            )
+                            is True
+                        )
+                        generation_limit_recovery = {
+                            **generation_limit_recovery,
+                            'status': 'passed' if chunk_passed else 'failed',
+                            'retry_count': 1,
+                            'selected_attempt_index': 2,
+                            'terminal_reason_code': str(
+                                chunk_integrity.get('reason_code')
+                                or 'TTS_AUDIO_CHUNK_INTEGRITY_FAILED'
+                            ).strip(),
+                        }
+            attempts[-1]['selected'] = True
+            chunk_record = {
+                key: value
+                for key, value in {
+                    'index': raw_chunk.get('index'),
+                    'source_span_start': raw_chunk.get('source_span_start'),
+                    'source_span_end': raw_chunk.get('source_span_end'),
+                    'text_sha256': chunk_source_sha256,
+                    'estimated_speech_seconds': raw_chunk.get(
+                        'estimated_speech_seconds'
+                    ),
+                    'status': (
+                        'recovered'
+                        if chunk_passed and len(attempts) > 1
+                        else 'passed'
+                        if chunk_passed
+                        else 'failed'
+                    ),
+                    'generation_budget': terminal_budget,
+                    'audio_size_bytes': len(raw_audio),
+                    'audio_sha256': (
+                        hashlib.sha256(raw_audio).hexdigest()
+                        if raw_audio
+                        else None
+                    ),
+                    'content_type': chunk_content_type,
+                    'integrity_evidence': chunk_integrity,
+                    'attempt_count': len(attempts),
+                    'recovery_attempt_count': max(0, len(attempts) - 1),
+                    'attempts': attempts,
+                    'generation_limit_recovery': generation_limit_recovery,
+                }.items()
+                if value not in (None, '', [], {})
+            }
+            chunk_diagnostics.append(chunk_record)
+            if not chunk_passed:
+                chunk_failure_reason = str(
+                    chunk_integrity.get('reason_code')
+                    or 'TTS_AUDIO_CHUNK_INTEGRITY_FAILED'
+                ).strip()
+                chunk_failure_bytes = raw_audio
+                chunk_failure_content_type = chunk_content_type
+                break
+            passed_chunk_count += 1
+            if len(attempts) > 1:
+                recovered_chunk_count += 1
+            chunk_audio_bytes.append(raw_audio)
+
+        join_evidence: dict[str, Any] = {}
+        joined_audio = b''
+        if not chunk_failure_reason:
+            try:
+                joined_audio, join_evidence = join_pcm_wav_bytes(chunk_audio_bytes)
+            except ValueError as exc:
+                chunk_failure_reason = 'TTS_AUDIO_CHUNK_JOIN_FAILED'
+                chunk_failure_bytes = chunk_audio_bytes[0] if chunk_audio_bytes else b''
+                chunk_failure_content_type = 'audio/wav'
+                join_evidence = {
+                    'kind': 'ollmo.pcm_wav_join',
+                    'version': 1,
+                    'status': 'failed',
+                    'reason_code': chunk_failure_reason,
+                    'error_type': type(exc).__name__,
+                }
+        chunking_evidence = {
+            key: value
+            for key, value in {
+                **{
+                    key: value
+                    for key, value in chunk_plan.items()
+                    if key != 'chunks'
+                },
+                'status': 'failed' if chunk_failure_reason else 'passed',
+                'chunks': chunk_diagnostics,
+                'completed_chunk_count': len(chunk_diagnostics),
+                'attempted_chunk_count': len(chunk_diagnostics),
+                'passed_chunk_count': passed_chunk_count,
+                'backend_call_count': backend_call_count,
+                'generation_limit_recovery_attempt_count': (
+                    recovery_attempt_count
+                ),
+                'recovered_chunk_count': recovered_chunk_count,
+                'failed_chunk_index': (
+                    chunk_diagnostics[-1].get('index')
+                    if chunk_failure_reason and chunk_diagnostics
+                    else None
+                ),
+                'failure_reason_code': chunk_failure_reason or None,
+                'join_evidence': join_evidence or None,
+                'joined_audio_size_bytes': len(joined_audio) if joined_audio else None,
+                'joined_audio_sha256': (
+                    hashlib.sha256(joined_audio).hexdigest()
+                    if joined_audio
+                    else None
+                ),
+            }.items()
+            if value not in (None, '', [], {})
+        }
+        if chunk_failure_reason:
+            result = {
+                'audio_bytes': chunk_failure_bytes,
+                'content_type': chunk_failure_content_type,
+                'result': {
+                    'bytes': len(chunk_failure_bytes),
+                    'diagnostic_only': True,
+                    'reason_code': chunk_failure_reason,
+                },
+            }
+        else:
+            result = {
+                'audio_bytes': joined_audio,
+                'content_type': 'audio/wav',
+                'result': {
+                    'bytes': len(joined_audio),
+                    'chunk_count': len(chunk_audio_bytes),
+                    'joined_pcm_wav': True,
+                },
+            }
+    else:
+        speech_kwargs = dict(base_speech_kwargs)
+        if generation_budget:
+            speech_kwargs['max_tokens'] = generation_budget['max_tokens']
+        result = ops['mlx_audio_speech'](
+            ctx.port,
+            ctx.model_name,
+            prompt,
+            **speech_kwargs,
+        )
+        initial_audio_candidate = bytes(result.get('audio_bytes') or b'')
+        if (
+            is_qwen3_tts
+            and tts_model_type
+            in _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_MODEL_TYPES
+            and resolved_response_format in {'wav', 'wave', 'x-wav'}
+            and isinstance(generation_budget, Mapping)
+            and str(
+                generation_budget.get('generation_scope') or ''
+            ).strip().lower()
+            == 'single_sequence'
+            and len(initial_audio_candidate) >= 12
+            and initial_audio_candidate[:4] == b'RIFF'
+            and initial_audio_candidate[8:12] == b'WAVE'
+        ):
+            initial_audio = initial_audio_candidate
+            initial_content_type = str(
+                result.get('content_type') or 'audio/wav'
+            )
+            initial_integrity = _tts_audio_bytes_integrity_evidence(
+                initial_audio,
+                prompt,
+                source_sha256=str(
+                    semantic_source.get('tts_source_text_sha256') or ''
+                ).strip(),
+                generation_budget=generation_budget,
+                tts_model_type=tts_model_type,
+            )
+            if tts_audio_has_qwen_generation_limit_exhaustion(
+                initial_integrity,
+                generation_budget=generation_budget,
+            ):
+                recovery = _build_qwen3_tts_generation_limit_recovery(
+                    generation_budget,
+                    integrity_evidence=initial_integrity,
+                )
+                retry_budget = recovery.get('generation_budget')
+                if (
+                    recovery.get('applied') is True
+                    and isinstance(retry_budget, Mapping)
+                ):
+                    retry_kwargs = dict(base_speech_kwargs)
+                    retry_kwargs['max_tokens'] = int(
+                        retry_budget.get('max_tokens') or 0
+                    )
+                    retry_result = ops['mlx_audio_speech'](
+                        ctx.port,
+                        ctx.model_name,
+                        prompt,
+                        **retry_kwargs,
+                    )
+                    retry_audio = bytes(
+                        retry_result.get('audio_bytes') or b''
+                    )
+                    retry_content_type = str(
+                        retry_result.get('content_type') or 'audio/wav'
+                    )
+                    retry_integrity = _tts_audio_bytes_integrity_evidence(
+                        retry_audio,
+                        prompt,
+                        source_sha256=str(
+                            semantic_source.get(
+                                'tts_source_text_sha256'
+                            )
+                            or ''
+                        ).strip(),
+                        generation_budget=retry_budget,
+                        tts_model_type=tts_model_type,
+                    )
+                    retry_passed = bool(
+                        str(
+                            retry_integrity.get('status') or ''
+                        ).strip().lower()
+                        == 'passed'
+                        and retry_integrity.get(
+                            'materialization_eligible'
+                        )
+                        is True
+                    )
+                    initial_attempt = {
+                        'attempt_index': 1,
+                        'role': 'initial',
+                        'generation_budget': dict(generation_budget),
+                        'audio_size_bytes': len(initial_audio),
+                        'audio_sha256': (
+                            hashlib.sha256(initial_audio).hexdigest()
+                            if initial_audio
+                            else None
+                        ),
+                        'content_type': initial_content_type,
+                        'integrity_evidence': initial_integrity,
+                        'selected': False,
+                    }
+                    retry_attempt = {
+                        'attempt_index': 2,
+                        'role': 'generation_limit_recovery',
+                        'generation_budget': dict(retry_budget),
+                        'audio_size_bytes': len(retry_audio),
+                        'audio_sha256': (
+                            hashlib.sha256(retry_audio).hexdigest()
+                            if retry_audio
+                            else None
+                        ),
+                        'content_type': retry_content_type,
+                        'integrity_evidence': retry_integrity,
+                        'selected': True,
+                    }
+                    single_sequence_recovery_evidence = {
+                        **recovery,
+                        'status': 'passed' if retry_passed else 'failed',
+                        'retry_count': 1,
+                        'attempt_count': 2,
+                        'selected_attempt_index': 2,
+                        'terminal_reason_code': str(
+                            retry_integrity.get('reason_code')
+                            or 'TTS_AUDIO_INTEGRITY_UNAVAILABLE'
+                        ).strip(),
+                        'attempts': [initial_attempt, retry_attempt],
+                    }
+                    generation_budget = dict(retry_budget)
+                    result = dict(retry_result)
+
     saved_audio_path = ops['persist_audio_bytes_locally'](
         result.get('audio_bytes'),
         ctx.model_name,
@@ -2295,6 +3268,41 @@ def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
     if not saved_audio_path:
         return {'error': 'TTS audio could not be saved locally.'}, 500
 
+    integrity_evidence = build_tts_audio_integrity_evidence(
+        saved_audio_path,
+        prompt,
+        source_sha256=semantic_source.get('tts_source_text_sha256'),
+        generation_budget=generation_budget,
+        model_family='qwen3_tts' if is_qwen3_tts else None,
+        tts_model_type=tts_model_type or None,
+    )
+    if chunking_evidence:
+        integrity_evidence = dict(integrity_evidence)
+        integrity_evidence['chunking_evidence'] = chunking_evidence
+    if single_sequence_recovery_evidence:
+        integrity_evidence = dict(integrity_evidence)
+        integrity_evidence['generation_limit_recovery'] = (
+            single_sequence_recovery_evidence
+        )
+    if chunk_failure_reason:
+        integrity_evidence = dict(integrity_evidence)
+        defect_codes = [
+            str(item).strip()
+            for item in (integrity_evidence.get('defect_codes') or [])
+            if str(item).strip()
+        ]
+        if chunk_failure_reason not in defect_codes:
+            defect_codes.append(chunk_failure_reason)
+        integrity_evidence.update(
+            {
+                'status': 'failed',
+                'reason_code': chunk_failure_reason,
+                'materialization_eligible': False,
+                'defect_codes': defect_codes,
+                'diagnostic_scope': 'failed_qwen_chunk',
+            }
+        )
+
     payload = {
         'instance_id': ctx.instance_id,
         'capability': ctx.capability,
@@ -2303,10 +3311,8 @@ def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
         'saved_audio_path': saved_audio_path,
         'audio_mimetype': result.get('content_type'),
         'result': result.get('result'),
-        'tts_audio_integrity_evidence': build_tts_audio_integrity_evidence(
-            saved_audio_path,
-            prompt,
-        ),
+        'tts_semantic_source': semantic_source,
+        'tts_audio_integrity_evidence': integrity_evidence,
     }
     if effective_lang_code:
         payload['lang_code'] = effective_lang_code
@@ -2318,6 +3324,12 @@ def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
         payload['instruct'] = ctx.instruct
     if ctx.response_format:
         payload['response_format'] = ctx.response_format
+    if generation_budget:
+        payload['tts_generation_budget'] = generation_budget
+    if tts_model_type:
+        payload['tts_model_type'] = tts_model_type
+    if sampling_profile:
+        payload['tts_sampling_profile'] = sampling_profile
     return payload, 200
 
 

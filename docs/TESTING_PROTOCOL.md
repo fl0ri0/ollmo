@@ -20,6 +20,10 @@ Do not overthink. Just map the issue.
 3a. Did route preview or route selection start or force-start anything?
    → Start-source boundary / runtime liveness guard
 
+3b. Did an external downstream executor receive one bounded task without
+    re-entering Ollmo, while Ghost planning remained an internal Ollmo role?
+   → External downstream execution boundary
+
 4. Is the output itself good?
    → Provider
 
@@ -32,6 +36,9 @@ Do not overthink. Just map the issue.
 5b. Did a known terminal/closure failure produce no graph-repair proposal?
    → Backend runtime evidence bridge / `ollmo_services.graph_repair`
 
+5c. Did `BLOCKED:` provider output become content or an artifact?
+   → External-provider block projection / runtime truth gate
+
 6. Does it feel right?
    → UX
 
@@ -42,18 +49,24 @@ Do not overthink. Just map the issue.
 - misunderstood → Ghost
 - wrong branch / flow → Ghost, candidate graph, promotion review
 - wrong execution → Resolver, branch-local payload, backend fabric
+- recursive or widened external execution → downstream execution marker and bounded-task contract
 - route-driven start → start-source guard, runtime liveness, model control
 - bad output → Provider
 - broken state → Runtime, response frame, artifact dossier
 - unresolved generated links → artifact registry, terminal rebind, graph closure review
 - graph repair proposal missing despite runtime evidence → backend runtime evidence bridge, `graph_repair_proposals`, `graph_repair_reviews`
 - graph repair patch staged/applied unexpectedly → `OLLMO_GRAPH_REPAIR_AUTONOMY`, `graph_patch_lifecycle`, `staged_graph_patches`, `applied_graph_patches`
+- `BLOCKED:` provider text materialized as output content → external-provider block projection, artifact acceptance, late fill
+- modality cue created work without a current-turn obligation → candidate graph, promotion review, Closure-repair authority
 - bad feel → UX
 
 ## Current Failure Mapping
 
 - possible work executed even though it was only reserved → promotion review
+- a reserved, negated, or inferred modality cue creates executable or Closure-repair work without a promoted current-turn obligation → promotion/repair-authority regression
 - required work missing from the graph → candidate extraction or graph closure repair
+- an external branch-executor call lacks `[OLLMO_DOWNSTREAM_EXECUTION_V1]`, can recursively invoke Ollmo, widens `<ollmo_bounded_task>`, or applies the marker to Ghost planning → downstream execution-boundary regression
+- downstream output beginning with `BLOCKED:` becomes artifact/materialization content, fulfillment, or Late Fill work instead of blocked runtime truth → external-provider block-projection regression
 - later branch used the whole first answer → branch-local handoff
 - image/audio follow-up text is hypothetical → missing evidence branch or artifact dossier
 - TTS produces a non-empty but wrong recording and any non-empty STT transcript still closes the graph → TTS source-fidelity evidence gate regression
@@ -85,6 +98,21 @@ Do not overthink. Just map the issue.
 - Ghost, resolver, router, semantic-role, or injected-policy prompt wording changes → behavior-affecting prompt regression; require targeted route/resolver/Responses tests and live A/B checks when a local runtime is available
 
 ## Current Self-Healing Test Slices
+
+For the external downstream execution boundary, run:
+
+    .venv/bin/python -m pytest tests/test_codex_runtime_bridge.py -q
+
+The expected shape is that only an actual external branch-executor call starts
+with `[OLLMO_DOWNSTREAM_EXECUTION_V1]`, carries one
+`<ollmo_bounded_task>` plus only promoted `<ollmo_promoted_context>`, and forbids
+recursive Ollmo use or follow-up work. Ghost planning itself remains unmarked
+because it is an Ollmo-internal runtime role, does not invoke the companion
+skill, and receives manifest, model, and capability orientation from Ollmo. An
+external target selected after that planning still receives the downstream
+marker. A result beginning with `BLOCKED:` must project blocked lifecycle,
+output, and surface truth, create no artifact, and skip materialization,
+Closure, and Late Fill.
 
 For labelled/count TTS extraction, output-side WAV integrity, and TTS-to-STT semantic evidence, run:
 
@@ -121,6 +149,10 @@ For generic intent-obligation graph adequacy, run:
     .venv/bin/python -m pytest tests/test_request_phase_graph_runtime.py tests/test_response_semantics_runtime.py tests/test_graph_repair_self_healing.py -q
 
 Use this when touching `ollmo_g/intent_obligations.py`, `ollmo_g/request_phase_graph.py`, structural `intent_graph_adequacy`, or graph-repair bridges from adequacy checks. The expected current shape is that `request_phase_graph.intent_obligations` exposes text artifact, media artifact, evidence branch, dependency, and navigation promises; strong producer-before-consumer bindings such as generated local images before HTML consumers become executable dependency edges before work runs; missing executable edges surface as `intent_graph_adequacy_missing_dependency_edge`; and Runtime can validate/apply only a safe additive missing-dependency-edge patch. Advisory/provider/degraded/cache/liveness or accepted-learning-only signals must not create executable obligations or validate patches.
+
+The same slice must prove that reserved, negated, or merely inferred modality
+cues remain non-executable and do not create Closure-repair work unless a
+current-turn obligation was explicitly promoted.
 
 For cleanup/archive retention policy, run:
 
