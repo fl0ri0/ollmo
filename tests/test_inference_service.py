@@ -258,6 +258,100 @@ class InferenceServiceTests(unittest.TestCase):
                 requests = detect_text_artifact_requests(prompt)
                 self.assertEqual([item['extension'] for item in requests], ['json'])
 
+    def test_detect_text_artifact_requests_keeps_named_json_in_file_manifests(self):
+        prompts = (
+            'Build a polished local two-page watch atelier site with index.html, configurator.html, '
+            'styles.css, and pricing.json. The pages should link to each other, share the stylesheet, '
+            'and use the pricing data consistently. Save it as one complete local bundle.',
+            'Could you build a local site with index.html, configurator.html, styles.css, '
+            'and pricing.json?',
+            'Create exactly four web files: index.html, configurator.html, pricing.json, and styles.css.',
+            'Create exactly four web files:\n'
+            '1. index.html\n2. configurator.html\n3. pricing.json\n4. styles.css',
+            'Create exactly four web files:\n'
+            'index.html\nconfigurator.html\npricing.json\nstyles.css',
+            'Create these files:\n- `index.html`\n- `configurator.html`\n- `pricing.json`\n- `styles.css`',
+            'Create exactly four web files:\n\n'
+            '1. index.html\n2. configurator.html\n3. pricing.json\n4. styles.css',
+            'Create exactly four web files:\n'
+            '1. index.html\n   Main page\n2. configurator.html\n   Builder page\n'
+            '3. pricing.json\n   Pricing data\n4. styles.css\n   Shared styles',
+            'Create these artifacts:\n'
+            '1. index.html\n2. configurator.html\n3. one image of a watch\n'
+            '4. pricing.json\n5. styles.css',
+            'Create these files:\n'
+            '1. site/index.html\n2. site/configurator.html\n'
+            '3. data/pricing.json\n4. css/styles.css',
+            'Create these files: site/index.html, site/configurator.html, '
+            'data/pricing.json, css/styles.css.',
+            'Create these files: ./pricing.json, index.html, configurator.html, styles.css.',
+            'Create the following:\n'
+            '1. index.html\n2. configurator.html\n3. pricing.json\n4. styles.css',
+            'Create these files.\n'
+            '1. index.html\n2. configurator.html\n3. pricing.json\n4. styles.css',
+            'Erstelle genau vier Dateien:\n'
+            '1. index.html\n2. configurator.html\n3. pricing.json\n4. styles.css',
+        )
+        expected = sorted(
+            [
+                ('configurator', 'html'),
+                ('index', 'html'),
+                ('pricing', 'json'),
+                ('styles', 'css'),
+            ]
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                requests = detect_text_artifact_requests(prompt)
+                self.assertEqual(
+                    sorted((item['source_name'], item['extension']) for item in requests),
+                    expected,
+                )
+
+    def test_detect_text_artifact_requests_does_not_promote_json_source_mentions(self):
+        prompts = (
+            'Create index.html using data from pricing.json.',
+            'Build a polished site with index.html using data from pricing.json.',
+            'Explain how to build a site with index.html and pricing.json.',
+            'Create exactly two files: index.html and styles.css. Use data from pricing.json.',
+            'Create README.md and mention pricing.json in it.',
+            'Explain this file list:\n1. pricing.json\n2. index.html',
+            'Create a page from these source files:\n1. pricing.json\n2. content.md',
+            'Create a comparison between index.html and pricing.json.',
+            'Create a summary of index.html and pricing.json.',
+            'Create documentation for index.html and pricing.json.',
+            'Create a list of files:\n1. index.html\n2. pricing.json',
+            'The generated files are:\n1. index.html\n2. pricing.json',
+            'Created files:\n1. index.html\n2. pricing.json',
+            'Saved artifacts:\n1. index.html\n2. pricing.json',
+            'Return a JSON object listing these files:\n1. index.html\n2. pricing.json',
+            'Explain this instruction:\n"Create these files:\n1. index.html\n2. pricing.json"',
+            'Explain the following example:\n'
+            '```text\nCreate these files:\n1. index.html\n2. pricing.json\n```',
+            'Create a report: index.html, pricing.json.',
+            'Create a table: index.html, pricing.json.',
+            'Create a summary: index.html, pricing.json.',
+            'Provide a list: index.html, pricing.json.',
+            'Review and return these files: index.html, pricing.json.',
+            'Which of these files should be generated:\n1. index.html\n2. pricing.json',
+            'Tell me whether these files should be generated:\n1. index.html\n2. pricing.json',
+            'Decide which files must be created:\n1. index.html\n2. pricing.json',
+            'Assess whether these files need to be generated:\n1. index.html\n2. pricing.json',
+            'Welche dieser Dateien sollen erstellt werden:\n1. index.html\n2. pricing.json',
+            'Suggested files to generate:\n1. index.html\n2. pricing.json',
+            'Candidate files to create:\n1. index.html\n2. pricing.json',
+            'Optional files to create:\n1. index.html\n2. pricing.json',
+            'Plan the files to create:\n1. index.html\n2. pricing.json',
+            'Provide checksums for these files:\n1. index.html\n2. pricing.json',
+            'Return the status of these files:\n1. index.html\n2. pricing.json',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                requests = detect_text_artifact_requests(prompt)
+                self.assertNotIn('json', [item['extension'] for item in requests])
+
     def test_detect_text_artifact_requests_json_response_format_boundary_matrix(self):
         no_artifact_prompts = (
             'Return a JSON object with artifact references for each result.',
@@ -525,6 +619,33 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.assertEqual(requests, [])
 
+    def test_detect_text_artifact_requests_honors_negated_named_files(self):
+        cases = (
+            (
+                'Do not create index.html; just explain the structure.',
+                [],
+            ),
+            (
+                'Erstelle keine index.html; erkläre nur die Struktur.',
+                [],
+            ),
+            (
+                'Do not create index.html; create styles.css instead.',
+                [('css', 'styles', 'explicit_extension')],
+            ),
+        )
+
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                requests = detect_text_artifact_requests(prompt)
+                self.assertEqual(
+                    [
+                        (item['extension'], item['source_name'], item['source'])
+                        for item in requests
+                    ],
+                    expected,
+                )
+
     def test_detect_text_artifact_request_ignores_plain_chat(self):
         self.assertIsNone(detect_text_artifact_request('Tell me what HTML means in one sentence.'))
         self.assertIsNone(detect_text_artifact_request('What does index.html mean?'))
@@ -567,6 +688,21 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(request['extension'], 'html')
         self.assertEqual(request['source_name'], 'index')
         self.assertEqual(request['target_path'], '/tmp/artifacts/documents/index.html')
+
+    def test_named_selected_source_edit_outranks_generic_explicit_extension(self):
+        request = detect_text_artifact_request(
+            'Update styles.css for the visualizer and keep the rest of the existing design intact.',
+            source_available=True,
+            source_extension='css',
+            source_name='styles',
+            source_path='/tmp/artifacts/documents/styles.css',
+        )
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request['source'], 'selected_source_edit')
+        self.assertEqual(request['extension'], 'css')
+        self.assertEqual(request['source_name'], 'styles')
+        self.assertEqual(request['target_path'], '/tmp/artifacts/documents/styles.css')
 
     def test_detect_text_artifact_request_allows_self_contained_generated_text_save(self):
         prompt = (
@@ -1057,6 +1193,43 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.assertEqual(extract_text_artifact_payloads(content, [request]), [])
 
+    def test_json_text_artifact_payload_keeps_user_data_and_blocks_control_key_parity(self):
+        request = {
+            'extension': 'json',
+            'source': 'explicit_extension',
+            'source_name': 'pricing',
+        }
+        pricing = (
+            '[\n'
+            '  {"material": "Titanium Base", "price_chf": 24000, "image": "../images/titanium.png"}\n'
+            ']'
+        )
+
+        self.assertEqual(
+            extract_text_artifact_payloads(f'```json\n{pricing}\n```', [request]),
+            [{'artifact_request': request, 'content': pricing}],
+        )
+
+        control_payloads = (
+            '{"request_phase_graph": {"phases": []}}',
+            '{"decision_contract": {"route": "chat"}}',
+            '{"user_facing_response": "I will create the file next."}',
+            '[{"request_phase_graph": {"phases": []}}]',
+            '{"Request_Phase_Graph": {"phases": []}}',
+            '{"result": {"request_ir": {"output_obligations": []}}}',
+            '{"response": {"request_phase_graph": {"phases": []}}}',
+            '{"data": [{"decision_contract": {"route": "chat"}}]}',
+        )
+        for content in control_payloads:
+            with self.subTest(content=content):
+                self.assertEqual(extract_text_artifact_payloads(content, [request]), [])
+
+        ordinary_reserved_word_value = '[{"name": "request_phase_graph", "price_chf": 24000}]'
+        self.assertEqual(
+            extract_text_artifact_payloads(ordinary_reserved_word_value, [request]),
+            [{'artifact_request': request, 'content': ordinary_reserved_word_value}],
+        )
+
     def test_extract_text_artifact_payload_blocks_clarification_text(self):
         request = detect_text_artifact_request('Generate me this html file as artifact')
         content = (
@@ -1145,6 +1318,52 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload['saved_text_path'], '/tmp/artifacts/documents/safety-protocol.md')
         self.assertEqual(payload['text_artifact_request']['source'], 'runtime_contract')
+
+    def test_chat_dispatch_does_not_persist_an_incomplete_multi_file_set(self):
+        requests = [
+            {'extension': 'html', 'source_name': 'index', 'source': 'runtime_contract'},
+            {'extension': 'css', 'source_name': 'styles', 'source': 'runtime_contract'},
+            {'extension': 'html', 'source_name': 'configurator', 'source': 'runtime_contract'},
+            {'extension': 'json', 'source_name': 'pricing', 'source': 'runtime_contract'},
+        ]
+        ctx = InferContext(
+            instance_id='chat-1',
+            backend='ollama',
+            capability='chat',
+            model_name='gemma4:26b',
+            port=11437,
+            prompt='Materialize the complete four-file contract.',
+            user_prompt='Materialize the complete four-file contract.',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            text_artifact_requests=requests,
+        )
+        artifacts = InferArtifacts()
+        persisted: list[str] = []
+
+        payload, status = dispatch_infer_request(
+            ctx,
+            artifacts,
+            {
+                'ollama_chat': lambda *_args, **_kwargs: {
+                    'content': (
+                        '```html\n<!doctype html><title>Atelier</title>\n```\n'
+                        '```css\nbody { color: #111; }\n```\n'
+                        '```json\n{"currency": "CHF"}\n```'
+                    ),
+                },
+                'persist_text_artifact_locally': (
+                    lambda content, **_kwargs: persisted.append(content)
+                ),
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(persisted, [])
+        self.assertNotIn('saved_text_path', payload)
+        self.assertNotIn('saved_text_artifacts', payload)
 
     def test_chat_dispatch_persists_selected_html_source_edit_from_file_context(self):
         ctx = InferContext(

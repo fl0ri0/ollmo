@@ -423,6 +423,12 @@ def _review_criteria_for_phase(
         criteria.append('preparation_text_is_bounded_to_downstream_inputs')
     if _phase_dependency_ids(phase):
         criteria.append('consumes_declared_input_refs')
+    if phase.get('text_artifact_revision_required') is True:
+        criteria.append('runtime_text_artifact_revision_write_proven_when_fulfilled')
+        if phase.get('text_artifact_revision_preservation_required') is True:
+            criteria.append(
+                'runtime_text_artifact_revision_preservation_passed_when_required'
+            )
     role = _clean_text(phase.get('role')).lower()
     stage_direction = _clean_text(phase.get('stage_direction')).lower()
     if role == 'post_artifact_text_follow_up' or stage_direction == 'write_text_after_artifact_generation':
@@ -1121,6 +1127,13 @@ def _apply_workload_task_proposals(
             'text_artifact_extension',
             'text_artifact_source_name',
             'text_artifact_source',
+            'text_artifact_target_path',
+            'text_artifact_revision_required',
+            'text_artifact_revision_source',
+            'text_artifact_revision_binding_state',
+            'text_artifact_source_is_input',
+            'text_artifact_revision_preservation_required',
+            'text_artifact_revision_preservation_policy',
             'superseded_by',
             'superseded_by_candidate_id',
             'superseded_by_obligation_id',
@@ -1318,6 +1331,13 @@ def build_workload_graph(
             'text_artifact_extension',
             'text_artifact_source_name',
             'text_artifact_source',
+            'text_artifact_target_path',
+            'text_artifact_revision_required',
+            'text_artifact_revision_source',
+            'text_artifact_revision_binding_state',
+            'text_artifact_source_is_input',
+            'text_artifact_revision_preservation_required',
+            'text_artifact_revision_preservation_policy',
             'superseded_by',
             'superseded_by_candidate_id',
             'superseded_by_obligation_id',
@@ -1457,6 +1477,13 @@ def build_output_obligations(
             'text_artifact_extension',
             'text_artifact_source_name',
             'text_artifact_source',
+            'text_artifact_target_path',
+            'text_artifact_revision_required',
+            'text_artifact_revision_source',
+            'text_artifact_revision_binding_state',
+            'text_artifact_source_is_input',
+            'text_artifact_revision_preservation_required',
+            'text_artifact_revision_preservation_policy',
             'superseded_by',
             'superseded_by_candidate_id',
             'superseded_by_obligation_id',
@@ -1490,6 +1517,18 @@ def build_output_obligations(
             limit=48,
             max_chars=160,
         )
+        if not review_criteria and raw_phase.get(
+            'text_artifact_revision_required'
+        ) is True:
+            review_criteria = [
+                'runtime_text_artifact_revision_write_proven_when_fulfilled'
+            ]
+            if raw_phase.get(
+                'text_artifact_revision_preservation_required'
+            ) is True:
+                review_criteria.append(
+                    'runtime_text_artifact_revision_preservation_passed_when_required'
+                )
         if review_criteria:
             obligation['review_criteria'] = review_criteria
         obligations.append(obligation)

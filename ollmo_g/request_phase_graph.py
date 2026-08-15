@@ -38,6 +38,7 @@ from ollmo_g.intent_obligations import (
 )
 from ollmo_g.request_ir import build_request_ir
 from ollmo_g.request_meta import extract_request_meta
+from ollmo_g.text_artifact_revision_intent import classify_named_text_revision_intent
 from ollmo_services.responses import extract_responses_current_turn_prompt
 from ollmo_services.tts_source import resolve_explicit_tts_source
 
@@ -241,6 +242,74 @@ _DIRECT_MEDIA_DEICTIC_PAYLOAD_RE = re.compile(
     r'^\s*(?:(?:the\s+)?(?:previous|prepared|generated|written|described|referenced)\s+)?'
     r'(?:story|text|description|prompt|reply|response|content)\b|'
     r'^\s*the\s+(?:story|text|description|prompt|reply|response|content)\s+(?:above|before)\b',
+    re.IGNORECASE,
+)
+_NUMBERED_MANIFEST_ITEM_LINE_RE = re.compile(
+    r'^\s*(?P<index>\d{1,3})[.)]\s+(?P<body>\S.*)\s*$',
+    re.IGNORECASE,
+)
+_EXPLICIT_IMAGE_MANIFEST_ITEM_RE = re.compile(
+    r'^\s*(?:one|an?|1|ein(?:e|en|es)?)\s+'
+    r'(?:image|picture|photo|illustration|bild|foto)\s*'
+    r'(?:(?:of|showing|depicting|featuring|von|mit|zeigt)\b\s*|[:\-]\s*)?'
+    r'(?P<description>.+?)\s*$',
+    re.IGNORECASE,
+)
+_GROUPED_IMAGE_MANIFEST_ITEM_RE = re.compile(
+    r'^\s*(?:one|an?|1|ein(?:e|en|es)?)\s+(?P<description>.+?)\s*$',
+    re.IGNORECASE,
+)
+_GROUPED_IMAGE_MANIFEST_RE = re.compile(
+    r'^\s*(?:(?P<item_index>\d{1,3})[.)]\s+)?'
+    r'(?:(?:create|generate|make|render|erstelle|erzeuge|generiere|mache)\s+)?'
+    r'(?:(?:exactly|genau)\s+)?'
+    r'(?P<count>\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|'
+    r'eins?|eine|zwei|drei|vier|fuenf|fünf|sechs|sieben|acht|neun|zehn)\s+'
+    r'(?:images?|pictures?|photos?|illustrations?|bilder|fotos)\s*:\s*'
+    r'(?P<body>.+?)\s*$',
+    re.IGNORECASE,
+)
+_EXACT_COUNT_IMAGE_SECTION_HEADER_RE = re.compile(
+    r'^\s*(?:(?:create|generate|make|render|erstelle|erzeuge|generiere|mache)\s+)?'
+    r'(?:exactly|genau)\s+'
+    r'(?P<count>\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|'
+    r'eins?|eine|zwei|drei|vier|fuenf|fünf|sechs|sieben|acht|neun|zehn)\s+'
+    r'(?:(?!(?:and|und|plus|\d+|one|two|three|four|five|six|seven|eight|nine|ten|'
+    r'eins?|eine|zwei|drei|vier|fuenf|fünf|sechs|sieben|acht|neun|zehn)\b)'
+    r'[\w-]+\s+){0,6}(?:images?|pictures?|photos?|illustrations?|bilder|fotos)'
+    r'(?:\s*\([^\n)]{1,120}\))?'
+    r'(?:\s+(?:of|showing|depicting|featuring|for|von|mit|vom|der|des)\s+[^\n:]{1,160})?'
+    r'\s*:\s*$',
+    re.IGNORECASE,
+)
+_IMAGE_MANIFEST_COUNT_WORDS = {
+    'one': 1,
+    'ein': 1,
+    'eins': 1,
+    'eine': 1,
+    'two': 2,
+    'zwei': 2,
+    'three': 3,
+    'drei': 3,
+    'four': 4,
+    'vier': 4,
+    'five': 5,
+    'fuenf': 5,
+    'fünf': 5,
+    'six': 6,
+    'sechs': 6,
+    'seven': 7,
+    'sieben': 7,
+    'eight': 8,
+    'acht': 8,
+    'nine': 9,
+    'neun': 9,
+    'ten': 10,
+    'zehn': 10,
+}
+_INVALID_EXPLICIT_IMAGE_DESCRIPTION_RE = re.compile(
+    r'\{\{|\}\}|\[\[|\]\]|'
+    r'\b(?:tbd|todo|placeholder|image\s+prompt|bild\s*prompt|description\s+here)\b',
     re.IGNORECASE,
 )
 _GERMAN_ORIGINAL_AUDIO_VARIANT_RE = re.compile(
@@ -1229,7 +1298,14 @@ def _text_artifact_source_requests_from_history(
     prompt: str,
     *payloads: Mapping[str, Any],
 ) -> list[dict[str, str]]:
-    if not _TEXT_SOURCE_EDIT_CUE_RE.search(_clean_text(prompt)):
+    named_revision_intent = classify_named_text_revision_intent(prompt)
+    if (
+        not _TEXT_SOURCE_EDIT_CUE_RE.search(_clean_text(prompt))
+        and not (
+            named_revision_intent.get('mutation_requested') is True
+            and bool(named_revision_intent.get('named_targets'))
+        )
+    ):
         return []
     requests: list[dict[str, str]] = []
     seen_keys: set[tuple[str, str]] = set()
@@ -1314,6 +1390,79 @@ def _merge_text_artifact_requests(
 ) -> list[dict[str, str]]:
     if not source_requests:
         return explicit_requests
+
+    def normalized_identity(request: Mapping[str, Any]) -> tuple[str, str]:
+        extension = normalize_text_artifact_extension(
+            _clean_text(request.get('extension'))
+        ) or ''
+        raw_source_name = _clean_text(request.get('source_name'))
+        filename = raw_source_name.replace('\\', '/').rsplit('/', 1)[-1]
+        suffix = f'.{extension}' if extension else ''
+        if suffix and filename.lower().endswith(suffix):
+            filename = filename[: -len(suffix)]
+        return extension, filename.casefold()
+
+    def distinct_source_candidates(
+        requests: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        distinct: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for request in requests:
+            identity = normalized_identity(request)
+            target_path = _clean_text(request.get('target_path'))
+            fingerprint = (
+                identity[0],
+                identity[1],
+                target_path.casefold(),
+                (
+                    ''
+                    if target_path
+                    else _clean_text(request.get('source')).lower()
+                ),
+            )
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            distinct.append(request)
+        return distinct
+
+    def source_binding(
+        requests: list[dict[str, str]],
+    ) -> tuple[Optional[dict[str, str]], bool]:
+        candidates = distinct_source_candidates(requests)
+        target_bound = [
+            request for request in candidates
+            if _clean_text(request.get('target_path'))
+        ]
+        authoritative = target_bound or candidates
+        if len(authoritative) == 1:
+            return authoritative[0], False
+        return None, len(authoritative) > 1
+
+    def bind_revision_source(
+        request: dict[str, str],
+        source_request: dict[str, str],
+    ) -> dict[str, str]:
+        updated = dict(request)
+        source = _clean_text(source_request.get('source')) or 'selected_source_edit'
+        target_path = _clean_text(source_request.get('target_path'))
+        updated['source'] = source
+        if target_path:
+            updated['target_path'] = target_path
+            updated['revision_source'] = 'canonical_predecessor_artifact'
+            updated['revision_binding_state'] = 'bound'
+        else:
+            updated['revision_source'] = 'bounded_predecessor_source'
+            updated['revision_binding_state'] = 'bounded_source'
+        return updated
+
+    def mark_ambiguous_revision_source(request: dict[str, str]) -> dict[str, str]:
+        updated = dict(request)
+        updated.pop('target_path', None)
+        updated['revision_source'] = 'canonical_predecessor_artifact'
+        updated['revision_binding_state'] = 'ambiguous'
+        return updated
+
     merged: list[dict[str, str]] = []
     for request in explicit_requests:
         if (
@@ -1322,18 +1471,62 @@ def _merge_text_artifact_requests(
             and request.get('source_name') == 'generated-text'
         ):
             continue
-        merged.append(request)
-    existing_extensions = {
-        _clean_text(request.get('extension')).lower()
-        for request in merged
-        if _clean_text(request.get('extension'))
-    }
-    for request in source_requests:
-        extension = _clean_text(request.get('extension')).lower()
-        if not extension or extension in existing_extensions:
+        merged.append(dict(request))
+
+    source_groups: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for source_request in source_requests:
+        identity = normalized_identity(source_request)
+        if not all(identity):
             continue
-        existing_extensions.add(extension)
-        merged.append(request)
+        source_groups.setdefault(identity, []).append(source_request)
+    target_bound_source_extensions = {
+        identity[0]
+        for identity, candidates in source_groups.items()
+        if any(_clean_text(candidate.get('target_path')) for candidate in candidates)
+    }
+
+    matched_source_identities: set[tuple[str, str]] = set()
+    explicit_extensions = {
+        normalized_identity(request)[0]
+        for request in merged
+        if normalized_identity(request)[0]
+    }
+    for index, request in enumerate(merged):
+        identity = normalized_identity(request)
+        candidates = source_groups.get(identity) or []
+        if not candidates:
+            continue
+        matched_source_identities.add(identity)
+        selected_source, ambiguous = source_binding(candidates)
+        if selected_source is not None:
+            merged[index] = bind_revision_source(request, selected_source)
+        elif ambiguous:
+            merged[index] = mark_ambiguous_revision_source(request)
+
+    for identity, candidates in source_groups.items():
+        if identity in matched_source_identities:
+            continue
+        extension, _ = identity
+        if extension in explicit_extensions:
+            # Explicit current-turn filenames define the output set. A differently
+            # named predecessor with the same extension is input evidence for a
+            # different file, not authority to create another output branch.
+            continue
+        if (
+            extension in target_bound_source_extensions
+            and not any(_clean_text(candidate.get('target_path')) for candidate in candidates)
+        ):
+            # A fenced phase output commonly repeats the newly written file
+            # without a filename. When a concrete selected source of the same
+            # extension already owns this edit, that anonymous payload is its
+            # candidate body, not a second `updated-html` obligation.
+            continue
+        selected_source, ambiguous = source_binding(candidates)
+        if selected_source is not None:
+            merged.append(bind_revision_source(selected_source, selected_source))
+        elif ambiguous:
+            representative = dict(candidates[0])
+            merged.append(mark_ambiguous_revision_source(representative))
     return merged
 
 
@@ -1408,6 +1601,306 @@ def _apply_current_predecessor_image_prompt_contract(
             cues.append('current_predecessor_prompt_page_binding')
         updated['local_visual_asset_cues'] = cues
     return updated, prompts
+
+
+def _split_grouped_image_manifest_items(value: str) -> list[str]:
+    text = _clean_text(value)
+    if not text:
+        return []
+    item_start = r'(?:one|an?|1|ein(?:e|en|es)?)\b'
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character in '([{':
+            depth += 1
+        elif character in ')]}' and depth:
+            depth -= 1
+        if depth == 0:
+            delimiter = None
+            if character in ',;':
+                delimiter = re.match(
+                    rf'[,;]\s*(?:and\s+|und\s+)?(?={item_start})',
+                    text[index:],
+                    re.IGNORECASE,
+                )
+            elif character.isspace():
+                delimiter = re.match(
+                    rf'\s+(?:and|und)\s+(?={item_start})',
+                    text[index:],
+                    re.IGNORECASE,
+                )
+            if delimiter:
+                parts.append(text[start:index].strip())
+                start = index + delimiter.end()
+                index = start
+                continue
+        index += 1
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
+def _explicit_image_manifest_count(value: Any) -> int:
+    token = _clean_text(value).lower()
+    if token.isdigit():
+        return _coerce_positive_int(token)
+    return _IMAGE_MANIFEST_COUNT_WORDS.get(token, 0)
+
+
+def _valid_explicit_image_description(value: Any) -> str:
+    description = _clean_text(value).strip(' \t:;-')
+    if (
+        not description
+        or _INVALID_EXPLICIT_IMAGE_DESCRIPTION_RE.search(description)
+        or len(re.findall(r'[^\W\d_]+', description, re.UNICODE)) < 2
+    ):
+        return ''
+    return description
+
+
+def _current_turn_explicit_image_manifest(
+    prompt_text: str,
+    *,
+    prompt_analysis: Mapping[str, Any],
+) -> dict[str, Any]:
+    lines = str(prompt_text or '').splitlines()
+    requested_count = _coerce_positive_int(
+        prompt_analysis.get('requested_visual_output_count')
+    )
+    section_headers = [
+        (line_index, match)
+        for line_index, line in enumerate(lines)
+        if (match := _EXACT_COUNT_IMAGE_SECTION_HEADER_RE.match(line))
+    ]
+    if section_headers:
+        if len(section_headers) != 1:
+            return {
+                'status': 'ambiguous',
+                'reason': 'multiple_exact_count_image_sections',
+            }
+        header_index, header_match = section_headers[0]
+        declared_count = _explicit_image_manifest_count(
+            header_match.group('count')
+        )
+        item_numbers: list[int] = []
+        prompts: list[str] = []
+        for line in lines[header_index + 1:]:
+            if not line.strip():
+                if prompts:
+                    break
+                continue
+            numbered_match = _NUMBERED_MANIFEST_ITEM_LINE_RE.match(line)
+            if not numbered_match:
+                break
+            item_numbers.append(int(numbered_match.group('index')))
+            prompts.append(
+                _valid_explicit_image_description(numbered_match.group('body'))
+            )
+        if (
+            declared_count <= 0
+            or len(prompts) != declared_count
+            or any(not prompt for prompt in prompts)
+            or item_numbers != list(range(1, declared_count + 1))
+            or (requested_count and requested_count != declared_count)
+        ):
+            return {
+                'status': 'ambiguous',
+                'reason': 'exact_count_image_section_count_or_sequence_mismatch',
+                'declared_count': declared_count,
+                'parsed_count': len([prompt for prompt in prompts if prompt]),
+                'item_numbers': item_numbers,
+            }
+        return {
+            'status': 'valid',
+            'source_kind': 'numbered_exact_count_image_section',
+            'declared_count': declared_count,
+            'item_numbers': item_numbers,
+            'prompts': prompts,
+        }
+
+    grouped_candidates: list[dict[str, Any]] = []
+    numbered_candidates: list[dict[str, Any]] = []
+    for line in lines:
+        grouped_match = _GROUPED_IMAGE_MANIFEST_RE.match(line)
+        if grouped_match:
+            grouped_items = _split_grouped_image_manifest_items(
+                grouped_match.group('body') or ''
+            )
+            prompts = []
+            for item in grouped_items:
+                explicit_match = _EXPLICIT_IMAGE_MANIFEST_ITEM_RE.match(item)
+                grouped_item_match = _GROUPED_IMAGE_MANIFEST_ITEM_RE.match(item)
+                candidate = ''
+                if explicit_match:
+                    candidate = explicit_match.group('description')
+                elif grouped_item_match:
+                    candidate = grouped_item_match.group('description')
+                prompts.append(_valid_explicit_image_description(candidate))
+            grouped_candidates.append(
+                {
+                    'declared_count': _explicit_image_manifest_count(
+                        grouped_match.group('count')
+                    ),
+                    'item_number': _coerce_positive_int(grouped_match.group('item_index')),
+                    'prompts': prompts,
+                }
+            )
+            continue
+        numbered_match = _NUMBERED_MANIFEST_ITEM_LINE_RE.match(line)
+        if not numbered_match:
+            continue
+        image_match = _EXPLICIT_IMAGE_MANIFEST_ITEM_RE.match(
+            numbered_match.group('body') or ''
+        )
+        if image_match:
+            numbered_candidates.append(
+                {
+                    'item_number': int(numbered_match.group('index')),
+                    'prompt': _valid_explicit_image_description(
+                        image_match.group('description')
+                    ),
+                }
+            )
+
+    if grouped_candidates and numbered_candidates:
+        return {
+            'status': 'ambiguous',
+            'reason': 'multiple_explicit_image_manifest_shapes',
+        }
+    if grouped_candidates:
+        if len(grouped_candidates) != 1:
+            return {
+                'status': 'ambiguous',
+                'reason': 'multiple_grouped_image_manifests',
+            }
+        candidate = grouped_candidates[0]
+        prompts = candidate['prompts']
+        declared_count = candidate['declared_count']
+        if (
+            len(prompts) != declared_count
+            or any(not prompt for prompt in prompts)
+            or (requested_count and requested_count != declared_count)
+        ):
+            return {
+                'status': 'ambiguous',
+                'reason': 'grouped_image_manifest_count_or_payload_mismatch',
+                'declared_count': declared_count,
+                'parsed_count': len([prompt for prompt in prompts if prompt]),
+            }
+        return {
+            'status': 'valid',
+            'source_kind': 'grouped_exact_count_row',
+            'declared_count': declared_count,
+            'item_numbers': [candidate['item_number']] if candidate['item_number'] else [],
+            'prompts': prompts,
+        }
+    if numbered_candidates:
+        item_numbers = [item['item_number'] for item in numbered_candidates]
+        prompts = [item['prompt'] for item in numbered_candidates]
+        if (
+            any(not prompt for prompt in prompts)
+            or item_numbers != list(range(item_numbers[0], item_numbers[0] + len(item_numbers)))
+            or (requested_count and requested_count != len(prompts))
+        ):
+            return {
+                'status': 'ambiguous',
+                'reason': 'numbered_image_manifest_count_or_sequence_mismatch',
+                'declared_count': requested_count,
+                'parsed_count': len([prompt for prompt in prompts if prompt]),
+                'item_numbers': item_numbers,
+            }
+        return {
+            'status': 'valid',
+            'source_kind': 'numbered_image_rows',
+            'declared_count': len(prompts),
+            'item_numbers': item_numbers,
+            'prompts': prompts,
+        }
+    return {'status': 'not_present'}
+
+
+def _apply_current_turn_explicit_image_manifest_contract(
+    prompt_analysis: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated = dict(prompt_analysis or {})
+    if _clean_text(manifest.get('status')).lower() != 'valid':
+        return updated
+    declared_count = _coerce_positive_int(manifest.get('declared_count'))
+    if declared_count <= 0:
+        return updated
+    updated['requests_visual_output'] = True
+    updated['has_visual_follow_up_request'] = True
+    updated['separate_visual_generation_request'] = True
+    updated['counted_visual_output_obligation'] = True
+    updated['requested_visual_output_count'] = declared_count
+    return updated
+
+
+def _bind_current_turn_explicit_image_manifest(
+    branches: list[dict[str, Any]],
+    manifest: Mapping[str, Any],
+    graph_refinements: list[dict[str, Any]],
+) -> None:
+    status = _clean_text(manifest.get('status')).lower()
+    if status == 'not_present':
+        return
+    image_branches = sorted(
+        (
+            branch
+            for branch in branches
+            if normalize_capability(branch.get('capability'))
+            == CAPABILITY_IMAGE_GENERATION
+            and not _is_unpromoted_candidate_record(branch)
+        ),
+        key=lambda item: (
+            _coerce_positive_int(item.get('queue_index')),
+            _clean_text(item.get('phase_id')),
+        ),
+    )
+    prompts = _clean_string_list(manifest.get('prompts'))
+    declared_count = _coerce_positive_int(manifest.get('declared_count'))
+    if status != 'valid' or len(image_branches) != declared_count or len(prompts) != declared_count:
+        for branch in image_branches:
+            branch.pop('artifact_prompt', None)
+            branch.pop('artifact_prompt_source', None)
+            branch.pop('batch_prompts', None)
+            branch['branch_contract_error'] = 'ambiguous_current_turn_image_manifest'
+            branch['blocked_by_branch_contract'] = True
+            branch['repair_action'] = 'repair_branch_contract'
+            branch['resolution'] = 'blocked_branch_contract'
+        graph_refinements.append(
+            {
+                'source': 'current_turn_explicit_image_manifest',
+                'refinement': 'branch_local_image_prompt_binding',
+                'status': 'blocked',
+                'reason': _clean_text(manifest.get('reason'))
+                or 'image_manifest_branch_count_mismatch',
+                'declared_count': declared_count,
+                'parsed_prompt_count': len(prompts),
+                'executable_branch_count': len(image_branches),
+            }
+        )
+        return
+    for branch, prompt in zip(image_branches, prompts):
+        branch['artifact_prompt'] = prompt
+        branch['artifact_prompt_source'] = 'current_turn_explicit_image_manifest'
+        branch['batch_prompts'] = list(prompts)
+    graph_refinements.append(
+        {
+            'source': 'current_turn_explicit_image_manifest',
+            'refinement': 'branch_local_image_prompt_binding',
+            'status': 'bound',
+            'manifest_source_kind': _clean_text(manifest.get('source_kind')),
+            'item_numbers': list(manifest.get('item_numbers') or []),
+            'bound_prompt_count': len(prompts),
+            'bound_branch_ids': [
+                _clean_text(branch.get('branch_id')) for branch in image_branches
+            ],
+        }
+    )
 
 
 def _bind_current_predecessor_image_prompts(
@@ -1795,6 +2288,10 @@ def _project_workload_task_fields(
         'text_artifact_source_name',
         'text_artifact_source',
         'text_artifact_target_path',
+        'text_artifact_revision_required',
+        'text_artifact_revision_source',
+        'text_artifact_revision_binding_state',
+        'text_artifact_source_is_input',
         'artifact_request',
         'repair_action',
         'recovery_action',
@@ -2621,6 +3118,48 @@ def _next_phase_number(branches: list[Mapping[str, Any]]) -> int:
     return highest + 1
 
 
+def _text_artifact_revision_contract(
+    request: Mapping[str, Any],
+    *,
+    prompt_analysis: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    binding_state = _clean_text(request.get('revision_binding_state')).lower()
+    revision_source = _clean_text(request.get('revision_source'))
+    if not binding_state or not revision_source:
+        return {}
+    contract: dict[str, Any] = {
+        'text_artifact_revision_required': True,
+        'text_artifact_revision_source': revision_source,
+        'text_artifact_revision_binding_state': binding_state,
+        'text_artifact_source_is_input': binding_state != 'ambiguous',
+    }
+    analysis = prompt_analysis if isinstance(prompt_analysis, Mapping) else {}
+    named_revision_intent = (
+        analysis.get('named_text_revision_intent')
+        if isinstance(analysis.get('named_text_revision_intent'), Mapping)
+        else {}
+    )
+    if (
+        binding_state != 'ambiguous'
+        and named_revision_intent.get('preservation_requested') is True
+        and named_revision_intent.get('full_replacement_requested') is not True
+    ):
+        contract['text_artifact_revision_preservation_required'] = True
+        contract['text_artifact_revision_preservation_policy'] = (
+            'structural_anchor_retention_v1'
+        )
+    if binding_state == 'ambiguous':
+        contract.update(
+            {
+                'branch_contract_error': 'ambiguous_text_artifact_revision_source',
+                'blocked_by_branch_contract': True,
+                'repair_action': 'clarify_text_artifact_revision_source',
+                'resolution': 'blocked_branch_contract',
+            }
+        )
+    return contract
+
+
 def _text_artifact_request_branches(
     text_artifact_requests: list[dict[str, str]],
     *,
@@ -2631,6 +3170,7 @@ def _text_artifact_request_branches(
     if not text_artifact_requests:
         return branches
     remaining_requests = list(text_artifact_requests)
+    analysis = prompt_analysis if isinstance(prompt_analysis, Mapping) else {}
     json_request_indexes = [
         index
         for index, request in enumerate(text_artifact_requests)
@@ -2671,11 +3211,20 @@ def _text_artifact_request_branches(
             source_name = _clean_text(request.get('source_name')) or 'generated-json'
             source = _clean_text(request.get('source')) or 'explicit_text_artifact_request'
             target_path = _clean_text(request.get('target_path'))
+            revision_contract = _text_artifact_revision_contract(
+                request,
+                prompt_analysis=analysis,
+            )
             artifact_request = {
                 'extension': extension,
                 'source_name': source_name,
                 'source': source,
                 **({'target_path': target_path} if target_path else {}),
+                **{
+                    key: value
+                    for key, value in revision_contract.items()
+                    if key.startswith('text_artifact_')
+                },
             }
             artifact_target.update(
                 {
@@ -2688,6 +3237,7 @@ def _text_artifact_request_branches(
                     'artifact_request': artifact_request,
                     'stage_direction': 'materialize_requested_json_after_artifact_evidence',
                     'phase_summary': f'materialize {extension} artifact {source_name}',
+                    **revision_contract,
                 }
             )
             if target_path:
@@ -2698,7 +3248,6 @@ def _text_artifact_request_branches(
                 if index != json_request_index
             ]
     next_phase_number = _next_phase_number(existing_branches)
-    analysis = prompt_analysis if isinstance(prompt_analysis, Mapping) else {}
     local_visual_asset_binding_required = bool(analysis.get('local_visual_asset_requirement'))
     linked_image_phase_ids = [
         _clean_text(branch.get('phase_id'))
@@ -2712,9 +3261,13 @@ def _text_artifact_request_branches(
         source_name = _clean_text(request.get('source_name')) or f'generated-{extension}'
         source = _clean_text(request.get('source')) or 'explicit_text_artifact_request'
         target_path = _clean_text(request.get('target_path'))
+        revision_contract = _text_artifact_revision_contract(
+            request,
+            prompt_analysis=analysis,
+        )
         phase_id = f'phase-{next_phase_number + index - 1}'
         depends_on = ['phase-1']
-        image_link_text_artifact = extension in {'html', 'htm', 'css'}
+        image_link_text_artifact = extension in {'html', 'htm', 'css', 'json'}
         if local_visual_asset_binding_required and image_link_text_artifact and linked_image_phase_ids:
             depends_on = list(linked_image_phase_ids)
         branch_record = {
@@ -2738,10 +3291,16 @@ def _text_artifact_request_branches(
                 'source_name': source_name,
                 'source': source,
                 **({'target_path': target_path} if target_path else {}),
+                **{
+                    key: value
+                    for key, value in revision_contract.items()
+                    if key.startswith('text_artifact_')
+                },
             },
             'content_payload_source': 'current_phase_output',
             'stage_direction': 'materialize_requested_text_artifact',
             'phase_summary': f'materialize {extension} artifact {source_name}',
+            **revision_contract,
         }
         if target_path:
             branch_record['text_artifact_target_path'] = target_path
@@ -3703,6 +4262,10 @@ def _normalize_explicit_downstream_branch(
             'text_artifact_source_name',
             'text_artifact_source',
             'text_artifact_target_path',
+            'text_artifact_revision_required',
+            'text_artifact_revision_source',
+            'text_artifact_revision_binding_state',
+            'text_artifact_source_is_input',
             'artifact_request',
             'repair_action',
             'recovery_action',
@@ -4571,13 +5134,23 @@ def build_request_phase_graph(
         prompt_analysis,
         text_artifact_requests,
     )
-    prompt_analysis, current_predecessor_image_prompts = (
-        _apply_current_predecessor_image_prompt_contract(
-            prompt_analysis,
-            request,
-            text_artifact_requests,
-        )
+    current_turn_image_manifest = _current_turn_explicit_image_manifest(
+        normalized_prompt,
+        prompt_analysis=prompt_analysis,
     )
+    prompt_analysis = _apply_current_turn_explicit_image_manifest_contract(
+        prompt_analysis,
+        current_turn_image_manifest,
+    )
+    current_predecessor_image_prompts: list[str] = []
+    if _clean_text(current_turn_image_manifest.get('status')).lower() != 'valid':
+        prompt_analysis, current_predecessor_image_prompts = (
+            _apply_current_predecessor_image_prompt_contract(
+                prompt_analysis,
+                request,
+                text_artifact_requests,
+            )
+        )
     refinement_capabilities = {
         normalize_capability(item.get('capability'))
         for item in graph_refinements
@@ -4620,6 +5193,11 @@ def build_request_phase_graph(
     _bind_current_predecessor_image_prompts(
         downstream_branches,
         current_predecessor_image_prompts,
+        graph_refinements,
+    )
+    _bind_current_turn_explicit_image_manifest(
+        downstream_branches,
+        current_turn_image_manifest,
         graph_refinements,
     )
     _bind_direct_clause_local_media_payloads(
@@ -4879,6 +5457,10 @@ def build_request_phase_graph(
             'text_artifact_source_name',
             'text_artifact_source',
             'text_artifact_target_path',
+            'text_artifact_revision_required',
+            'text_artifact_revision_source',
+            'text_artifact_revision_binding_state',
+            'text_artifact_source_is_input',
             'artifact_request',
             'kind',
             'role',
@@ -4983,6 +5565,10 @@ def build_request_phase_graph(
             'text_artifact_source_name',
             'text_artifact_source',
             'text_artifact_target_path',
+            'text_artifact_revision_required',
+            'text_artifact_revision_source',
+            'text_artifact_revision_binding_state',
+            'text_artifact_source_is_input',
             'artifact_request',
             'kind',
             'role',
@@ -5381,6 +5967,10 @@ def next_executable_downstream_branches(
                             'text_artifact_source_name',
                             'text_artifact_source',
                             'text_artifact_target_path',
+                            'text_artifact_revision_required',
+                            'text_artifact_revision_source',
+                            'text_artifact_revision_binding_state',
+                            'text_artifact_source_is_input',
                             'artifact_request',
                             'repair_action',
                             'recovery_action',

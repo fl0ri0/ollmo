@@ -46,6 +46,44 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
             return obligations
         return [item for item in obligations if item.get('kind') == kind]
 
+    def test_discussion_and_negated_artifacts_do_not_promote_execution(self):
+        discussion_prompts = (
+            'Explain image generation and HTML artifacts.',
+            'Explain how to create an image.',
+            'Why would someone create an image?',
+            'Do not create index.html; just explain the structure.',
+        )
+
+        for prompt in discussion_prompts:
+            with self.subTest(prompt=prompt):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'prompt': prompt},
+                    route_payload={'capability': 'chat'},
+                )
+                self.assertEqual(graph['mode'], 'single_phase')
+                self.assertEqual(graph.get('downstream_branches'), [])
+                self.assertFalse(graph['prompt_intent']['requests_visual_output'])
+                self.assertFalse(
+                    graph['prompt_intent']['requests_text_artifact_output']
+                )
+
+        executable_prompt = (
+            'Explain image generation, then create one image of a lighthouse.'
+        )
+        executable_graph = build_request_phase_graph(
+            executable_prompt,
+            request_payload={'prompt': executable_prompt},
+            route_payload={'capability': 'chat'},
+        )
+        self.assertEqual(
+            [
+                branch.get('capability')
+                for branch in executable_graph.get('downstream_branches') or []
+            ],
+            ['image_generation'],
+        )
+
     def test_generated_image_analysis_followup_builds_evidence_and_final_text(self):
         prompt = (
             'Erstelle ein realistisches Bild eines gelben Notizbuchs mit der Aufschrift "Plan A". '
@@ -809,6 +847,404 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(len(self._text_artifact_obligations(graph)), 2)
 
+    def test_natural_site_component_list_promotes_all_named_files_without_images(self):
+        prompt = (
+            'Build a polished local two-page watch atelier site with index.html, configurator.html, '
+            'styles.css, and pricing.json. The pages should link to each other, share the stylesheet, '
+            'and use the pricing data consistently. Save it as one complete local bundle.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertEqual(
+            sorted(
+                (item.get('target_name'), item.get('target_extension'))
+                for item in self._intent_obligations(graph, 'text_artifact')
+            ),
+            sorted(
+                [
+                    ('index', 'html'),
+                    ('configurator', 'html'),
+                    ('styles', 'css'),
+                    ('pricing', 'json'),
+                ]
+            ),
+        )
+        self.assertEqual(self._executable_image_branches(graph), [])
+
+    def test_named_json_file_manifest_builds_required_asset_bound_branch(self):
+        prompt = (
+            'Create a premium local app bundle. Generate exactly four web files and three local images:\n'
+            '1. index.html\n'
+            '2. configurator.html\n'
+            '3. pricing.json\n'
+            '4. styles.css\n'
+            '5. 3 Images: a watch movement, an atelier exterior, and three material samples.\n\n'
+            'The pricing.json file must contain a data array with the exact local image artifact paths. '
+            'Both HTML files must link the generated images and shared styles.css locally.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        image_branches = self._executable_image_branches(graph)
+        text_branches = [
+            branch for branch in (graph.get('downstream_branches') or [])
+            if branch.get('text_artifact_extension')
+        ]
+        text_obligations = self._intent_obligations(graph, 'text_artifact')
+        json_branch = next(
+            branch for branch in text_branches
+            if branch.get('text_artifact_source_name') == 'pricing'
+        )
+        json_dependencies = [
+            obligation for obligation in self._intent_obligations(graph, 'dependency')
+            if obligation.get('target_name') == 'pricing'
+            and obligation.get('target_extension') == 'json'
+            and obligation.get('dependency_contract') == 'local_visual_asset_binding'
+        ]
+        image_phase_ids = [branch['phase_id'] for branch in image_branches]
+
+        self.assertEqual(graph['prompt_intent']['text_artifact_output_count'], 4)
+        self.assertEqual(
+            sorted(
+                (item.get('target_name'), item.get('target_extension'))
+                for item in text_obligations
+            ),
+            sorted(
+                [
+                    ('index', 'html'),
+                    ('configurator', 'html'),
+                    ('pricing', 'json'),
+                    ('styles', 'css'),
+                ]
+            ),
+        )
+        self.assertEqual(len(image_branches), 3)
+        self.assertEqual(json_branch.get('depends_on'), image_phase_ids)
+        self.assertEqual(json_branch.get('dependency_contract'), 'local_visual_asset_binding')
+        self.assertEqual(len(json_dependencies), 1)
+        self.assertEqual(json_dependencies[0].get('source_phase_ids'), image_phase_ids)
+
+        json_only_prompt = 'Create exactly one local file:\n1. pricing.json'
+        json_only_graph = build_request_phase_graph(
+            json_only_prompt,
+            request_payload={'ghost_route': True, 'prompt': json_only_prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+        self.assertEqual(self._executable_image_branches(json_only_graph), [])
+
+        data_bundle_prompt = (
+            'Create exactly three local artifacts:\n'
+            '1. styles.css\n'
+            '2. pricing.json\n'
+            '3. one local image of a watch.\n'
+            'Generate the image locally. styles.css and pricing.json must contain '
+            'the exact local image artifact path.'
+        )
+        data_bundle_graph = build_request_phase_graph(
+            data_bundle_prompt,
+            request_payload={'ghost_route': True, 'prompt': data_bundle_prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+        data_bundle_dependencies = [
+            obligation for obligation in self._intent_obligations(data_bundle_graph, 'dependency')
+            if obligation.get('dependency_contract') == 'local_visual_asset_binding'
+        ]
+        self.assertEqual(
+            {
+                (obligation.get('target_name'), obligation.get('target_extension'))
+                for obligation in data_bundle_dependencies
+            },
+            {('styles', 'css'), ('pricing', 'json')},
+        )
+
+    def test_exact_current_turn_image_manifests_bind_branch_local_prompts_in_order(self):
+        cases = (
+            (
+                'numbered_image_rows',
+                (
+                    'Create exactly four web files and three local images:\n'
+                    '1. index.html\n'
+                    '2. configurator.html\n'
+                    '3. pricing.json\n'
+                    '4. styles.css\n'
+                    '5. One image of a hyper-detailed tourbillon movement under watchmaker-bench lighting.\n'
+                    '6. One image of a glass-and-stone atelier above misty Lake Neuchâtel.\n'
+                    '7. One image of brushed titanium, forged carbon, and rose gold blocks in deep-focus macro.'
+                ),
+                [
+                    'a hyper-detailed tourbillon movement under watchmaker-bench lighting.',
+                    'a glass-and-stone atelier above misty Lake Neuchâtel.',
+                    'brushed titanium, forged carbon, and rose gold blocks in deep-focus macro.',
+                ],
+                [5, 6, 7],
+            ),
+            (
+                'grouped_exact_count_row',
+                (
+                    'Create exactly four web files and three local images:\n'
+                    '1. index.html\n'
+                    '2. configurator.html\n'
+                    '3. pricing.json\n'
+                    '4. styles.css\n'
+                    '5. 3 Images: One hyper-detailed macro shot of a complex tourbillon watch movement '
+                    'illuminated by subtle watchmaker-bench lighting (hero), one wide cinematic exterior '
+                    'of the glass-and-stone atelier overlooking the mist of Lake Neuchâtel, and one deep '
+                    'focus macro shot of raw materials (brushed grade 5 titanium, forged carbon, and rose '
+                    'gold blocks side-by-side).'
+                ),
+                [
+                    'hyper-detailed macro shot of a complex tourbillon watch movement illuminated by subtle '
+                    'watchmaker-bench lighting (hero)',
+                    'wide cinematic exterior of the glass-and-stone atelier overlooking the mist of Lake '
+                    'Neuchâtel',
+                    'deep focus macro shot of raw materials (brushed grade 5 titanium, forged carbon, and '
+                    'rose gold blocks side-by-side).',
+                ],
+                [5],
+            ),
+            (
+                'grouped_exact_count_row',
+                (
+                    'Create three images: one titanium watch in crisp side light, one forged-carbon watch '
+                    'against dark slate, and one rose-gold watch with a warm macro highlight.'
+                ),
+                [
+                    'titanium watch in crisp side light',
+                    'forged-carbon watch against dark slate',
+                    'rose-gold watch with a warm macro highlight.',
+                ],
+                [],
+            ),
+            (
+                'grouped_exact_count_row',
+                (
+                    'Erstelle drei Bilder: ein Titanmodell in klarem Seitenlicht, ein Carbonmodell vor '
+                    'dunklem Schiefer und ein Roségoldmodell mit warmem Makrolicht.'
+                ),
+                [
+                    'Titanmodell in klarem Seitenlicht',
+                    'Carbonmodell vor dunklem Schiefer',
+                    'Roségoldmodell mit warmem Makrolicht.',
+                ],
+                [],
+            ),
+            (
+                'numbered_exact_count_image_section',
+                (
+                    'Create exactly three square cinematic macro images of the same front-facing '
+                    'luxury watch case:\n'
+                    '1. Brushed titanium, cool diffuse bench light, a precise cyan seconds hand.\n'
+                    '2. Forged carbon, directional light revealing the layered weave.\n'
+                    '3. Polished rose gold, warm controlled highlights and restrained reflections.'
+                ),
+                [
+                    'Brushed titanium, cool diffuse bench light, a precise cyan seconds hand.',
+                    'Forged carbon, directional light revealing the layered weave.',
+                    'Polished rose gold, warm controlled highlights and restrained reflections.',
+                ],
+                [1, 2, 3],
+            ),
+        )
+
+        for source_kind, prompt, expected_prompts, item_numbers in cases:
+            with self.subTest(source_kind=source_kind):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={
+                        'ghost_route': True,
+                        'prompt': prompt,
+                        'current_predecessor_context': {
+                            'status': 'authorized',
+                            'authorization': 'canonical_same_conversation_predecessor',
+                            'batch_prompts': [
+                                'stale predecessor prompt one',
+                                'stale predecessor prompt two',
+                                'stale predecessor prompt three',
+                                'stale predecessor prompt four',
+                            ],
+                        },
+                    },
+                    route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+                )
+                image_branches = self._executable_image_branches(graph)
+                refinements = [
+                    item for item in (graph.get('graph_refinements') or [])
+                    if item.get('source') == 'current_turn_explicit_image_manifest'
+                ]
+
+                self.assertEqual(len(image_branches), 3)
+                self.assertEqual(
+                    [branch.get('artifact_prompt') for branch in image_branches],
+                    expected_prompts,
+                )
+                self.assertEqual(len(set(expected_prompts)), 3)
+                self.assertTrue(
+                    all(
+                        branch.get('artifact_prompt_source')
+                        == 'current_turn_explicit_image_manifest'
+                        for branch in image_branches
+                    )
+                )
+                self.assertTrue(
+                    all(branch.get('batch_prompts') == expected_prompts for branch in image_branches)
+                )
+                self.assertEqual(
+                    refinements,
+                    [
+                        {
+                            'source': 'current_turn_explicit_image_manifest',
+                            'refinement': 'branch_local_image_prompt_binding',
+                            'status': 'bound',
+                            'manifest_source_kind': source_kind,
+                            'item_numbers': item_numbers,
+                            'bound_prompt_count': 3,
+                            'bound_branch_ids': [
+                                'branch-image_generation-1',
+                                'branch-image_generation-2',
+                                'branch-image_generation-3',
+                            ],
+                        }
+                    ],
+                )
+                self.assertFalse(
+                    any(
+                        branch.get('capability') == 'vision_analysis'
+                        for branch in (graph.get('downstream_branches') or [])
+                    )
+                )
+
+    def test_exact_count_image_section_uses_numbered_current_turn_descriptions(self):
+        prompt = (
+            'Generate exactly 3 new cinematic images (square format):\n'
+            '1. A front-facing macro shot of a titanium watch with a cyan seconds hand.\n'
+            '2. The exact same titanium watch viewed from the crown side under cool bench light.\n'
+            '3. A three-quarter rear view of the same watch revealing its exhibition caseback.'
+        )
+        stale_prompt = 'Create one image from the selected reference reply.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={
+                'ghost_route': True,
+                'prompt': prompt,
+                'reference_artifacts': [
+                    {
+                        'type': 'message',
+                        'message_id': 'msg-stale-reference',
+                        'content': stale_prompt,
+                    }
+                ],
+                'current_predecessor_context': {
+                    'status': 'authorized',
+                    'authorization': 'canonical_same_conversation_predecessor',
+                    'batch_prompts': [stale_prompt, stale_prompt, stale_prompt],
+                },
+            },
+            route_payload={'capability': 'image_generation', 'route_source': 'ghost_carried'},
+        )
+        image_branches = self._executable_image_branches(graph)
+        expected_prompts = [
+            'A front-facing macro shot of a titanium watch with a cyan seconds hand.',
+            'The exact same titanium watch viewed from the crown side under cool bench light.',
+            'A three-quarter rear view of the same watch revealing its exhibition caseback.',
+        ]
+
+        self.assertEqual(len(image_branches), 3)
+        self.assertEqual(
+            [branch.get('artifact_prompt') for branch in image_branches],
+            expected_prompts,
+        )
+        self.assertTrue(
+            all(
+                branch.get('artifact_prompt_source')
+                == 'current_turn_explicit_image_manifest'
+                and branch.get('batch_prompts') == expected_prompts
+                for branch in image_branches
+            )
+        )
+        self.assertNotIn(stale_prompt, expected_prompts)
+        self.assertTrue(
+            any(
+                item.get('manifest_source_kind')
+                == 'numbered_exact_count_image_section'
+                and item.get('item_numbers') == [1, 2, 3]
+                for item in (graph.get('graph_refinements') or [])
+            )
+        )
+        self.assertFalse(
+            any(
+                branch.get('capability') == 'vision_analysis'
+                for branch in (graph.get('downstream_branches') or [])
+            )
+        )
+
+    def test_exact_count_image_section_with_noncontiguous_rows_blocks(self):
+        prompt = (
+            'Generate exactly 3 new cinematic images (square format):\n'
+            '1. A front-facing macro shot of a titanium watch.\n'
+            '3. A crown-side view of the titanium watch.\n'
+            '4. A rear view of the titanium watch.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'image_generation', 'route_source': 'ghost_carried'},
+        )
+        image_branches = self._executable_image_branches(graph)
+
+        self.assertEqual(len(image_branches), 3)
+        self.assertTrue(all(not branch.get('artifact_prompt') for branch in image_branches))
+        self.assertTrue(
+            all(
+                branch.get('branch_contract_error')
+                == 'ambiguous_current_turn_image_manifest'
+                and branch.get('blocked_by_branch_contract') is True
+                for branch in image_branches
+            )
+        )
+
+    def test_ambiguous_grouped_image_manifest_blocks_instead_of_repeating_prompts(self):
+        prompt = (
+            'Create exactly three local images and one index.html file:\n'
+            '1. index.html\n'
+            '2. 3 Images: one tourbillon macro and one atelier exterior.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+        image_branches = self._executable_image_branches(graph)
+
+        self.assertEqual(len(image_branches), 3)
+        self.assertTrue(all(not branch.get('artifact_prompt') for branch in image_branches))
+        self.assertTrue(
+            all(
+                branch.get('branch_contract_error')
+                == 'ambiguous_current_turn_image_manifest'
+                and branch.get('blocked_by_branch_contract') is True
+                and branch.get('repair_action') == 'repair_branch_contract'
+                for branch in image_branches
+            )
+        )
+        self.assertFalse(
+            any(
+                branch.get('capability') == 'vision_analysis'
+                for branch in (graph.get('downstream_branches') or [])
+            )
+        )
+
     def test_local_image_assets_for_multi_page_landing_page_create_image_obligations(self):
         prompt = (
             'Erstelle eine hochwertige Landingpage fuer ein fiktives Boutique-Hotel am See namens "Lumenhof". '
@@ -1429,6 +1865,372 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(self._text_artifact_obligations(graph)), 2)
+
+    def test_named_predecessor_files_bind_as_revision_inputs_by_exact_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            configurator_path = root / 'configurator.html'
+            styles_path = root / 'styles.css'
+            configurator_path.write_text('<main>Original configurator</main>', encoding='utf-8')
+            styles_path.write_text('.watch { color: silver; }', encoding='utf-8')
+            prompt = (
+                'Reference the current configurator.html and styles.css. '
+                'Update configurator.html and styles.css while keeping the rest intact.'
+            )
+
+            graph = build_request_phase_graph(
+                prompt,
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'selected_reference_artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(configurator_path),
+                            'artifact_ref': 'artifact:configurator',
+                        },
+                        {
+                            'type': 'text',
+                            'path': str(styles_path),
+                            'artifact_ref': 'artifact:styles',
+                        },
+                    ],
+                },
+                route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            )
+
+            branches = {
+                (
+                    branch.get('text_artifact_extension'),
+                    branch.get('text_artifact_source_name'),
+                ): branch
+                for branch in self._text_artifact_branches(graph)
+            }
+            self.assertEqual(
+                set(branches),
+                {('html', 'configurator'), ('css', 'styles')},
+            )
+            for identity, expected_path in {
+                ('html', 'configurator'): str(configurator_path),
+                ('css', 'styles'): str(styles_path),
+            }.items():
+                branch = branches[identity]
+                artifact_request = branch.get('artifact_request') or {}
+                self.assertEqual(branch.get('text_artifact_source'), 'selected_source_edit')
+                self.assertEqual(branch.get('text_artifact_target_path'), expected_path)
+                self.assertEqual(artifact_request.get('target_path'), expected_path)
+                self.assertTrue(branch.get('text_artifact_revision_required'))
+                self.assertEqual(
+                    branch.get('text_artifact_revision_source'),
+                    'canonical_predecessor_artifact',
+                )
+                self.assertEqual(branch.get('text_artifact_revision_binding_state'), 'bound')
+                self.assertIs(branch.get('text_artifact_source_is_input'), True)
+                self.assertEqual(branch.get('content_payload_source'), 'current_phase_output')
+                self.assertTrue(artifact_request.get('text_artifact_revision_required'))
+
+    def test_material_visualizer_follow_up_preserves_revision_sources_and_image_dependencies(self):
+        prompt = (
+            'Use the current configurator.html and styles.css. Upgrade only the material visualizer.\n\n'
+            'Create exactly three square cinematic macro images of the same front-facing luxury watch case:\n'
+            '1. Brushed titanium on a dark background.\n'
+            '2. Dark, textured forged carbon.\n'
+            '3. Glowing rose gold.\n\n'
+            'Wire the material selector to those three images. Keep all other design, copy, navigation, '
+            'and shared CSS intact.'
+        )
+        expected_image_prompts = [
+            'Brushed titanium on a dark background.',
+            'Dark, textured forged carbon.',
+            'Glowing rose gold.',
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            configurator_path = root / 'configurator.html'
+            styles_path = root / 'styles.css'
+            configurator_path.write_text(
+                '<main><section id="material-visualizer">Original selector</section></main>',
+                encoding='utf-8',
+            )
+            styles_path.write_text(
+                '#material-visualizer { color: silver; }',
+                encoding='utf-8',
+            )
+            selected_references = [
+                {
+                    'type': 'message',
+                    'message_role': 'assistant',
+                    'message_id': 'message-pricing-matrix',
+                    'content': '{"Titanium Base": {"price_chf": 3850}}',
+                },
+                {
+                    'type': 'text',
+                    'path': str(configurator_path),
+                    'artifact_ref': 'artifact:configurator',
+                },
+                {
+                    'type': 'text',
+                    'path': str(styles_path),
+                    'artifact_ref': 'artifact:styles',
+                },
+            ]
+
+            graph = build_request_phase_graph(
+                prompt,
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'selected_reference_artifacts': selected_references,
+                },
+                route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            )
+
+            image_branches = self._executable_image_branches(graph)
+            text_branches = {
+                (
+                    branch.get('text_artifact_extension'),
+                    branch.get('text_artifact_source_name'),
+                ): branch
+                for branch in self._text_artifact_branches(graph)
+            }
+            image_phase_ids = [branch['phase_id'] for branch in image_branches]
+
+            self.assertEqual(len(image_branches), 3)
+            self.assertEqual(
+                [branch.get('artifact_prompt') for branch in image_branches],
+                expected_image_prompts,
+            )
+            self.assertEqual(len(set(expected_image_prompts)), 3)
+            self.assertTrue(all(
+                branch.get('artifact_prompt_source') == 'current_turn_explicit_image_manifest'
+                for branch in image_branches
+            ))
+            self.assertTrue(all(branch.get('depends_on') == ['phase-1'] for branch in image_branches))
+            self.assertTrue(all(
+                {'kind': 'phase_output', 'phase_id': 'phase-1', 'role': 'dependency'}
+                in (branch.get('input_refs') or [])
+                for branch in image_branches
+            ))
+            self.assertFalse(any(
+                branch.get('capability') == 'vision_analysis'
+                for branch in (graph.get('downstream_branches') or [])
+            ))
+
+            expected_text_targets = {
+                ('html', 'configurator'): str(configurator_path),
+                ('css', 'styles'): str(styles_path),
+            }
+            self.assertEqual(set(text_branches), set(expected_text_targets))
+            for identity, expected_path in expected_text_targets.items():
+                branch = text_branches[identity]
+                artifact_request = branch.get('artifact_request') or {}
+                self.assertEqual(branch.get('depends_on'), image_phase_ids)
+                self.assertEqual(branch.get('required_image_phase_ids'), image_phase_ids)
+                self.assertEqual(
+                    [item.get('phase_id') for item in (branch.get('input_refs') or [])],
+                    image_phase_ids,
+                )
+                self.assertEqual(branch.get('text_artifact_source'), 'selected_source_edit')
+                self.assertEqual(branch.get('text_artifact_target_path'), expected_path)
+                self.assertTrue(branch.get('text_artifact_revision_required'))
+                self.assertEqual(
+                    branch.get('text_artifact_revision_source'),
+                    'canonical_predecessor_artifact',
+                )
+                self.assertEqual(branch.get('text_artifact_revision_binding_state'), 'bound')
+                self.assertIs(branch.get('text_artifact_source_is_input'), True)
+                self.assertEqual(artifact_request.get('target_path'), expected_path)
+                self.assertTrue(artifact_request.get('text_artifact_revision_preservation_required'))
+                self.assertEqual(
+                    artifact_request.get('text_artifact_revision_preservation_policy'),
+                    'structural_anchor_retention_v1',
+                )
+
+            text_obligations = {
+                (
+                    obligation.get('text_artifact_extension'),
+                    obligation.get('text_artifact_source_name'),
+                ): obligation
+                for obligation in self._text_artifact_obligations(graph)
+            }
+            self.assertEqual(set(text_obligations), set(expected_text_targets))
+            for identity, expected_path in expected_text_targets.items():
+                obligation = text_obligations[identity]
+                artifact_request = obligation.get('artifact_request') or {}
+                self.assertEqual(obligation.get('depends_on'), image_phase_ids)
+                self.assertEqual(obligation.get('text_artifact_target_path'), expected_path)
+                self.assertTrue(obligation.get('text_artifact_revision_required'))
+                self.assertEqual(
+                    obligation.get('text_artifact_revision_source'),
+                    'canonical_predecessor_artifact',
+                )
+                self.assertEqual(obligation.get('text_artifact_revision_binding_state'), 'bound')
+                self.assertTrue(artifact_request.get('text_artifact_revision_preservation_required'))
+                self.assertEqual(
+                    artifact_request.get('text_artifact_revision_preservation_policy'),
+                    'structural_anchor_retention_v1',
+                )
+                self.assertIn(
+                    'runtime_text_artifact_revision_write_proven_when_fulfilled',
+                    obligation.get('review_criteria') or [],
+                )
+
+    def test_named_predecessor_binding_preserves_multiple_same_extension_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = root / 'index.html'
+            configurator_path = root / 'configurator.html'
+            index_path.write_text('<main>Index</main>', encoding='utf-8')
+            configurator_path.write_text('<main>Configurator</main>', encoding='utf-8')
+            prompt = (
+                'Reference index.html and configurator.html. '
+                'Update index.html and configurator.html, preserving all unrelated sections.'
+            )
+
+            graph = build_request_phase_graph(
+                prompt,
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'selected_reference_artifacts': [
+                        {'type': 'text', 'path': str(index_path)},
+                        {'type': 'text', 'path': str(configurator_path)},
+                    ],
+                },
+                route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            )
+
+            html_branches = {
+                branch.get('text_artifact_source_name'): branch
+                for branch in self._text_artifact_branches(graph)
+                if branch.get('text_artifact_extension') == 'html'
+            }
+            self.assertEqual(set(html_branches), {'index', 'configurator'})
+            self.assertEqual(
+                html_branches['index'].get('text_artifact_target_path'),
+                str(index_path),
+            )
+            self.assertEqual(
+                html_branches['configurator'].get('text_artifact_target_path'),
+                str(configurator_path),
+            )
+            self.assertTrue(all(
+                branch.get('text_artifact_revision_binding_state') == 'bound'
+                for branch in html_branches.values()
+            ))
+
+    def test_selected_source_edit_does_not_promote_anonymous_output_fence_as_second_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / 'index.html'
+            index_path.write_text('<main>Original</main>', encoding='utf-8')
+            prompt = 'Please change the font to red.'
+
+            graph = build_request_phase_graph(
+                prompt,
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'selected_reference_artifacts': [
+                        {'type': 'text', 'path': str(index_path)},
+                    ],
+                },
+                response_payload={
+                    'output_text': (
+                        '```html\n<!doctype html><style>body{color:red}</style>'
+                        '<h1>Hello</h1>\n```'
+                    ),
+                },
+                route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            )
+
+            branches = self._text_artifact_branches(graph)
+            self.assertEqual(len(branches), 1)
+            self.assertEqual(branches[0].get('text_artifact_source_name'), 'index')
+            self.assertEqual(
+                branches[0].get('text_artifact_target_path'),
+                str(index_path),
+            )
+            self.assertNotEqual(
+                branches[0].get('text_artifact_source_name'),
+                'updated-html',
+            )
+
+    def test_named_predecessor_binding_does_not_guess_from_same_extension_no_match(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = root / 'index.html'
+            index_path.write_text('<main>Index</main>', encoding='utf-8')
+            prompt = 'Reference the prior work and update configurator.html only.'
+
+            graph = build_request_phase_graph(
+                prompt,
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'selected_reference_artifacts': [
+                        {'type': 'text', 'path': str(index_path)},
+                    ],
+                },
+                route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            )
+
+            branches = self._text_artifact_branches(graph)
+            self.assertEqual(
+                [
+                    (
+                        branch.get('text_artifact_extension'),
+                        branch.get('text_artifact_source_name'),
+                    )
+                    for branch in branches
+                ],
+                [('html', 'configurator')],
+            )
+            self.assertIsNone(branches[0].get('text_artifact_target_path'))
+            self.assertIsNone(branches[0].get('text_artifact_revision_required'))
+            self.assertFalse(branches[0].get('blocked_by_branch_contract'))
+
+    def test_named_predecessor_binding_blocks_ambiguous_same_name_sources(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first_path = root / 'first' / 'configurator.html'
+            second_path = root / 'second' / 'configurator.html'
+            first_path.parent.mkdir()
+            second_path.parent.mkdir()
+            first_path.write_text('<main>First</main>', encoding='utf-8')
+            second_path.write_text('<main>Second</main>', encoding='utf-8')
+            prompt = 'Reference the prior work and update configurator.html.'
+
+            graph = build_request_phase_graph(
+                prompt,
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'selected_reference_artifacts': [
+                        {'type': 'text', 'path': str(first_path)},
+                        {'type': 'text', 'path': str(second_path)},
+                    ],
+                },
+                route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            )
+
+            branches = self._text_artifact_branches(graph)
+            self.assertEqual(len(branches), 1)
+            branch = branches[0]
+            self.assertEqual(branch.get('text_artifact_source_name'), 'configurator')
+            self.assertIsNone(branch.get('text_artifact_target_path'))
+            self.assertTrue(branch.get('text_artifact_revision_required'))
+            self.assertEqual(
+                branch.get('text_artifact_revision_source'),
+                'canonical_predecessor_artifact',
+            )
+            self.assertEqual(branch.get('text_artifact_revision_binding_state'), 'ambiguous')
+            self.assertIs(branch.get('text_artifact_source_is_input'), False)
+            self.assertEqual(
+                branch.get('branch_contract_error'),
+                'ambiguous_text_artifact_revision_source',
+            )
+            self.assertTrue(branch.get('blocked_by_branch_contract'))
 
     def test_counted_visual_branch_guard_backfills_missing_explicit_branch_count(self):
         prompt = 'I need exactly three images for this landing page.'

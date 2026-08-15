@@ -3199,6 +3199,43 @@ class ResponseFrameTests(unittest.TestCase):
         self.assertEqual(frame["output"]["outputs"][0]["value"], "Hello.")
         self.assertNotIn("controls", frame)
 
+    def test_build_response_frame_preserves_authorized_predecessor_bundle_contract(self):
+        context = {
+            'kind': 'ollmo.current_predecessor_context',
+            'status': 'authorized',
+            'authorization': 'canonical_same_conversation_predecessor',
+            'promotion_mode': 'named_text_edit',
+            'source_response_id': 'resp-predecessor',
+            'matched_text_artifacts': [
+                {'filename': 'styles.css', 'path': '/tmp/styles.css'}
+            ],
+            'carried_public_dependencies': [
+                {
+                    'type': 'text',
+                    'path': '/tmp/index.html',
+                    'source_response_id': 'resp-predecessor',
+                    'carried_public_dependency': True,
+                }
+            ],
+        }
+
+        frame = build_response_frame(
+            {
+                'id': 'resp-follow-up',
+                'status': 'completed',
+                'output_text': 'Updated.',
+            },
+            request_payload={
+                'prompt': 'Update styles.css and keep the rest intact.',
+                'current_predecessor_context': context,
+            },
+        )
+
+        self.assertEqual(
+            frame['request']['current_predecessor_context'],
+            context,
+        )
+
     def test_build_response_frame_exposes_intent_contract_in_planning(self):
         phase_graph = build_request_phase_graph(
             "Write a short prompt and generate an image from it.",

@@ -141,6 +141,138 @@ class InferApiTests(unittest.TestCase):
             mock_activity.assert_called_once()
             mock_success.assert_called_once()
 
+    @patch("ollmo_webserver.record_instance_success")
+    @patch("ollmo_webserver.record_instance_activity")
+    @patch("ollmo_webserver._lookup_instance")
+    @patch.object(ollmo_webserver._GENERATED_IMAGE_POSTPROCESS, "schedule_generated_image_payload_enrichment")
+    @patch("ollmo_webserver._persist_image_data_url_locally")
+    @patch("ollmo_webserver._ollama_generate")
+    def test_image_generation_suppresses_stale_selected_reply_for_authoritative_branch_prompt(
+        self,
+        mock_generate,
+        mock_persist,
+        mock_schedule_enrichment,
+        mock_lookup,
+        mock_activity,
+        mock_success,
+    ):
+        mock_lookup.return_value = {
+            "instance_id": "flux-branch-1",
+            "port": 11435,
+            "model": "x/flux2-klein:latest",
+            "backend": "ollama",
+            "capability": "image_generation",
+        }
+        mock_generate.return_value = {
+            "response": "Image done",
+            "images": ["aGVsbG8="],
+        }
+        mock_persist.return_value = "/tmp/artifacts/images/titanium.png"
+        mock_schedule_enrichment.side_effect = lambda payload: dict(payload)
+        mock_activity.return_value = ({}, {"readiness": "ready"})
+        mock_success.return_value = ({"readiness": "ready"}, {"readiness": "ready"})
+        branch_prompt = (
+            "A front-facing macro shot of a hyper-luxury watch case made of "
+            "brushed titanium on a dark background."
+        )
+
+        with patch("ollmo_webserver._ollama_openai_image_generation", return_value=None):
+            response = self.client.post(
+                "/api/infer",
+                json={
+                    "instance_id": "flux-branch-1",
+                    "prompt": branch_prompt,
+                    "suppress_reference_file_context": True,
+                    "selected_reference_artifacts": [
+                        {
+                            "type": "message",
+                            "message_role": "assistant",
+                            "content": "Earlier reply containing unrelated lighthouse artwork.",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["mode"], "image_generation")
+        mock_generate.assert_called_once()
+        self.assertEqual(mock_generate.call_args.args[2], branch_prompt)
+        self.assertNotIn("Selected prior assistant reply", mock_generate.call_args.args[2])
+        self.assertNotIn("lighthouse", mock_generate.call_args.args[2])
+
+    @patch("ollmo_webserver.record_instance_success")
+    @patch("ollmo_webserver.record_instance_activity")
+    @patch("ollmo_webserver._lookup_instance")
+    @patch.object(ollmo_webserver._GENERATED_IMAGE_POSTPROCESS, "schedule_generated_image_payload_enrichment")
+    @patch("ollmo_webserver._persist_image_data_url_locally")
+    @patch("ollmo_webserver._ollama_generate")
+    def test_responses_to_infer_selected_reference_prefix_is_applied_once(
+        self,
+        mock_generate,
+        mock_persist,
+        mock_schedule_enrichment,
+        mock_lookup,
+        mock_activity,
+        mock_success,
+    ):
+        instance = {
+            "instance_id": "flux-reference-1",
+            "port": 11435,
+            "model": "x/flux2-klein:latest",
+            "backend": "ollama",
+            "capability": "image_generation",
+        }
+        selected_reply = {
+            "type": "message",
+            "message_role": "assistant",
+            "content": "Use the selected reference palette for this explicit edit.",
+        }
+        branch_prompt = "Edit the selected watch image with a restrained cyan accent."
+        mock_lookup.return_value = instance
+        mock_generate.return_value = {
+            "response": "Image done",
+            "images": ["aGVsbG8="],
+        }
+        mock_persist.return_value = "/tmp/artifacts/images/watch-edit.png"
+        mock_schedule_enrichment.side_effect = lambda payload: dict(payload)
+        mock_activity.return_value = ({}, {"readiness": "ready"})
+        mock_success.return_value = ({"readiness": "ready"}, {"readiness": "ready"})
+
+        with app.test_request_context("/api/responses", method="POST"):
+            infer_payload, _route_info, _has_file_context, _expose_input_artifacts = (
+                ollmo_webserver._build_responses_infer_execution_payload(
+                    {
+                        "ghost_route": True,
+                        "prompt": branch_prompt,
+                        "selected_reference_artifacts": [selected_reply],
+                    },
+                    route_info={
+                        "capability": "image_generation",
+                        "route_source": "phase_continuation",
+                    },
+                    instance=instance,
+                    instance_id=instance["instance_id"],
+                    backend=instance["backend"],
+                    capability=instance["capability"],
+                    request_model_override=instance["model"],
+                    upload_present=False,
+                )
+            )
+
+        with patch("ollmo_webserver._ollama_openai_image_generation", return_value=None):
+            response = self.client.post("/api/infer", json=infer_payload)
+
+        self.assertEqual(response.status_code, 200)
+        backend_prompt = mock_generate.call_args.args[2]
+        self.assertEqual(
+            backend_prompt.count(
+                "Selected prior assistant reply reference for this conversation turn."
+            ),
+            1,
+        )
+        self.assertEqual(backend_prompt.count("Current user request:"), 1)
+        self.assertTrue(backend_prompt.endswith(branch_prompt))
+
     @patch("ollmo_webserver._execute_infer_request")
     def test_invoke_internal_api_json_route_establishes_app_context(self, mock_execute_infer):
         def fake_execute(payload, upload=None):
@@ -1022,6 +1154,72 @@ class InferApiTests(unittest.TestCase):
         mock_persist_text_artifact.assert_called_once()
         self.assertEqual(mock_persist_text_artifact.call_args.args[0], "# Einsatzprotokoll\n\n- Risiko: Vereisung.")
         self.assertEqual(mock_persist_text_artifact.call_args.kwargs["source_name"], "einsatzprotokoll")
+
+    @patch("ollmo_webserver._persist_text_artifact_locally")
+    @patch("ollmo_webserver._lookup_instance")
+    @patch("ollmo_webserver._ollama_chat")
+    def test_chat_infer_preserves_distinct_files_with_the_same_extension(
+        self,
+        mock_chat,
+        mock_lookup,
+        mock_persist_text_artifact,
+    ):
+        mock_lookup.return_value = {
+            "instance_id": "gemma-1",
+            "port": 11436,
+            "model": "gemma4:26b",
+            "backend": "ollama",
+            "capability": "chat",
+        }
+        mock_chat.return_value = {
+            "content": (
+                "```html\n<!doctype html><title>Atelier</title>\n```\n"
+                "```css\nbody { color: #111; }\n```\n"
+                "```html\n<!doctype html><title>Configurator</title>\n```\n"
+                "```json\n{\"currency\": \"CHF\"}\n```"
+            )
+        }
+        mock_persist_text_artifact.side_effect = lambda _content, **kwargs: (
+            f"/tmp/artifacts/documents/{kwargs['source_name']}.{kwargs['extension']}"
+        )
+        requests = [
+            {"extension": "html", "source_name": "index", "source": "runtime_contract"},
+            {"extension": "css", "source_name": "styles", "source": "runtime_contract"},
+            {"extension": "html", "source_name": "configurator", "source": "runtime_contract"},
+            {"extension": "json", "source_name": "pricing", "source": "runtime_contract"},
+        ]
+
+        response = self.client.post(
+            "/api/infer",
+            json={
+                "instance_id": "gemma-1",
+                "prompt": "Materialize the complete four-file contract.",
+                "text_artifact_requests": requests,
+                "artifact_request": requests[0],
+                "text_artifact_extension": "html",
+                "text_artifact_source_name": "index",
+                "text_artifact_source": "runtime_contract",
+                "text_artifact_target_path": "/tmp/artifacts/documents/index.html",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            [
+                item["text_artifact_request"]["source_name"]
+                for item in payload["saved_text_artifacts"]
+            ],
+            ["index", "styles", "configurator", "pricing"],
+        )
+        self.assertEqual(
+            payload["saved_text_artifacts"][0]["text_artifact_request"]["target_path"],
+            "/tmp/artifacts/documents/index.html",
+        )
+        self.assertEqual(
+            [call.kwargs["source_name"] for call in mock_persist_text_artifact.call_args_list],
+            ["index", "styles", "configurator", "pricing"],
+        )
 
     @patch("ollmo_webserver.record_instance_success")
     @patch("ollmo_webserver.record_instance_activity")

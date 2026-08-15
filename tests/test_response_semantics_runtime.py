@@ -1655,6 +1655,29 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             ],
         )
 
+    def test_numbered_image_prompt_section_stops_before_arbitrary_named_text_artifact(self):
+        output_text = (
+            '### Image Generation Prompts\n\n'
+            '1. A square cinematic macro photograph of a brushed titanium watch case under cool '
+            'diffuse watchmaker-bench light, front-facing and centered.\n\n'
+            '2. A square cinematic macro photograph of the same watch case in forged carbon, '
+            'directional light revealing the layered weave.\n\n'
+            '3. A square cinematic macro photograph of the same watch case in polished rose gold, '
+            'warm controlled highlights and restrained reflections.\n\n'
+            '**Updated configurator.html (Material Visualizer Segment):**\n\n'
+            '```html\n<section class="material-visualizer"></section>\n```\n\n'
+            '**Updated theme-tokens.json:**\n\n'
+            '```json\n{"accent": "cyan"}\n```'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(output_text, expected_count=3)
+
+        self.assertEqual(len(prompts), 3)
+        self.assertTrue(prompts[2].endswith('warm controlled highlights and restrained reflections.'))
+        self.assertNotIn('configurator.html', prompts[2])
+        self.assertNotIn('theme-tokens.json', prompts[2])
+        self.assertNotIn('```', prompts[2])
+
     def test_extract_batch_image_prompts_preserves_sequential_bold_alpha_labels_before_analysis_section(self):
         output_text = (
             '**Image Generation Prompts:**\n\n'
@@ -2768,6 +2791,47 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertFalse(any('Image Generation Prompt' in prompt for prompt in prompts))
         self.assertFalse(any('index.html' in prompt or 'styles.css' in prompt for prompt in prompts))
 
+    def test_extract_batch_image_prompts_uses_generic_artifact_title_bodies_before_html(self):
+        content = (
+            '### Artifact 1: Titanium Watch\n'
+            'A hyper-detailed studio photograph of a brushed titanium wristwatch, crisp macro '
+            'lighting across the bezel and visible mechanical finishing.\n\n'
+            '### Artifact 2: Forged Carbon Watch\n'
+            'A cinematic product photograph of a forged-carbon wristwatch, the layered carbon '
+            'weave sharply visible beneath controlled side lighting.\n\n'
+            '### Artifact 3: Rose Gold Watch\n'
+            'A luxury macro photograph of a rose-gold wristwatch, warm reflections tracing the '
+            'case while the dial remains in precise focus.\n\n'
+            '### Artifact 4: index.html\n'
+            '```html\n'
+            '<img src="PATH_TITANIUM" alt="Titanium Watch">\n'
+            '<img src="PATH_CARBON" alt="Carbon Watch">\n'
+            '<img src="PATH_ROSEGOLD" alt="Rose Gold Watch">\n'
+            '```'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(content, expected_count=3)
+
+        self.assertEqual(len(prompts), 3)
+        self.assertIn('brushed titanium wristwatch', prompts[0])
+        self.assertIn('layered carbon weave', prompts[1])
+        self.assertIn('rose-gold wristwatch', prompts[2])
+        self.assertFalse(any('Artifact ' in prompt or '<img' in prompt for prompt in prompts))
+
+    def test_extract_batch_image_prompts_does_not_pad_exact_batch_from_heading_or_prose(self):
+        content = (
+            '```text\n'
+            '// Image Generation Prompts (for downstream pipeline)\n'
+            '```\n\n'
+            'A cinematic macro photograph of a tourbillon movement under watchmaker-bench lighting.\n\n'
+            'A wide architectural photograph of a glass atelier above misty Lake Neuchatel.\n\n'
+            'The package architecture has four files and all image paths must be local.\n'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(content, expected_count=3)
+
+        self.assertEqual(prompts, [])
+
     def test_late_fill_batch_normalization_replaces_artifact_heading_only_prompts_with_bodies(self):
         content = (
             '### Artifact 1: Image Generation Prompt (Teapot)\n'
@@ -3344,6 +3408,30 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             'materialization_blocked',
         )
 
+    def test_truth_gate_preserves_ordinary_user_json_data(self):
+        source = json.dumps(
+            [
+                {
+                    'material': 'Titanium Base',
+                    'price_chf': 24000,
+                    'image': '../images/titanium.png',
+                }
+            ]
+        )
+
+        updated = self.owner.truth_gate_response_output_claims(
+            {'id': 'resp_user_json_data', 'output_text': source},
+            request_payload={
+                'prompt': (
+                    'Create pricing.json as a local file artifact containing one '
+                    'Titanium Base price entry.'
+                )
+            },
+        )
+
+        self.assertEqual(updated['output_text'], source)
+        self.assertNotIn('truth_guard', updated.get('runtime') or {})
+
     def test_truth_gate_unwraps_single_control_json_content_payload(self):
         payload = {
             'id': 'resp_control_json_content_payload',
@@ -3511,6 +3599,140 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(updated['runtime']['truth_guard']['kind'], 'ungrounded_text_artifact_reference')
         self.assertEqual(updated['runtime']['truth_guard']['status'], 'clarification_required')
 
+    def test_truth_gate_allows_graph_prepared_named_text_artifact_pronouns(self):
+        prompts = (
+            'Create index.html with a concise premium landing page and save it as a '
+            'local artifact.',
+            'Create index.html and styles.css for a premium landing page, then save '
+            'them as local artifacts.',
+            'Create index.html with a sunrise poem, then turn it into an image.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                request_payload = {'prompt': prompt}
+                phase_graph = build_request_phase_graph(
+                    prompt,
+                    intent_prompt=prompt,
+                    request_payload=request_payload,
+                    route_payload={'capability': 'chat'},
+                )
+                route_payload = {
+                    'route_runtime': {'request_phase_graph': phase_graph}
+                }
+                payload = {
+                    'id': 'resp_graph_prepared_named_text_artifact',
+                    'output_text': '<main><h1>Mon Repos</h1></main>',
+                }
+
+                self.assertFalse(
+                    _request_requires_current_source_for_transform(
+                        prompt,
+                        request_payload=request_payload,
+                        route_payload=route_payload,
+                        response_payload=payload,
+                    )
+                )
+                updated = self.owner.truth_gate_response_output_claims(
+                    payload,
+                    route_payload=route_payload,
+                    request_payload=request_payload,
+                )
+
+                self.assertEqual(updated['output_text'], payload['output_text'])
+                self.assertNotIn('truth_guard', updated.get('runtime') or {})
+
+    def test_truth_gate_graph_prepare_does_not_ground_a_missing_source(self):
+        prompts = (
+            'Create index.html from this text.',
+            'Create index.html from this missing source.',
+            'Create index.html from the missing source and turn it into an image.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                request_payload = {'prompt': prompt}
+                phase_graph = build_request_phase_graph(
+                    prompt,
+                    intent_prompt=prompt,
+                    request_payload=request_payload,
+                    route_payload={'capability': 'chat'},
+                )
+                route_payload = {
+                    'route_runtime': {'request_phase_graph': phase_graph}
+                }
+                payload = {
+                    'id': 'resp_graph_prepare_missing_text_source',
+                    'output_text': '<main>Invented source</main>',
+                }
+
+                self.assertTrue(
+                    _request_requires_current_source_for_transform(
+                        prompt,
+                        request_payload=request_payload,
+                        route_payload=route_payload,
+                        response_payload=payload,
+                    )
+                )
+                updated = self.owner.truth_gate_response_output_claims(
+                    payload,
+                    route_payload=route_payload,
+                    request_payload=request_payload,
+                )
+
+                self.assertIn('need the source/content', updated['output_text'])
+                self.assertEqual(
+                    updated['runtime']['truth_guard']['status'],
+                    'clarification_required',
+                )
+
+    def test_truth_gate_keeps_style_pronoun_local_to_its_own_action(self):
+        prompts = (
+            (
+                'Create a premium local landing page for a lakeside atelier. '
+                'Make it cinematic, restrained, and tactile. Then create three images, '
+                'index.html, and styles.css.',
+                'sentence_scoped',
+            ),
+            (
+                'Create a premium local landing page. Make it cinematic, then create '
+                'index.html and styles.css.',
+                'coordinated_follow_up',
+            ),
+            (
+                'Create a premium local landing page. Make it cinematic; create '
+                'index.html and styles.css.',
+                'semicolon_clause',
+            ),
+            (
+                'Create a premium local landing page. Make it cinematic, create '
+                'index.html and styles.css.',
+                'comma_clause',
+            ),
+        )
+
+        for prompt, case_name in prompts:
+            with self.subTest(case=case_name):
+                payload = {
+                    'id': f'resp_style_pronoun_{case_name}',
+                    'output_text': 'Cinematic preparation text for the requested package.',
+                }
+
+                self.assertFalse(
+                    _request_requires_current_source_for_transform(
+                        prompt,
+                        request_payload={'prompt': prompt},
+                        response_payload=payload,
+                    )
+                )
+                updated = self.owner.truth_gate_response_output_claims(
+                    payload,
+                    request_payload={'prompt': prompt},
+                )
+
+                self.assertEqual(updated['output_text'], payload['output_text'])
+                self.assertNotIn('truth_guard', updated.get('runtime') or {})
+
     def test_truth_gate_preserves_self_contained_deictic_tts_sources(self):
         cases = (
             (
@@ -3561,6 +3783,7 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
     def test_truth_gate_keeps_ungrounded_text_and_html_transforms_fail_closed(self):
         prompts = (
             'Save this text.',
+            'Make this HTML.',
             'Transform this text into an HTML artifact.',
             'Mach daraus ein HTML und ein Audio.',
             'Create this image, then speak this text exactly: "Hello."',
@@ -5851,6 +6074,53 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             '1. Ruhige deutsche Fassung.\n2. Energetic English version.',
         )
 
+    def test_external_prepare_task_is_graph_owned_and_direct_chat_stays_unshaped(self):
+        prompt = (
+            'Create a premium local landing page. Generate exactly three images: '
+            'a lake villa, a warm salon, and carved stone. Create index.html and '
+            'styles.css using those generated images as local assets.'
+        )
+        request_payload = {'prompt': prompt}
+        phase_graph = build_request_phase_graph(
+            prompt,
+            intent_prompt=prompt,
+            request_payload=request_payload,
+            route_payload={'capability': 'chat'},
+        )
+
+        bounded_task = self.owner.build_external_prepare_phase_bounded_task(
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            request_payload=request_payload,
+        )
+        fallback_bounded_task = self.owner.build_external_prepare_phase_bounded_task(
+            request_payload=request_payload,
+        )
+        direct_chat_prompts = (
+            'Explain gravity in one sentence.',
+            'Do not create index.html; just explain the structure.',
+            'Explain image generation and HTML artifacts.',
+        )
+
+        for task in (bounded_task, fallback_bounded_task):
+            with self.subTest(task=task[:48]):
+                self.assertIn('Ollmo phase contract: prepare-only.', task)
+                self.assertIn('only the current text-preparation phase', task)
+                self.assertIn('image generation and chat separately', task)
+                self.assertIn('Do not perform filesystem writes', task)
+                self.assertIn(
+                    'Ollmo retains authority for downstream execution',
+                    task,
+                )
+                self.assertNotIn(prompt, task)
+        for direct_chat_prompt in direct_chat_prompts:
+            with self.subTest(direct_chat_prompt=direct_chat_prompt):
+                self.assertEqual(
+                    self.owner.build_external_prepare_phase_bounded_task(
+                        request_payload={'prompt': direct_chat_prompt},
+                    ),
+                    '',
+                )
+
     def test_selected_tts_late_fill_uses_second_distinct_numbered_candidate(self):
         payload = self.late_fill_owner.focus_late_fill_branch_gap_payload(
             {
@@ -7537,6 +7807,118 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertIn('/tmp/aethelgard-abyss-7.png', binding_checks[0]['content_payload'])
         self.assertIn('placeholder', binding_checks[0]['content_payload'])
 
+    def test_terminal_dependency_review_blocks_only_missing_static_local_fetch_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            html_path = root / 'configurator.html'
+            pricing_path = root / 'pricing.json'
+            settings_path = root / 'settings.json'
+            html_path.write_text(
+                '<!doctype html><script>'
+                "fetch('pricing.json');"
+                "fetch('https://example.com/pricing.json');"
+                "fetch('data:application/json,%7B%7D');"
+                "fetch('#embedded-data');"
+                "fetch('/api/pricing.json');"
+                "fetch('/api/pricing');"
+                "fetch('dynamic.json' + window.location.search);"
+                'const dynamicPath = window.pricingPath; fetch(dynamicPath);'
+                '</script>',
+                encoding='utf-8',
+            )
+            settings_path.write_text('{"theme": "dark"}\n', encoding='utf-8')
+            payload = {
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(html_path),
+                        'artifact_ref': 'artifact:configurator',
+                        'branch_id': 'branch-configurator',
+                        'phase_id': 'phase-configurator',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(settings_path),
+                        'name': 'settings',
+                        'artifact_ref': 'artifact:settings',
+                    },
+                ]
+            }
+
+            self.late_fill_owner.rebind_terminal_linked_artifacts(payload)
+            unchanged_html = html_path.read_text(encoding='utf-8')
+            self.assertIn("fetch('pricing.json')", unchanged_html)
+            self.assertNotIn("fetch('settings.json')", unchanged_html)
+            self.assertIn("fetch('/api/pricing.json')", unchanged_html)
+
+            checks = self.late_fill_owner._terminal_unresolved_local_dependency_link_open_checks(
+                payload
+            )
+
+            self.assertEqual(len(checks), 1)
+            self.assertEqual(checks[0]['evidence'], 'unresolved_local_dependency_link')
+            self.assertEqual(checks[0]['missing_dependency_url'], 'pricing.json')
+            self.assertEqual(checks[0]['text_artifact_extension'], 'json')
+            self.assertEqual(
+                checks[0]['text_artifact_target_path'],
+                str(pricing_path.resolve(strict=False)),
+            )
+            self.assertEqual(
+                checks[0]['artifact_request']['target_path'],
+                str(pricing_path.resolve(strict=False)),
+            )
+
+            pricing_path.write_text('{"materials": []}\n', encoding='utf-8')
+            self.assertEqual(
+                self.late_fill_owner._terminal_unresolved_local_dependency_link_open_checks(
+                    payload
+                ),
+                [],
+            )
+
+    def test_terminal_link_rebind_preserves_html_self_links_and_matches_siblings_by_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = root / 'generated_index.html'
+            configurator_path = root / 'generated_configurator.html'
+            index_path.write_text(
+                '<a href="index.html">Home</a>'
+                '<a href="configurator.html">Configurator</a>'
+                '<a href="missing.html">Missing</a>',
+                encoding='utf-8',
+            )
+            configurator_path.write_text(
+                '<a href="configurator.html">Configurator</a>'
+                '<a href="index.html">Home</a>',
+                encoding='utf-8',
+            )
+            payload = {
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(index_path),
+                        'name': 'index',
+                        'artifact_ref': 'artifact:index',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(configurator_path),
+                        'name': 'configurator',
+                        'artifact_ref': 'artifact:configurator',
+                    },
+                ]
+            }
+
+            self.late_fill_owner.rebind_terminal_linked_artifacts(payload)
+
+            index = index_path.read_text(encoding='utf-8')
+            configurator = configurator_path.read_text(encoding='utf-8')
+            self.assertIn('href="index.html"', index)
+            self.assertIn('href="generated_configurator.html"', index)
+            self.assertIn('href="configurator.html"', configurator)
+            self.assertIn('href="generated_index.html"', configurator)
+            self.assertIn('href="missing.html"', index)
+
     def test_closure_review_displays_ollmo_relative_artifact_paths_for_link_rebind(self):
         prompt = (
             'Generate exactly one local image artifact first. '
@@ -7970,6 +8352,94 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                 if item.get('check_kind') == 'html_css_selector_binding'
             ]
         )
+
+    def test_closure_uses_full_saved_text_when_transport_preview_is_truncated(self):
+        html_classes = [
+            'hero-shell',
+            'hero-title',
+            'hero-copy',
+            'hero-actions',
+            'feature-grid',
+            'feature-card',
+            'footer-links',
+            'footer-meta',
+        ]
+        html = (
+            '<!doctype html><html><head>'
+            '<link rel="stylesheet" href="styles.css"></head>'
+            f'<body class="{" ".join(html_classes)}"></body></html>'
+        )
+        matching_css = ' '.join(
+            f'.{token} {{ color: inherit; }}' for token in html_classes
+        )
+        unused_css = ' '.join(
+            f'.unused-{index} {{ display: block; }}' for index in range(8)
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            html_path = root / 'index.html'
+            css_path = root / 'styles.css'
+            html_path.write_text(html, encoding='utf-8')
+            prefix = f'{unused_css}\n'
+            full_css = (
+                prefix
+                + (' ' * max(0, 15985 - len(prefix)))
+                + '.late-rule { color: #123456; }\n'
+                + matching_css
+            )
+            css_path.write_text(full_css, encoding='utf-8')
+            preview = full_css[:16000]
+            self.assertTrue(
+                self.owner.text_artifact_syntax_sanity_issues_for_extension(
+                    'css',
+                    preview,
+                )
+            )
+            records = {
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(html_path),
+                        'name': 'index',
+                        'mime_type': 'text/html',
+                        'content': html,
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(css_path),
+                        'name': 'styles',
+                        'mime_type': 'text/css',
+                        'content': preview,
+                        'content_preview_truncated': True,
+                    },
+                ]
+            }
+
+            self.assertFalse(
+                self.owner._text_artifact_syntax_sanity_checks(
+                    artifact_payload=records,
+                )
+            )
+            self.assertFalse(
+                self.owner._html_css_selector_binding_checks(
+                    artifact_payload=records,
+                )
+            )
+
+            css_path.write_text(
+                f'{unused_css}\n{" " * 16000}\n.late-rule {{ color: #123456;\n',
+                encoding='utf-8',
+            )
+            self.assertTrue(
+                self.owner._text_artifact_syntax_sanity_checks(
+                    artifact_payload=records,
+                )
+            )
+            self.assertTrue(
+                self.owner._html_css_selector_binding_checks(
+                    artifact_payload=records,
+                )
+            )
 
     def test_deterministic_syntax_repair_normalizes_malformed_html_closing_tag(self):
         content = '<!doctype html><html><body><section><p>Copy</p></承section></body></html>'
@@ -12049,6 +12519,288 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(
             [item.get('capability') for item in feedback['items']],
             ['text_to_speech'],
+        )
+
+    @staticmethod
+    def _text_revision_closure_fixture(
+        target_path,
+        *,
+        include_write_proof=False,
+        proof_target_path=None,
+        preservation_status=None,
+    ):
+        target = Path(target_path)
+        content = (
+            '.global-nav { display: flex; }\n'
+            '.material-visualizer { background: url("titanium.png"); }\n'
+        )
+        target.write_text(content, encoding='utf-8')
+        branch_id = 'branch-text-artifact-revision-styles'
+        phase_id = 'phase-1'
+        phase = {
+            'phase_id': phase_id,
+            'branch_id': branch_id,
+            'capability': 'chat',
+            'output_type': 'text',
+            'role': 'text_artifact_output',
+            'status': 'planned',
+            'required': True,
+            'requires_artifact': True,
+            'fulfillment_policy': 'runtime_text_artifact',
+            'stage_direction': 'materialize_requested_text_artifact',
+            'text_artifact_extension': 'css',
+            'text_artifact_source_name': 'styles',
+            'text_artifact_source': 'selected_source_edit',
+            'text_artifact_target_path': str(target),
+            'text_artifact_revision_required': True,
+            'text_artifact_revision_source': 'canonical_predecessor_artifact',
+            'text_artifact_revision_binding_state': 'bound',
+            'text_artifact_source_is_input': True,
+            'text_artifact_revision_preservation_required': True,
+            'text_artifact_revision_preservation_policy': (
+                'structural_anchor_retention_v1'
+            ),
+            'artifact_request': {
+                'extension': 'css',
+                'source_name': 'styles',
+                'source': 'selected_source_edit',
+                'target_path': str(target),
+            },
+            'review_criteria': [
+                'output_contract_matches_capability',
+                (
+                    'runtime_status_reaches_fulfilled_blocked_failed_waived_'
+                    'superseded_or_pending'
+                ),
+                'runtime_text_artifact_exists_when_fulfilled',
+                'runtime_text_artifact_revision_write_proven_when_fulfilled',
+                (
+                    'runtime_text_artifact_revision_preservation_passed_'
+                    'when_required'
+                ),
+            ],
+        }
+        fill_result = {
+            'branch_id': branch_id,
+            'phase_id': phase_id,
+            'capability': 'chat',
+            'saved_text_path': str(target),
+            'text_artifact_extension': 'css',
+            'text_artifact_source_name': 'styles',
+            'text_artifact_source': 'target_path_revision_output',
+            'text_artifact_target_path': str(target),
+            'text_artifact_revision_required': True,
+        }
+        if include_write_proof:
+            fill_result['text_artifact_revision_write_proof'] = {
+                'kind': 'ollmo.text_artifact_revision_write_proof',
+                'version': 1,
+                'status': 'applied',
+                'target_path': str(proof_target_path or target),
+                'output_sha256': hashlib.sha256(content.encode('utf-8')).hexdigest(),
+                'evidence': 'current_branch_output_written_to_target',
+            }
+        if preservation_status is not None:
+            fill_result['text_artifact_revision_preservation_evidence'] = {
+                'kind': 'ollmo.text_artifact_revision_preservation_evidence',
+                'version': 1,
+                'policy': 'structural_anchor_retention_v1',
+                'status': preservation_status,
+                'target_path': str(target),
+                'text_artifact_extension': 'css',
+                'source_size_chars': len(content),
+                'candidate_size_chars': len(content),
+                'size_retention_ratio': 1.0,
+                'source_anchor_count': 2,
+                'retained_anchor_count': 2 if preservation_status == 'passed' else 0,
+                'anchor_retention_ratio': 1.0 if preservation_status == 'passed' else 0.0,
+                **(
+                    {'failure_reason': 'structural_anchor_loss'}
+                    if preservation_status == 'failed'
+                    else {}
+                ),
+            }
+        phase_graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'mode': 'single_phase',
+            'current_phase_id': phase_id,
+            'current_phase_capability': 'chat',
+            'phases': [phase],
+        }
+        payload = {
+            'id': 'resp_text_revision_closure_evidence',
+            'output_text': 'The stylesheet was updated.',
+            'runtime': {'request_phase_graph': phase_graph},
+            # This real saved artifact is deliberately present in every case.
+            # Revision Closure must not treat its mere existence as write proof.
+            'artifacts': [
+                {
+                    'type': 'text',
+                    'kind': 'text',
+                    'path': str(target),
+                    'saved_text_path': str(target),
+                    'name': 'styles',
+                    'mime_type': 'text/css',
+                    'content': content,
+                    'text_artifact_extension': 'css',
+                    'text_artifact_source_name': 'styles',
+                }
+            ],
+            'late_fill': {
+                'status': 'completed',
+                'final_materialization_contract_status': 'fulfilled',
+                'materialization_contract_unmet': False,
+                'completed_capabilities': ['chat'],
+                'completed_branches': [
+                    {
+                        'branch_id': branch_id,
+                        'phase_id': phase_id,
+                        'capability': 'chat',
+                        'status': 'fulfilled',
+                    }
+                ],
+                'fill_results': [fill_result],
+            },
+        }
+        return payload, branch_id, content
+
+    def test_revision_closure_rejects_generic_text_artifact_without_write_proof(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload, branch_id, _content = self._text_revision_closure_fixture(
+                Path(tmpdir) / 'styles.css',
+            )
+
+            review = self.owner.build_graph_closure_review(
+                payload['output_text'],
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': 'Update styles.css and keep the rest intact.',
+                },
+                artifact_payload=payload,
+            )
+
+        check = next(
+            item for item in review['checks']
+            if item.get('branch_id') == branch_id
+        )
+        self.assertNotEqual(review['status'], 'fulfilled')
+        self.assertIn(check['status'], {'pending', 'blocked'})
+        self.assertNotEqual(check.get('evidence'), 'output_artifact_type:text')
+        closure_evidence = check['text_artifact_revision_closure_evidence']
+        self.assertEqual(closure_evidence['status'], 'failed')
+        self.assertFalse(closure_evidence['write_proven'])
+        self.assertEqual(
+            closure_evidence['evidence'],
+            'text_artifact_revision_write_proof_missing_or_invalid',
+        )
+
+    def test_revision_closure_rejects_write_proof_for_another_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, branch_id, _content = self._text_revision_closure_fixture(
+                root / 'styles.css',
+                include_write_proof=True,
+                proof_target_path=root / 'other.css',
+                preservation_status='passed',
+            )
+
+            review = self.owner.build_graph_closure_review(
+                payload['output_text'],
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': 'Update styles.css and keep the rest intact.',
+                },
+                artifact_payload=payload,
+            )
+
+        check = next(
+            item for item in review['checks']
+            if item.get('branch_id') == branch_id
+        )
+        self.assertNotEqual(review['status'], 'fulfilled')
+        self.assertIn(check['status'], {'pending', 'blocked'})
+        self.assertNotEqual(check.get('evidence'), 'output_artifact_type:text')
+        closure_evidence = check['text_artifact_revision_closure_evidence']
+        self.assertFalse(closure_evidence['write_proven'])
+        self.assertEqual(
+            closure_evidence['evidence'],
+            'text_artifact_revision_write_proof_target_mismatch',
+        )
+
+    def test_revision_closure_requires_passed_preservation_evidence(self):
+        for preservation_status, expected_status, expected_evidence in (
+            (
+                None,
+                'pending',
+                'text_artifact_revision_preservation_evidence_missing_or_invalid',
+            ),
+            (
+                'failed',
+                'blocked',
+                'text_artifact_revision_preservation_failed',
+            ),
+        ):
+            with self.subTest(preservation_status=preservation_status):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    payload, branch_id, _content = self._text_revision_closure_fixture(
+                        Path(tmpdir) / 'styles.css',
+                        include_write_proof=True,
+                        preservation_status=preservation_status,
+                    )
+
+                    review = self.owner.build_graph_closure_review(
+                        payload['output_text'],
+                        request_payload={
+                            'ghost_route': True,
+                            'prompt': 'Update styles.css and keep the rest intact.',
+                        },
+                        artifact_payload=payload,
+                    )
+
+                check = next(
+                    item for item in review['checks']
+                    if item.get('branch_id') == branch_id
+                )
+                self.assertNotEqual(review['status'], 'fulfilled')
+                self.assertEqual(check['status'], expected_status)
+                self.assertNotEqual(check.get('evidence'), 'output_artifact_type:text')
+                closure_evidence = check[
+                    'text_artifact_revision_closure_evidence'
+                ]
+                self.assertFalse(closure_evidence['write_proven'])
+                self.assertEqual(closure_evidence['evidence'], expected_evidence)
+
+    def test_revision_closure_accepts_matching_write_and_preservation_evidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload, branch_id, content = self._text_revision_closure_fixture(
+                Path(tmpdir) / 'styles.css',
+                include_write_proof=True,
+                preservation_status='passed',
+            )
+
+            review = self.owner.build_graph_closure_review(
+                payload['output_text'],
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': 'Update styles.css and keep the rest intact.',
+                },
+                artifact_payload=payload,
+            )
+
+        check = next(
+            item for item in review['checks']
+            if item.get('branch_id') == branch_id
+        )
+        self.assertEqual(review['status'], 'fulfilled')
+        self.assertEqual(check['status'], 'fulfilled')
+        self.assertEqual(check['evidence'], 'text_artifact_revision_write_proven')
+        closure_evidence = check['text_artifact_revision_closure_evidence']
+        self.assertEqual(closure_evidence['status'], 'passed')
+        self.assertTrue(closure_evidence['write_proven'])
+        self.assertTrue(closure_evidence['preservation_passed'])
+        self.assertEqual(
+            closure_evidence['actual_output_sha256'],
+            hashlib.sha256(content.encode('utf-8')).hexdigest(),
         )
 
 

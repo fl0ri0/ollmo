@@ -6,9 +6,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from helpers.model_capabilities import CAPABILITY_EMBEDDING
+from ollmo_g.text_artifact_revision_intent import classify_named_text_revision_intent
 from ollmo_services.responses import extract_canonical_predecessor_image_prompts
 
 _TEMPORARY_QUARANTINED_MODEL_MARKERS: tuple[str, ...] = (
@@ -38,6 +40,14 @@ _CURRENT_PREDECESSOR_PAGE_BINDING_RE = re.compile(
     r'einf(?:u|ü)g(?:e|en|t)?|aktualisier(?:e|en|t)?|reparier(?:e|en|t)?)\b',
     re.IGNORECASE,
 )
+_CURRENT_PREDECESSOR_TEXT_ARTIFACT_TYPES = {'text', 'document', 'file'}
+_CURRENT_PREDECESSOR_NAMED_TEXT_EDIT_ORIGIN = 'current_predecessor_named_text_edit'
+
+
+def _explicit_current_turn_named_text_edit_targets(prompt: str) -> list[str]:
+    """Return ordered filenames explicitly governed by a current-turn edit action."""
+    intent = classify_named_text_revision_intent(prompt)
+    return [str(item) for item in intent.get('named_targets') or [] if str(item)]
 
 
 @dataclass
@@ -343,15 +353,237 @@ class RequestIntakeRuntimeOwner:
             }
         return None
 
+    @staticmethod
+    def _canonical_artifact_path(record: dict[str, Any]) -> str:
+        return str(record.get('path') or record.get('source_path') or '').strip()
+
+    @staticmethod
+    def _canonical_text_artifact_extension(record: dict[str, Any]) -> str:
+        request_payload = (
+            record.get('artifact_request')
+            if isinstance(record.get('artifact_request'), dict)
+            else record.get('text_artifact_request')
+            if isinstance(record.get('text_artifact_request'), dict)
+            else {}
+        )
+        path = RequestIntakeRuntimeOwner._canonical_artifact_path(record)
+        for value in (
+            record.get('text_artifact_extension'),
+            record.get('extension'),
+            request_payload.get('extension'),
+            Path(path).suffix.lstrip('.') if path else '',
+            Path(str(record.get('name') or '')).suffix.lstrip('.'),
+        ):
+            extension = str(value or '').strip().lower().lstrip('.')
+            if extension:
+                return extension
+        return ''
+
+    @staticmethod
+    def _normalized_text_artifact_source_name(value: Any) -> str:
+        token = str(value or '').strip()
+        if not token:
+            return ''
+        name = Path(token).name
+        if Path(name).suffix:
+            name = Path(name).stem
+        return re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+
+    @classmethod
+    def _canonical_artifact_matches_named_text_target(
+        cls,
+        record: dict[str, Any],
+        filename: str,
+    ) -> bool:
+        artifact_kind = str(record.get('type') or record.get('kind') or '').strip().lower()
+        if artifact_kind not in _CURRENT_PREDECESSOR_TEXT_ARTIFACT_TYPES:
+            return False
+        expected_extension = Path(filename).suffix.lstrip('.').lower()
+        if not expected_extension or cls._canonical_text_artifact_extension(record) != expected_extension:
+            return False
+        expected_source_name = cls._normalized_text_artifact_source_name(filename)
+        request_payload = (
+            record.get('artifact_request')
+            if isinstance(record.get('artifact_request'), dict)
+            else record.get('text_artifact_request')
+            if isinstance(record.get('text_artifact_request'), dict)
+            else {}
+        )
+        explicit_names = {
+            cls._normalized_text_artifact_source_name(value)
+            for value in (
+                record.get('text_artifact_source_name'),
+                record.get('source_name'),
+                request_payload.get('source_name'),
+                record.get('name'),
+            )
+            if str(value or '').strip()
+        }
+        if explicit_names:
+            return any(
+                name == expected_source_name or name.endswith(f'-{expected_source_name}')
+                for name in explicit_names
+            )
+        path_name = cls._normalized_text_artifact_source_name(cls._canonical_artifact_path(record))
+        return bool(
+            path_name == expected_source_name
+            or path_name.endswith(f'-{expected_source_name}')
+        )
+
+    def _canonical_named_text_edit_artifacts(
+        self,
+        canonical_artifacts: list[dict[str, Any]],
+        filenames: list[str],
+    ) -> Optional[list[tuple[str, dict[str, Any]]]]:
+        resolve_saved_path = self.hooks.get('resolve_saved_downloadable_artifact_path')
+        concrete_artifacts: list[dict[str, Any]] = []
+        for item in canonical_artifacts:
+            path = self._canonical_artifact_path(item)
+            if not path:
+                continue
+            resolved_path: Any = path
+            if callable(resolve_saved_path):
+                try:
+                    resolved_path = resolve_saved_path(path)
+                except Exception:  # noqa: BLE001 - canonical source resolution fails closed
+                    resolved_path = None
+            if not resolved_path:
+                continue
+            record = dict(item)
+            record['path'] = str(resolved_path)
+            concrete_artifacts.append(record)
+
+        matched: list[tuple[str, dict[str, Any]]] = []
+        matched_paths: set[str] = set()
+        for filename in filenames:
+            candidates_by_path: dict[str, dict[str, Any]] = {}
+            for artifact in concrete_artifacts:
+                if not self._canonical_artifact_matches_named_text_target(artifact, filename):
+                    continue
+                path = self._canonical_artifact_path(artifact)
+                if path:
+                    candidates_by_path.setdefault(path, artifact)
+            if len(candidates_by_path) != 1:
+                return None
+            path, artifact = next(iter(candidates_by_path.items()))
+            if path in matched_paths:
+                return None
+            matched_paths.add(path)
+            matched.append((filename, artifact))
+        return matched
+
+    def _canonical_carried_predecessor_dependencies(
+        self,
+        canonical_artifacts: list[dict[str, Any]],
+        *,
+        excluded_paths: set[str],
+        source_response_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return immutable public predecessor files needed by a follow-up bundle."""
+
+        resolve_saved_path = self.hooks.get(
+            'resolve_saved_downloadable_artifact_path'
+        )
+        normalized_excluded_paths = {
+            str(Path(path).expanduser().resolve(strict=False))
+            for path in excluded_paths
+            if str(path or '').strip()
+        }
+        carried_reversed: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        seen_named_text_identities: set[tuple[str, str]] = set()
+        for item in reversed(canonical_artifacts):
+            path = self._canonical_artifact_path(item)
+            if not path:
+                continue
+            resolved_path: Any = path
+            if callable(resolve_saved_path):
+                try:
+                    resolved_path = resolve_saved_path(path)
+                except Exception:  # noqa: BLE001 - canonical dependency resolution fails closed
+                    resolved_path = None
+            if not resolved_path:
+                continue
+            try:
+                normalized_path = str(
+                    Path(str(resolved_path)).expanduser().resolve(strict=False)
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if (
+                normalized_path in normalized_excluded_paths
+                or normalized_path in seen_paths
+            ):
+                continue
+            artifact_type = str(
+                item.get('type') or item.get('kind') or ''
+            ).strip().lower()
+            if artifact_type not in {
+                'audio',
+                'document',
+                'file',
+                'image',
+                'text',
+            }:
+                continue
+            extension = str(
+                item.get('text_artifact_extension')
+                or Path(normalized_path).suffix.lstrip('.')
+                or ''
+            ).strip().lower()
+            source_name = str(
+                item.get('text_artifact_source_name')
+                or item.get('name')
+                or Path(normalized_path).stem
+                or ''
+            ).strip().lower()
+            if artifact_type in {'document', 'text'} and extension and source_name:
+                identity = (extension, source_name)
+                if identity in seen_named_text_identities:
+                    continue
+                seen_named_text_identities.add(identity)
+            seen_paths.add(normalized_path)
+            carried_reversed.append(
+                {
+                    key: value
+                    for key, value in {
+                        'type': artifact_type,
+                        'kind': artifact_type,
+                        'artifact_ref': str(
+                            item.get('artifact_ref') or item.get('ref') or ''
+                        ).strip()
+                        or None,
+                        'ref': str(
+                            item.get('artifact_ref') or item.get('ref') or ''
+                        ).strip()
+                        or None,
+                        'path': normalized_path,
+                        'source_path': normalized_path,
+                        'name': str(item.get('name') or '').strip() or None,
+                        'mime_type': str(item.get('mime_type') or '').strip()
+                        or None,
+                        'source_response_id': source_response_id,
+                        'origin': 'canonical_predecessor_bundle_dependency',
+                        'carried_public_dependency': True,
+                    }.items()
+                    if value not in (None, '')
+                }
+            )
+            if len(carried_reversed) >= 64:
+                break
+        return list(reversed(carried_reversed))
+
     def promote_current_predecessor_context(self, data: Any) -> dict[str, Any]:
         """Bind a selected same-conversation predecessor to canonical repair evidence."""
 
         payload = dict(data) if isinstance(data, dict) else dict(data or {})
         prompt = str(payload.get('prompt') or '').strip()
-        if not (
+        named_text_edit_targets = _explicit_current_turn_named_text_edit_targets(prompt)
+        legacy_image_site_recovery = bool(
             _CURRENT_PREDECESSOR_IMAGE_MATERIALIZATION_RE.search(prompt)
             and _CURRENT_PREDECESSOR_PAGE_BINDING_RE.search(prompt)
-        ):
+        )
+        if not named_text_edit_targets and not legacy_image_site_recovery:
             return payload
 
         raw_references = self._parse_jsonish_field(
@@ -430,9 +662,15 @@ class RequestIntakeRuntimeOwner:
             or predecessor_request.get('conversationId')
             or ''
         ).strip()
+        history_message_id = str(
+            (history_entry or {}).get('message_id')
+            or (history_entry or {}).get('messageId')
+            or ''
+        ).strip()
         predecessor_message_id = str(
             predecessor_record.get('message_id')
             or predecessor_payload.get('message_id')
+            or history_message_id
             or ''
         ).strip()
         predecessor_lifecycle = str(
@@ -443,31 +681,30 @@ class RequestIntakeRuntimeOwner:
         ).strip().lower()
         if (
             str(predecessor_record.get('id') or '').strip() != source_response_id
-            or predecessor_conversation_id != conversation_id
+            or (
+                predecessor_conversation_id
+                and predecessor_conversation_id != conversation_id
+            )
             or not predecessor_message_id
             or predecessor_lifecycle not in {'completed', 'repair_needed'}
         ):
             return payload
 
-        batch_prompts = extract_canonical_predecessor_image_prompts(predecessor_payload)
-        extract_batch_image_prompts = self.hooks.get('extract_batch_image_prompts')
-        if not batch_prompts and callable(extract_batch_image_prompts):
-            predecessor_late_fill = (
-                predecessor_payload.get('late_fill')
-                if isinstance(predecessor_payload.get('late_fill'), dict)
-                else {}
-            )
-            prepared_content = str(
-                predecessor_late_fill.get('content_payload')
-                or predecessor_payload.get('content_payload')
+        predecessor_conversation_authority = (
+            'response_frame_request'
+            if predecessor_conversation_id
+            else 'current_conversation_history_mapping'
+        )
+        predecessor_message_authority = (
+            'canonical_response_record'
+            if str(
+                predecessor_record.get('message_id')
+                or predecessor_payload.get('message_id')
                 or ''
             ).strip()
-            if prepared_content:
-                batch_prompts = extract_batch_image_prompts(
-                    prepared_content,
-                    expected_count=0,
-                    allow_plain_alpha_sequence=False,
-                )
+            else 'current_conversation_history_mapping'
+        )
+
         canonical_artifacts = [
             dict(item)
             for item in predecessor_payload.get('artifacts') or []
@@ -478,11 +715,49 @@ class RequestIntakeRuntimeOwner:
             item
             for item in canonical_artifacts
             if str(item.get('type') or item.get('kind') or '').strip().lower()
-            in {'text', 'document', 'file'}
+            in _CURRENT_PREDECESSOR_TEXT_ARTIFACT_TYPES
         ]
         predecessor_text = str(predecessor_payload.get('output_text') or '').strip()
-        if not predecessor_text or not batch_prompts or not text_artifacts:
+        if not predecessor_text:
             return payload
+
+        promotion_mode = 'legacy_image_site_recovery'
+        batch_prompts: list[str] = []
+        named_text_matches: list[tuple[str, dict[str, Any]]] = []
+        artifacts_for_promotion = canonical_artifacts
+        if named_text_edit_targets:
+            matched = self._canonical_named_text_edit_artifacts(
+                canonical_artifacts,
+                named_text_edit_targets,
+            )
+            if not matched:
+                return payload
+            named_text_matches = matched
+            artifacts_for_promotion = [dict(artifact) for _filename, artifact in matched]
+            text_artifacts = artifacts_for_promotion
+            promotion_mode = 'named_text_edit'
+        else:
+            batch_prompts = extract_canonical_predecessor_image_prompts(predecessor_payload)
+            extract_batch_image_prompts = self.hooks.get('extract_batch_image_prompts')
+            if not batch_prompts and callable(extract_batch_image_prompts):
+                predecessor_late_fill = (
+                    predecessor_payload.get('late_fill')
+                    if isinstance(predecessor_payload.get('late_fill'), dict)
+                    else {}
+                )
+                prepared_content = str(
+                    predecessor_late_fill.get('content_payload')
+                    or predecessor_payload.get('content_payload')
+                    or ''
+                ).strip()
+                if prepared_content:
+                    batch_prompts = extract_batch_image_prompts(
+                        prepared_content,
+                        expected_count=0,
+                        allow_plain_alpha_sequence=False,
+                    )
+            if not batch_prompts or not text_artifacts:
+                return payload
 
         message_reference = {
             'type': 'message',
@@ -495,11 +770,39 @@ class RequestIntakeRuntimeOwner:
             'origin': 'conversation_reference',
         }
         artifact_references: list[dict[str, Any]] = []
-        for artifact in canonical_artifacts:
+        matched_text_artifacts: list[dict[str, Any]] = []
+        for index, artifact in enumerate(artifacts_for_promotion, start=1):
             reference = dict(artifact)
             reference['source_message_id'] = predecessor_message_id
             reference['source_response_id'] = source_response_id
-            reference.setdefault('origin', 'conversation_reference')
+            if promotion_mode == 'named_text_edit':
+                filename = named_text_matches[index - 1][0]
+                extension = Path(filename).suffix.lstrip('.').lower()
+                source_name = Path(filename).stem
+                reference['type'] = 'text'
+                reference['kind'] = 'text'
+                reference['name'] = filename
+                reference['text_artifact_source_name'] = source_name
+                reference['text_artifact_extension'] = extension
+                reference['artifact_request'] = {
+                    'source_name': source_name,
+                    'extension': extension,
+                }
+                reference['origin'] = _CURRENT_PREDECESSOR_NAMED_TEXT_EDIT_ORIGIN
+                reference['batch_index'] = index
+                matched_text_artifacts.append(
+                    {
+                        'filename': filename,
+                        'artifact_ref': str(
+                            reference.get('artifact_ref')
+                            or reference.get('ref')
+                            or ''
+                        ).strip(),
+                        'path': self._canonical_artifact_path(reference),
+                    }
+                )
+            else:
+                reference.setdefault('origin', 'conversation_reference')
             artifact_references.append(reference)
         promoted_references = [message_reference, *artifact_references]
         payload['reference_artifacts'] = promoted_references
@@ -526,9 +829,13 @@ class RequestIntakeRuntimeOwner:
             'kind': 'ollmo.current_predecessor_context',
             'status': 'authorized',
             'authorization': 'canonical_same_conversation_predecessor',
+            'promotion_mode': promotion_mode,
+            'current_prompt_authority': 'payload.prompt',
             'source_response_id': source_response_id,
             'source_message_id': predecessor_message_id,
             'selected_message_id': message_id,
+            'predecessor_conversation_authority': predecessor_conversation_authority,
+            'predecessor_message_authority': predecessor_message_authority,
             'batch_prompts': batch_prompts,
             'text_artifact_refs': [
                 str(item.get('artifact_ref') or item.get('ref') or '').strip()
@@ -536,6 +843,24 @@ class RequestIntakeRuntimeOwner:
                 if str(item.get('artifact_ref') or item.get('ref') or '').strip()
             ],
         }
+        if matched_text_artifacts:
+            payload['current_predecessor_context']['requested_text_artifact_names'] = list(
+                named_text_edit_targets
+            )
+            payload['current_predecessor_context']['matched_text_artifacts'] = matched_text_artifacts
+            carried_dependencies = self._canonical_carried_predecessor_dependencies(
+                canonical_artifacts,
+                excluded_paths={
+                    str(item.get('path') or '').strip()
+                    for item in matched_text_artifacts
+                    if str(item.get('path') or '').strip()
+                },
+                source_response_id=source_response_id,
+            )
+            if carried_dependencies:
+                payload['current_predecessor_context'][
+                    'carried_public_dependencies'
+                ] = carried_dependencies
         return payload
 
     def _sanitize_selected_reference_artifact(
@@ -585,6 +910,8 @@ class RequestIntakeRuntimeOwner:
             for source_key, target_key in (
                 ('message_id', 'message_id'),
                 ('messageId', 'message_id'),
+                ('source_response_id', 'source_response_id'),
+                ('sourceResponseId', 'source_response_id'),
                 ('response_model', 'response_model'),
                 ('responseModel', 'response_model'),
                 ('response_instance_id', 'response_instance_id'),
@@ -602,7 +929,9 @@ class RequestIntakeRuntimeOwner:
                 default_origin='conversation_reference',
                 include_content=True,
             )
-        raw_path = str(raw_value.get('path') or '').strip()
+        raw_path = str(raw_value.get('path') or raw_value.get('source_path') or '').strip()
+        if artifact_type == 'file':
+            artifact_type = 'text'
         if artifact_type not in {'image', 'audio', 'text', 'document'} or not raw_path:
             return None
         resolved = resolve_saved_downloadable_artifact_path(raw_path)
@@ -618,6 +947,13 @@ class RequestIntakeRuntimeOwner:
         message_id = str(raw_value.get('message_id') or raw_value.get('messageId') or '').strip()
         if message_id:
             payload['source_message_id'] = message_id
+        source_response_id = str(
+            raw_value.get('source_response_id')
+            or raw_value.get('sourceResponseId')
+            or ''
+        ).strip()
+        if source_response_id:
+            payload['source_response_id'] = source_response_id
         name = str(raw_value.get('name') or '').strip()
         if name:
             payload['name'] = name
@@ -644,6 +980,14 @@ class RequestIntakeRuntimeOwner:
                 parsed_seed = None
             if parsed_seed is not None and parsed_seed >= 0:
                 payload['seed'] = parsed_seed
+        batch_index = raw_value.get('batch_index')
+        if isinstance(batch_index, (int, float, str)):
+            try:
+                parsed_batch_index = int(str(batch_index).strip())
+            except (TypeError, ValueError):
+                parsed_batch_index = None
+            if parsed_batch_index is not None and parsed_batch_index > 0:
+                payload['batch_index'] = parsed_batch_index
         image_state = raw_value.get('image_state')
         if artifact_type == 'image':
             if isinstance(image_state, dict) and image_state:
@@ -666,14 +1010,105 @@ class RequestIntakeRuntimeOwner:
         raw_items = raw_value if isinstance(raw_value, list) else [raw_value]
         message_reference: Optional[dict[str, Any]] = None
         artifact_reference: Optional[dict[str, Any]] = None
+        bounded_artifact_references: list[dict[str, Any]] = []
+        context = (
+            payload_source.get('current_predecessor_context')
+            if isinstance(payload_source, dict)
+            and isinstance(payload_source.get('current_predecessor_context'), dict)
+            else {}
+        )
+        bounded_entries = (
+            [dict(item) for item in context.get('matched_text_artifacts') or [] if isinstance(item, dict)]
+            if (
+                context.get('status') == 'authorized'
+                and context.get('authorization') == 'canonical_same_conversation_predecessor'
+                and context.get('promotion_mode') == 'named_text_edit'
+            )
+            else []
+        )
+        expected_source_response_id = str(context.get('source_response_id') or '').strip()
+
+        def reference_matches_entry(reference: dict[str, Any], entry: dict[str, Any]) -> bool:
+            entry_ref = str(entry.get('artifact_ref') or '').strip()
+            entry_path = str(entry.get('path') or '').strip()
+            reference_ref = str(reference.get('artifact_ref') or reference.get('ref') or '').strip()
+            reference_path = str(reference.get('path') or reference.get('source_path') or '').strip()
+            return bool(
+                (entry_ref and reference_ref == entry_ref)
+                or (entry_path and reference_path == entry_path)
+            )
+
         for item in raw_items:
             normalized = self._sanitize_selected_reference_artifact(item, payload_source=payload_source)
             if not normalized:
                 continue
             if str(normalized.get('type') or '').strip().lower() == 'message':
                 message_reference = normalized
-            else:
-                artifact_reference = normalized
+                continue
+            if bounded_entries:
+                source_response_id = str(normalized.get('source_response_id') or '').strip()
+                if (
+                    expected_source_response_id
+                    and source_response_id != expected_source_response_id
+                ):
+                    continue
+                if any(reference_matches_entry(normalized, entry) for entry in bounded_entries):
+                    bounded_artifact_references.append(normalized)
+                continue
+            if (
+                payload_source is None
+                and str(normalized.get('origin') or '').strip().lower()
+                == _CURRENT_PREDECESSOR_NAMED_TEXT_EDIT_ORIGIN
+            ):
+                bounded_artifact_references.append(normalized)
+                continue
+            artifact_reference = normalized
+
+        if bounded_entries:
+            ordered_bounded: list[dict[str, Any]] = []
+            seen_identities: set[tuple[str, str]] = set()
+            for entry in bounded_entries:
+                candidates = [
+                    reference
+                    for reference in bounded_artifact_references
+                    if reference_matches_entry(reference, entry)
+                ]
+                unique_candidates: list[dict[str, Any]] = []
+                for candidate in candidates:
+                    identity = (
+                        str(candidate.get('artifact_ref') or candidate.get('ref') or '').strip(),
+                        str(candidate.get('path') or candidate.get('source_path') or '').strip(),
+                    )
+                    if identity in seen_identities:
+                        continue
+                    seen_identities.add(identity)
+                    unique_candidates.append(candidate)
+                if len(unique_candidates) != 1:
+                    return [message_reference] if isinstance(message_reference, dict) else []
+                ordered_bounded.append(unique_candidates[0])
+            return [
+                item
+                for item in (message_reference, *ordered_bounded)
+                if isinstance(item, dict)
+            ]
+
+        if payload_source is None and bounded_artifact_references:
+            unique_bounded: list[dict[str, Any]] = []
+            seen_bounded: set[tuple[str, str]] = set()
+            for reference in bounded_artifact_references:
+                identity = (
+                    str(reference.get('artifact_ref') or reference.get('ref') or '').strip(),
+                    str(reference.get('path') or reference.get('source_path') or '').strip(),
+                )
+                if identity in seen_bounded:
+                    continue
+                seen_bounded.add(identity)
+                unique_bounded.append(reference)
+            return [
+                item
+                for item in (message_reference, *unique_bounded)
+                if isinstance(item, dict)
+            ]
         return [item for item in (message_reference, artifact_reference) if isinstance(item, dict)]
 
     def _extract_selected_reference_artifacts(self, data: Any) -> list[dict[str, Any]]:

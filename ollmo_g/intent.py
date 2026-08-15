@@ -12,6 +12,7 @@ from helpers.model_capabilities import (
     CAPABILITY_TEXT_TO_SPEECH,
     CAPABILITY_VISION_ANALYSIS,
 )
+from ollmo_g.text_artifact_revision_intent import classify_named_text_revision_intent
 from ollmo_services.tts_source import resolve_explicit_tts_source
 
 _INTENT_PROMPT_NORMALIZATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -825,12 +826,46 @@ _META_EXPLANATION_OPENING_RE = re.compile(
     r')\b',
     re.IGNORECASE,
 )
+_META_CAPABILITY_EXPLANATION_OPENING_RE = re.compile(
+    r'^\s*(?:(?:can|could|would)\s+you\s+|please\s+)?(?:'
+    r'explain|walk\s+me\s+through|tell\s+me\s+(?:about|how)|what\s+is|'
+    r'how\s+(?:does|do|would|can)|why\s+(?:does|do|would|can)|discuss|'
+    r'erkl[aä]r(?:e|\s+mir)?|f[uü]hr(?:e)?\s+mich\s+durch|'
+    r'sag(?:e)?\s+mir\s+(?:etwas\s+über|wie)|was\s+ist|'
+    r'wie\s+(?:funktioniert|funktionieren|würde|wuerde|kann)|'
+    r'warum\s+(?:funktioniert|funktionieren|würde|wuerde|kann)|erl[aä]uter(?:e)?'
+    r')\b',
+    re.IGNORECASE,
+)
 _META_PROCESS_HINT_RE = re.compile(
     r'\b(?:'
     r'runtime|architektur|architecture|ablauf|flow|workflow|prozess|process|'
     r'phase graph|request lifecycle|lifecycle|how (?:it|you) works|wie du funktionierst|'
     r'funktioniert|freeze|late fill|planner|truth|begriff(?:e)?|term(?:s)?'
     r')\b',
+    re.IGNORECASE,
+)
+_META_CAPABILITY_DISCUSSION_RE = re.compile(
+    r'\b(?:image|visual|audio|speech|voice|text[\s-]?to[\s-]?speech|'
+    r'speech[\s-]?to[\s-]?text|html|css|json|bild|audio|sprach)'
+    r'[\s-]*(?:generation|synthesis|creation|routing|materialization|materialisation|'
+    r'pipeline|workflow|artifact(?:s)?|artefact(?:s)?|erzeugung|generierung|'
+    r'synthese|routing|materialisierung|artefakt(?:e|en)?)\b|'
+    r'\b(?:how\s+to|why\s+(?:would|should|does)|wie\s+man|warum\s+(?:sollte|würde|wuerde))\b'
+    r'[^.!?\n]{0,80}\b(?:create|generate|make|render|build|save|materiali[sz]e|'
+    r'erstell(?:e|en)?|erzeug(?:e|en)?|generier(?:e|en)?|speicher(?:e|n)?|materialisier(?:e|en)?)\b'
+    r'[^.!?\n]{0,80}\b(?:image|audio|file|artifact|artefact|html|css|json|'
+    r'bild|datei|artefakt)\b',
+    re.IGNORECASE,
+)
+_META_FOLLOW_UP_MATERIALIZATION_RE = re.compile(
+    r'\b(?:and(?:\s+then)?|then|next|also|finally|afterwards|afterward|plus|'
+    r'und(?:\s+dann)?|dann|danach|anschlie(?:ß|ss)end|zus[aä]tzlich)\b'
+    r'[^.;!?\n]{0,80}\b(?:create|generate|make|produce|render|build|save|materiali[sz]e|'
+    r'erstell(?:e|en)?|erzeug(?:e|en)?|generier(?:e|en)?|mach(?:e|en)?|'
+    r'render(?:e|n)?|bau(?:e|en)?|speicher(?:e|n)?|materialisier(?:e|en)?)\b'
+    r'[^.;!?\n]{0,80}\b(?:image|audio|file|artifact|artefact|html|css|json|'
+    r'bild|datei|artefakt)\b',
     re.IGNORECASE,
 )
 _META_EXAMPLE_HINT_RE = re.compile(
@@ -1673,9 +1708,16 @@ def _is_meta_execution_explanation_request(prompt: str, normalized_prompt: str) 
     normalized = str(normalized_prompt or '').strip()
     if not raw_prompt or not normalized:
         return False
-    if not _META_EXPLANATION_OPENING_RE.search(normalized):
+    standard_opening = bool(_META_EXPLANATION_OPENING_RE.search(normalized))
+    capability_opening = bool(
+        _META_CAPABILITY_EXPLANATION_OPENING_RE.search(normalized)
+    )
+    if not standard_opening and not capability_opening:
         return False
-    if not _META_PROCESS_HINT_RE.search(normalized):
+    capability_discussion = bool(_META_CAPABILITY_DISCUSSION_RE.search(normalized))
+    if capability_opening and capability_discussion:
+        return not bool(_META_FOLLOW_UP_MATERIALIZATION_RE.search(normalized))
+    if not standard_opening or not _META_PROCESS_HINT_RE.search(normalized):
         return False
     has_example_hint = bool(_META_EXAMPLE_HINT_RE.search(normalized))
     has_quoted_example = bool(_META_EXAMPLE_QUOTE_RE.search(raw_prompt))
@@ -1768,6 +1810,12 @@ def _is_text_revision_turn(
     normalized = str(normalized_prompt or '').strip()
     if not raw_prompt or not normalized or direct_audio_materialization_request:
         return False
+    named_revision_intent = classify_named_text_revision_intent(raw_prompt)
+    if (
+        named_revision_intent.get('mutation_requested') is True
+        and bool(named_revision_intent.get('named_targets'))
+    ):
+        return True
     has_revision_action = bool(_TEXT_REVISION_ACTION_RE.search(normalized))
     has_output_constraint = bool(_TEXT_REVISION_OUTPUT_RE.search(normalized))
     has_text_target = bool(_TEXT_REVISION_TARGET_RE.search(normalized))
@@ -2113,6 +2161,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         and not explicit_audio_defer_materialization
     ):
         explicit_defer_materialization = False
+    named_text_revision_intent = classify_named_text_revision_intent(raw_command_text)
     text_revision_turn = _is_text_revision_turn(
         raw_command_text,
         command_text,
@@ -2308,6 +2357,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
             visual_analysis_execution_suppressed_by_preservation
         ),
         'text_revision_turn': text_revision_turn,
+        'named_text_revision_intent': named_text_revision_intent,
         'requests_audio_output': requests_audio_output,
         'requests_visual_output': requests_visual_output,
         'requests_speech_to_text_output': requests_speech_to_text_output,

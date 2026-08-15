@@ -458,6 +458,7 @@ _REQUEST_FRAME_KEYS = (
     'batch_prompts',
     'ghost_route',
     'ghost_preview',
+    'current_predecessor_context',
     'request_meta',
     'reference_artifacts',
     'selected_reference_artifacts',

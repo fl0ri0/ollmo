@@ -181,6 +181,15 @@ and capability orientation directly from Ollmo. If Ghost then resolves an
 already-shaped branch to an external ChatGPT/Codex target, that target call is
 downstream execution and does receive the marker.
 
+The selected external target may remain eligible for later graph-owned
+`chat` branches (for example review or text-artifact materialization) when it
+is still selectable and is not explicitly excluded by recovery truth. This is
+provider continuity, not admission to the generic local candidate pool:
+image, audio, vision, speech, and other non-chat branches never use it. Ollmo
+still performs every file write, syntax/integrity check, Closure decision, and
+publication step; an external `BLOCKED:` result is recorded before any
+materialization attempt.
+
 ---
 
 ### 4. Runtime / substrate (truth knob)

@@ -23,6 +23,7 @@ from ollmo_core.inference import (
     detect_text_artifact_requests,
     text_artifact_request_is_ungrounded_reference,
 )
+from ollmo_core.transports import TEXT_ARTIFACT_EXTENSIONS
 from ollmo_g.execution_planner import (
     plan_compound_execution,
     split_visible_image_payload,
@@ -758,6 +759,11 @@ _ARTIFACT_SECTION_HEADING_RE = re.compile(
     r'(?i)^\s*(?:[-*#>\u2022]+\s*)?(?:\*\*+|__+|\*)?\s*'
     r'(?:artifact|artefakt)\s*(?:\d+|[ivx]+)?\s*:\s*\S.*$'
 )
+_NUMBERED_ARTIFACT_SECTION_HEADING_RE = re.compile(
+    r'(?i)^\s*(?:[-*#>\u2022]+\s*)?(?:\*\*+|__+|\*)?\s*'
+    r'(?:artifact|artefakt)\s*(?P<index>\d+|[ivx]+)\s*:\s*'
+    r'(?P<title>\S.*?)\s*(?:\*\*+|__+|\*)?\s*$'
+)
 _EMBEDDED_LABELED_IMAGE_PROMPT_RE = re.compile(
     r'(?ims)(?:^|[\r\n])\s*(?:[-*#>\u2022]+\s*)?(?:\*\*+|__+|\*)?\s*'
     r'(?:visual\s+prompt|image\s+prompt|bild[-\s]?prompt|prompt)'
@@ -790,6 +796,13 @@ _NUMBERED_PREPARED_IMAGE_PROMPT_RE = re.compile(
     r'(?ms)(?:^|\n)\s*(?:\d{1,2}|[ivx]+)[.)]\s+'
     r'(?P<body>.*?)(?=(?:\n\s*(?:\d{1,2}|[ivx]+)[.)]\s+)|\Z)'
 )
+_NAMED_TEXT_ARTIFACT_FILENAME_RE = re.compile(
+    r'(?<![A-Za-z0-9._-])'
+    r'[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(?:'
+    + '|'.join(sorted(TEXT_ARTIFACT_EXTENSIONS, key=len, reverse=True))
+    + r')(?![A-Za-z0-9_-])',
+    re.IGNORECASE,
+)
 _NUMBERED_IMAGE_PROMPT_SEGMENT_PATTERNS = (
     r'(?ms)(?:^|\n)\s*\d+[.)]\s*(?P<body>.*?)(?=(?:\n\s*\d+[.)]\s*)|\Z)',
     r'(?ms)(?:^|\s)\d+[.)]\s*(?P<body>.*?)(?=(?:\s+\d+[.)]\s+)|\Z)',
@@ -799,6 +812,14 @@ _NUMBERED_PREPARED_IMAGE_SIGNAL_RE = re.compile(
     r'image|bild|photo|photograph|photography|foto|selfie|portrait|macro|'
     r'cinematic|camera|lens|lighting|render|illustration|poster|scene|shot|'
     r'close[-\s]?up|wide[-\s]?angle|hyper[-\s]?realistic'
+    r')\b',
+    re.IGNORECASE,
+)
+_PARAGRAPH_IMAGE_PROMPT_STRONG_SIGNAL_RE = re.compile(
+    r'\b(?:'
+    r'photo|photograph|photography|foto|selfie|portrait|macro|cinematic|camera|'
+    r'lens|lighting|render|illustration|painting|poster|scene|shot|close[-\s]?up|'
+    r'wide[-\s]?angle|hyper[-\s]?realistic|bokeh|depth\s+of\s+field'
     r')\b',
     re.IGNORECASE,
 )
@@ -962,6 +983,8 @@ _DETERMINISTIC_REVIEW_CRITERIA = {
     'runtime_status_reaches_fulfilled_blocked_failed_waived_or_pending',
     'runtime_status_reaches_fulfilled_blocked_failed_waived_superseded_or_pending',
     'runtime_text_artifact_exists_when_fulfilled',
+    'runtime_text_artifact_revision_preservation_passed_when_required',
+    'runtime_text_artifact_revision_write_proven_when_fulfilled',
     'runtime_text_exists_when_fulfilled',
     'uses_dependency_evidence',
 }
@@ -1282,6 +1305,16 @@ _DEICTIC_SOURCE_TRANSFORM_ACTION_RE = re.compile(
     r'visuali[sz]e|render|use|using|zeig(?:e|en|st|t)?|darstell(?:e|en|st|t)?|'
     r'visualisier(?:e|en|st|t)?|'
     r'nutz(?:e|en|t)?|verwend(?:e|en|et)?|wandle|verwandle|erstelle|erzeuge)\b'
+)
+_COORDINATED_DEICTIC_FOLLOW_UP_ACTION_RE = re.compile(
+    r'(?is)(?:'
+    r'[,;]\s*|'
+    r'(?:[,;]\s*)?\b(?:and|then|next|und|sowie|dann|danach|anschließend|anschliessend)\b'
+    r'[\s,:-]{0,24}'
+    r')(?=(?:mach(?:e|en)?|make|create|generate|turn|convert|transform|show|display|'
+    r'visuali[sz]e|render|use|using|zeig(?:e|en|st|t)?|darstell(?:e|en|st|t)?|'
+    r'visualisier(?:e|en|st|t)?|nutz(?:e|en|t)?|verwend(?:e|en|et)?|wandle|verwandle|'
+    r'erstelle|erzeuge)\b)'
 )
 _RELATIVE_ARTIFACT_CONTENT_NOUN_RE = re.compile(
     r'(?i)\b(?:audio|speech|voice|recording|image|picture|photo|illustration|'
@@ -3557,6 +3590,45 @@ def _transform_match_binds_direct_tts_source(
     )
 
 
+def _transform_match_targets_artifact_in_own_action(
+    prompt_text: str,
+    transform_match: re.Match[str],
+) -> bool:
+    """Bind an artifact target to this deictic action, not the whole request."""
+
+    _, reference_start, reference_end = _deictic_transform_reference(
+        prompt_text,
+        transform_match,
+    )
+    preceding_actions = list(
+        _DEICTIC_SOURCE_TRANSFORM_ACTION_RE.finditer(
+            prompt_text,
+            transform_match.start(),
+            reference_start,
+        )
+    )
+    action_start = (
+        preceding_actions[-1].start()
+        if preceding_actions
+        else transform_match.start()
+    )
+    action_end = _sentence_clause_end(prompt_text, reference_end)
+    follow_up = _COORDINATED_DEICTIC_FOLLOW_UP_ACTION_RE.search(
+        prompt_text,
+        reference_end,
+        action_end,
+    )
+    if follow_up is not None:
+        action_end = follow_up.start()
+    return bool(
+        _SOURCE_TRANSFORM_ARTIFACT_TARGET_RE.search(
+            prompt_text,
+            action_start,
+            action_end,
+        )
+    )
+
+
 def _prompt_declares_graph_grounded_artifact_source_before_transform(
     prompt_text: str,
     transform_match: re.Match[str],
@@ -3586,6 +3658,123 @@ def _prompt_declares_graph_grounded_artifact_source_before_transform(
     return False
 
 
+def _prompt_binds_graph_prepared_text_artifact_before_transform(
+    prompt_text: str,
+    transform_match: re.Match[str],
+    *,
+    route_payload: Optional[Mapping[str, Any]],
+) -> bool:
+    """Bind a bare pronoun to a named text artifact created in this graph."""
+
+    reference_match, reference_start, _ = _deictic_transform_reference(
+        prompt_text,
+        transform_match,
+    )
+    reference = re.sub(
+        r'\s+',
+        ' ',
+        str(reference_match.group(0) if reference_match else '').strip().lower(),
+    )
+    if reference not in {'it', 'them', 'es', 'sie'}:
+        return False
+
+    phase_graph = _phase_graph_from_runtime_payload(route_payload)
+    if not current_phase_is_graph_resolved(phase_graph):
+        return False
+    current_phase_id = str(phase_graph.get('current_phase_id') or '').strip()
+    phases = [
+        dict(item)
+        for item in (phase_graph.get('phases') or [])
+        if isinstance(item, Mapping)
+    ]
+    current_phase = next(
+        (
+            item
+            for item in phases
+            if str(item.get('phase_id') or '').strip() == current_phase_id
+        ),
+        {},
+    )
+    if (
+        normalize_capability(current_phase.get('capability')) != CAPABILITY_CHAT
+        or str(current_phase.get('kind') or '').strip().lower() != 'prepare'
+        or str(current_phase.get('role') or '').strip().lower()
+        != 'text_preparation'
+    ):
+        return False
+
+    phase_dependencies = {
+        str(item.get('phase_id') or '').strip(): {
+            str(dependency or '').strip()
+            for dependency in (item.get('depends_on') or [])
+            if str(dependency or '').strip()
+        }
+        for item in phases
+        if str(item.get('phase_id') or '').strip()
+    }
+
+    def descends_from_current_phase(phase_id: str) -> bool:
+        pending = list(phase_dependencies.get(phase_id, set()))
+        visited: set[str] = set()
+        while pending:
+            dependency_id = pending.pop()
+            if dependency_id == current_phase_id:
+                return True
+            if dependency_id in visited:
+                continue
+            visited.add(dependency_id)
+            pending.extend(phase_dependencies.get(dependency_id, set()))
+        return False
+
+    text_artifact_successors = [
+        item
+        for item in phases
+        if normalize_capability(item.get('capability')) == CAPABILITY_CHAT
+        and str(item.get('kind') or '').strip().lower() == 'materialize'
+        and str(item.get('role') or '').strip().lower()
+        == 'text_artifact_output'
+        and item.get('requires_artifact') is True
+        and str(item.get('content_payload_source') or '').strip().lower()
+        == 'current_phase_output'
+        and descends_from_current_phase(
+            str(item.get('phase_id') or '').strip()
+        )
+        and (
+            not isinstance(item.get('output_contract'), Mapping)
+            or item.get('output_contract', {}).get('required') is True
+        )
+    ]
+    if not text_artifact_successors:
+        return False
+    if reference == 'them' and len(text_artifact_successors) < 2:
+        return False
+
+    prefix = prompt_text[transform_match.start():reference_start]
+    coordinators = list(
+        re.finditer(
+            r'(?is)(?:\b(?:and|then|next|und|sowie|dann|danach|anschließend|anschliessend)\b|;)',
+            prefix,
+        )
+    )
+    if not coordinators:
+        return False
+    source_scope = prefix[:coordinators[-1].start()]
+    source_binding = re.search(
+        r'(?is)\b(?:from|using|based\s+on|derived\s+from|aus|anhand|auf\s+basis)\b'
+        r'(?P<source>[^,;.!?\n]{1,160})$',
+        source_scope,
+    )
+    if source_binding:
+        bound_source = str(source_binding.group('source') or '').strip()
+        if (
+            _DEICTIC_SOURCE_REFERENCE_RE.search(bound_source)
+            or _COMPETING_DEICTIC_SOURCE_QUALIFIER_RE.search(bound_source)
+            or _EXTERNAL_ARTIFACT_SOURCE_LOCATOR_RE.search(bound_source)
+        ):
+            return False
+    return bool(_SOURCE_TRANSFORM_ARTIFACT_TARGET_RE.search(source_scope))
+
+
 def _request_requires_current_source_for_transform(
     prompt: Any,
     request_payload: Optional[Mapping[str, Any]] = None,
@@ -3605,10 +3794,12 @@ def _request_requires_current_source_for_transform(
             match,
             source_start=direct_tts_source_start,
         )
+        and _transform_match_targets_artifact_in_own_action(
+            prompt_text,
+            match,
+        )
     ]
     if not transform_matches:
-        return False
-    if not _SOURCE_TRANSFORM_ARTIFACT_TARGET_RE.search(prompt_text):
         return False
     return any(
         not _payload_has_compatible_direct_artifact_source(
@@ -3631,6 +3822,11 @@ def _request_requires_current_source_for_transform(
             match,
         )
         and not _prompt_declares_graph_grounded_artifact_source_before_transform(
+            prompt_text,
+            match,
+            route_payload=route_payload,
+        )
+        and not _prompt_binds_graph_prepared_text_artifact_before_transform(
             prompt_text,
             match,
             route_payload=route_payload,
@@ -3924,6 +4120,37 @@ def _is_image_prompt_section_heading(raw_line: Any) -> bool:
     )
 
 
+def _is_named_text_artifact_section_heading(raw_line: Any) -> bool:
+    raw_text = str(raw_line or '').strip()
+    if not raw_text or '\n' in raw_text or '\r' in raw_text or len(raw_text) > 320:
+        return False
+    normalized = _normalize_handoff_heading_line(raw_text)
+    if not _NAMED_TEXT_ARTIFACT_FILENAME_RE.search(normalized):
+        return False
+    markdown_heading = bool(
+        re.match(r'^\s*(?:#{1,6}\s+|\*\*|__|[-*>\u2022]+\s+)', raw_text)
+    )
+    named_artifact_label = bool(
+        re.match(
+            r'(?i)^(?:updated?|revised?|new|final|complete|replacement|'
+            r'artifact|file|document|page|stylesheet|script|data|'
+            r'aktualisiert(?:e|en|er|es)?|überarbeitet(?:e|en|er|es)?|'
+            r'neu(?:e|en|er|es)?|datei|dokument|seite)\b',
+            normalized,
+        )
+    )
+    filename_only = bool(
+        re.fullmatch(
+            r'(?i)(?:updated?\s+|revised?\s+|final\s+|complete\s+)?'
+            r'[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(?:'
+            + '|'.join(sorted(TEXT_ARTIFACT_EXTENSIONS, key=len, reverse=True))
+            + r')(?:\s*\([^\n]{1,160}\))?\s*:?',
+            normalized,
+        )
+    )
+    return bool(markdown_heading or named_artifact_label or filename_only)
+
+
 def _is_image_prompt_section_stop(raw_line: Any) -> bool:
     stripped = str(raw_line or '').strip()
     if not stripped:
@@ -3933,7 +4160,7 @@ def _is_image_prompt_section_stop(raw_line: Any) -> bool:
     lowered = _normalize_handoff_heading_line(stripped).lower()
     if stripped.startswith('```'):
         return True
-    if any(token in lowered for token in ('index.html', 'styles.css')):
+    if _is_named_text_artifact_section_heading(stripped):
         return True
     if re.fullmatch(r'(?:html|css|javascript|js|index|styles?|page files?|text artifacts?)', lowered):
         return True
@@ -3957,7 +4184,12 @@ def _image_prompt_candidate_is_code_or_css_polluted(raw_value: Any) -> bool:
     lowered = text.lower()
     if re.search(r'(?m)^\s*\|[^|\n]+\|', text):
         return True
-    if any(token in lowered for token in ('index.html', 'styles.css', '```', '<html', '</', 'url(')):
+    if any(
+        _is_named_text_artifact_section_heading(line)
+        for line in text.splitlines()
+    ):
+        return True
+    if any(token in lowered for token in ('```', '<html', '</', 'url(')):
         return True
     if re.search(r'(?is)</?[a-z][^>]*>|(?:href|src)\s*=', text):
         return True
@@ -4142,6 +4374,14 @@ def _embedded_labeled_image_prompt_body(raw_value: Any) -> str:
 
 def _clean_numbered_image_prompt_candidate(raw_value: Any) -> str:
     text = str(raw_value or '').strip()
+    if not text:
+        return ''
+    bounded_lines: list[str] = []
+    for raw_line in text.splitlines():
+        if _is_image_prompt_section_stop(raw_line):
+            break
+        bounded_lines.append(raw_line)
+    text = '\n'.join(bounded_lines).strip()
     if not text:
         return ''
     embedded_body = _embedded_labeled_image_prompt_body(text)
@@ -4358,6 +4598,60 @@ def _extract_inline_labeled_image_prompt_lines(
         prompt = _clean_image_prompt_boundary_candidate(body)
         if prompt and prompt not in prompts:
             prompts.append(prompt)
+        if expected_count > 0 and len(prompts) >= expected_count:
+            break
+    if expected_count > 0:
+        return prompts[:expected_count]
+    return prompts
+
+
+def _extract_numbered_artifact_image_prompt_bodies(
+    prepared_text: str,
+    *,
+    expected_count: int = 0,
+) -> list[str]:
+    """Read rich image bodies from numbered artifact sections.
+
+    Some preparation models label image artifacts with their subject (for
+    example ``Artifact 2: Forged Carbon Watch``) instead of the literal words
+    ``Image Prompt``.  The heading is identity evidence, not a usable backend
+    prompt.  Only the following body can become prompt authority, and only
+    when it contains concrete visual-production language.  Filename and other
+    non-image artifact sections remain hard boundaries.
+    """
+
+    lines = str(prepared_text or '').splitlines()
+    prompts: list[str] = []
+    index = 0
+    while index < len(lines):
+        heading_match = _NUMBERED_ARTIFACT_SECTION_HEADING_RE.fullmatch(
+            str(lines[index] or '')
+        )
+        if not heading_match:
+            index += 1
+            continue
+        collected: list[str] = []
+        lookahead = index + 1
+        while lookahead < len(lines):
+            next_line = str(lines[lookahead] or '')
+            next_stripped = next_line.strip()
+            if (
+                _ARTIFACT_SECTION_HEADING_RE.fullmatch(next_line)
+                or _MARKDOWN_SEPARATOR_LINE_RE.fullmatch(next_stripped)
+                or _is_image_prompt_section_stop(next_stripped)
+            ):
+                break
+            if next_stripped:
+                collected.append(next_line)
+            lookahead += 1
+        body = _clean_image_prompt_boundary_candidate('\n'.join(collected))
+        if (
+            body
+            and _PARAGRAPH_IMAGE_PROMPT_STRONG_SIGNAL_RE.search(body)
+            and body not in prompts
+        ):
+            prompts.append(body)
+        index = max(lookahead, index + 1)
         if expected_count > 0 and len(prompts) >= expected_count:
             break
     if expected_count > 0:
@@ -5037,6 +5331,253 @@ class ResponseSemanticsRuntimeOwner:
         role = str(source.get('role') or '').strip().lower()
         policy = str(source.get('fulfillment_policy') or '').strip().lower()
         return role in {'text_artifact_output', 'document_output'} or policy == 'runtime_text_artifact'
+
+    @staticmethod
+    def _text_artifact_revision_required_for_closure(source: Mapping[str, Any]) -> bool:
+        value = source.get('text_artifact_revision_required')
+        if isinstance(value, bool):
+            return value
+        return str(value or '').strip().lower() in {'1', 'required', 'true', 'yes'}
+
+    @staticmethod
+    def _text_artifact_revision_target_for_closure(source: Mapping[str, Any]) -> str:
+        artifact_request = (
+            source.get('artifact_request')
+            if isinstance(source.get('artifact_request'), Mapping)
+            else {}
+        )
+        return str(
+            source.get('text_artifact_target_path')
+            or artifact_request.get('target_path')
+            or ''
+        ).strip()
+
+    @staticmethod
+    def _normalized_text_artifact_path_for_closure(value: Any) -> str:
+        raw = str(value or '').strip()
+        if not raw:
+            return ''
+        if raw.startswith('file://'):
+            raw = raw[7:]
+        try:
+            return str(Path(raw).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            return raw
+
+    @classmethod
+    def _text_artifact_revision_closure_evidence(
+        cls,
+        source: Mapping[str, Any],
+        *,
+        artifact_payload: Mapping[str, Any],
+        late_fill: Mapping[str, Any],
+        branch_id: str,
+        phase_id: str,
+    ) -> dict[str, Any]:
+        """Validate branch-local revision write and preservation evidence."""
+
+        target_path = cls._text_artifact_revision_target_for_closure(source)
+        normalized_target = cls._normalized_text_artifact_path_for_closure(target_path)
+        preservation_required = source.get(
+            'text_artifact_revision_preservation_required'
+        ) is True
+        preservation_policy = str(
+            source.get('text_artifact_revision_preservation_policy')
+            or 'structural_anchor_retention_v1'
+        ).strip()
+        result: dict[str, Any] = {
+            'required': True,
+            'target_path': target_path or None,
+            'write_proven': False,
+            'preservation_required': preservation_required,
+            'preservation_passed': not preservation_required,
+            'status': 'failed',
+            'evidence': 'text_artifact_revision_write_proof_missing_or_invalid',
+        }
+        if not normalized_target:
+            result['evidence'] = 'text_artifact_revision_target_contract_missing'
+            return result
+
+        matching_tokens = {token for token in (branch_id, phase_id) if token}
+        candidate_records: list[Mapping[str, Any]] = []
+        for record in late_fill.get('fill_results') or []:
+            if not isinstance(record, Mapping):
+                continue
+            record_tokens = {
+                str(record.get('branch_id') or '').strip(),
+                str(record.get('phase_id') or '').strip(),
+            }
+            record_tokens.discard('')
+            if matching_tokens and not matching_tokens.intersection(record_tokens):
+                continue
+            candidate_records.append(record)
+        for record in late_fill.get('completed_branches') or []:
+            if not isinstance(record, Mapping):
+                continue
+            record_tokens = {
+                str(record.get('branch_id') or '').strip(),
+                str(record.get('phase_id') or '').strip(),
+            }
+            record_tokens.discard('')
+            if matching_tokens and not matching_tokens.intersection(record_tokens):
+                continue
+            candidate_records.append(record)
+
+        # The synchronous path has no Late Fill record. It remains bounded by
+        # the contracted target path and an explicit current-response proof.
+        candidate_records.append(artifact_payload)
+        candidate_records.extend(
+            record
+            for record in (artifact_payload.get('saved_text_artifacts') or [])
+            if isinstance(record, Mapping)
+        )
+
+        proof_seen = False
+        target_matching_proof_seen = False
+        saved_path_seen = False
+        hash_mismatch_seen = False
+        preservation_failed = False
+        preservation_seen = False
+        for record in candidate_records:
+            nested_records = [record]
+            nested_records.extend(
+                item
+                for item in (record.get('saved_text_artifacts') or [])
+                if isinstance(item, Mapping)
+            )
+            for evidence_record in nested_records:
+                proof = (
+                    evidence_record.get('text_artifact_revision_write_proof')
+                    if isinstance(
+                        evidence_record.get('text_artifact_revision_write_proof'),
+                        Mapping,
+                    )
+                    else {}
+                )
+                if not proof:
+                    continue
+                proof_seen = True
+                if str(proof.get('status') or '').strip().lower() != 'applied':
+                    continue
+                proof_target = cls._normalized_text_artifact_path_for_closure(
+                    proof.get('target_path')
+                )
+                if proof_target != normalized_target:
+                    continue
+                target_matching_proof_seen = True
+
+                saved_paths = {
+                    cls._normalized_text_artifact_path_for_closure(
+                        evidence_record.get(key)
+                    )
+                    for key in ('path', 'saved_text_path', 'source_path')
+                }
+                saved_paths.update(
+                    cls._normalized_text_artifact_path_for_closure(
+                        record.get(key)
+                    )
+                    for key in ('path', 'saved_text_path', 'source_path')
+                )
+                saved_paths.discard('')
+                matching_saved_paths = {
+                    path for path in saved_paths if path == normalized_target
+                }
+                if not matching_saved_paths:
+                    continue
+                saved_path_seen = True
+                saved_path = next(iter(matching_saved_paths))
+                try:
+                    saved_bytes = Path(saved_path).read_bytes()
+                except OSError:
+                    continue
+                expected_output_sha256 = str(
+                    proof.get('output_sha256') or ''
+                ).strip().lower()
+                actual_output_sha256 = hashlib.sha256(saved_bytes).hexdigest()
+                if (
+                    expected_output_sha256
+                    and expected_output_sha256 != actual_output_sha256
+                ):
+                    hash_mismatch_seen = True
+                    continue
+
+                preservation_evidence = (
+                    evidence_record.get(
+                        'text_artifact_revision_preservation_evidence'
+                    )
+                    if isinstance(
+                        evidence_record.get(
+                            'text_artifact_revision_preservation_evidence'
+                        ),
+                        Mapping,
+                    )
+                    else record.get(
+                        'text_artifact_revision_preservation_evidence'
+                    )
+                    if isinstance(
+                        record.get('text_artifact_revision_preservation_evidence'),
+                        Mapping,
+                    )
+                    else {}
+                )
+                if preservation_required:
+                    if not preservation_evidence:
+                        continue
+                    preservation_seen = True
+                    preservation_target = (
+                        cls._normalized_text_artifact_path_for_closure(
+                            preservation_evidence.get('target_path')
+                        )
+                    )
+                    preservation_status = str(
+                        preservation_evidence.get('status') or ''
+                    ).strip().lower()
+                    if preservation_status == 'failed':
+                        preservation_failed = True
+                    if (
+                        preservation_status != 'passed'
+                        or preservation_target != normalized_target
+                        or str(
+                            preservation_evidence.get('policy') or ''
+                        ).strip()
+                        != preservation_policy
+                    ):
+                        continue
+
+                result.update(
+                    {
+                        'write_proven': True,
+                        'preservation_passed': True,
+                        'status': 'passed',
+                        'evidence': 'text_artifact_revision_write_proven',
+                        'saved_text_path': saved_path,
+                        'actual_output_sha256': actual_output_sha256,
+                        'write_proof': dict(proof),
+                    }
+                )
+                if preservation_evidence:
+                    result['preservation_evidence'] = dict(
+                        preservation_evidence
+                    )
+                return result
+
+        if preservation_required and preservation_failed:
+            result['evidence'] = 'text_artifact_revision_preservation_failed'
+            result['preservation_evidence_status'] = 'failed'
+        elif preservation_required and target_matching_proof_seen and saved_path_seen:
+            result['evidence'] = (
+                'text_artifact_revision_preservation_evidence_missing_or_invalid'
+            )
+            result['preservation_evidence_status'] = (
+                'invalid' if preservation_seen else 'missing'
+            )
+        elif hash_mismatch_seen:
+            result['evidence'] = 'text_artifact_revision_output_hash_mismatch'
+        elif proof_seen and not target_matching_proof_seen:
+            result['evidence'] = 'text_artifact_revision_write_proof_target_mismatch'
+        elif target_matching_proof_seen and not saved_path_seen:
+            result['evidence'] = 'text_artifact_revision_saved_target_missing'
+        return result
 
     @staticmethod
     def _branch_record_is_non_executable_candidate(source: Mapping[str, Any]) -> bool:
@@ -8280,6 +8821,14 @@ class ResponseSemanticsRuntimeOwner:
             expected_count <= 0 or len(inline_labeled_prompts) >= expected_count
         ):
             return inline_labeled_prompts[:expected_count] if expected_count > 0 else inline_labeled_prompts
+        artifact_body_prompts = _extract_numbered_artifact_image_prompt_bodies(
+            normalized_text,
+            expected_count=expected_count,
+        )
+        if artifact_body_prompts and (
+            expected_count <= 0 or len(artifact_body_prompts) >= expected_count
+        ):
+            return artifact_body_prompts[:expected_count] if expected_count > 0 else artifact_body_prompts
         sequential_alpha_prompts = _extract_sequential_bold_alpha_image_prompt_lines(
             normalized_text,
             expected_count=expected_count,
@@ -8385,10 +8934,16 @@ class ResponseSemanticsRuntimeOwner:
                     continue
                 extracted = split_visible_image_payload(body)
                 prompt = _clean_image_prompt_boundary_candidate(extracted.get('artifact_prompt') or body)
-                if prompt and prompt not in prompts:
+                if (
+                    prompt
+                    and _PARAGRAPH_IMAGE_PROMPT_STRONG_SIGNAL_RE.search(prompt)
+                    and prompt not in prompts
+                ):
                     prompts.append(prompt)
                 if len(prompts) >= expected_count:
                     break
+        if expected_count > 1 and len(prompts) < expected_count:
+            return []
         if expected_count > 0 and len(prompts) > expected_count:
             return prompts[:expected_count]
         return prompts
@@ -9013,14 +9568,13 @@ class ResponseSemanticsRuntimeOwner:
                             payload['batch_prompt_source_phase_id'] = plain_alpha_authority[
                                 'source_phase_id'
                             ]
-                        artifact_prompt = str(payload.get('artifact_prompt') or '').strip()
-                        artifact_prompt_clean = _clean_image_prompt_boundary_candidate(artifact_prompt)
-                        if (
-                            str(payload.get('artifact_prompt_source') or '').strip() == 'full_display_text'
-                            or (artifact_prompt and not artifact_prompt_clean)
-                        ):
-                            payload['artifact_prompt'] = batch_prompts[0]
-                            payload['artifact_prompt_source'] = 'semantic_batch_prompts'
+                        # Once a complete ordered batch is proven, its first item
+                        # is the only valid root prompt. Free-text extraction may
+                        # otherwise retain the final labelled prompt plus the
+                        # following HTML/CSS section even though the batch parser
+                        # correctly stopped at that boundary.
+                        payload['artifact_prompt'] = batch_prompts[0]
+                        payload['artifact_prompt_source'] = 'semantic_batch_prompts'
                     expanded_branches, expansion = self._expand_image_pending_branches_from_batch_prompts(
                         pending_branches,
                         payload.get('batch_prompts'),
@@ -10933,6 +11487,22 @@ class ResponseSemanticsRuntimeOwner:
 
     @staticmethod
     def _text_artifact_record_content(record: Mapping[str, Any]) -> str:
+        # A refreshed artifact may intentionally carry only a bounded preview.
+        # That preview is transport/UI data, never Closure authority.  Read the
+        # canonical saved file first whenever the record says the preview was
+        # truncated so syntax and cross-file checks see the complete bytes.
+        if record.get('content_preview_truncated') is True:
+            path = _artifact_path(record)
+            if path:
+                try:
+                    target = Path(path).expanduser()
+                    if target.is_file() and target.stat().st_size <= 512_000:
+                        return target.read_text(
+                            encoding='utf-8',
+                            errors='replace',
+                        ).strip()
+                except OSError:
+                    pass
         for key in ('content', 'text', 'result_text', 'content_payload'):
             value = record.get(key)
             if isinstance(value, str) and value.strip():
@@ -13082,13 +13652,13 @@ class ResponseSemanticsRuntimeOwner:
                     continue
                 html_without_css = sorted(html_tokens - css_tokens)
                 css_without_html = sorted(css_tokens - html_tokens)
-                html_missing_ratio = len(html_without_css) / max(1, len(html_tokens))
-                css_unused_ratio = len(css_without_html) / max(1, len(css_tokens))
                 if (
                     len(html_without_css) < _HTML_CSS_SELECTOR_BINDING_MIN_MISSING
                     or len(css_without_html) < _HTML_CSS_SELECTOR_BINDING_MIN_MISSING
-                    or html_missing_ratio < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
-                    or css_unused_ratio < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
+                    or len(html_without_css) / max(1, len(html_tokens))
+                    < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
+                    or len(css_without_html) / max(1, len(css_tokens))
+                    < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
                 ):
                     continue
 
@@ -13096,16 +13666,26 @@ class ResponseSemanticsRuntimeOwner:
                 css_name = _artifact_source_name(css_record) or 'styles'
                 css_display_path = _ollmo_relative_path(css_path) if css_path else ''
                 html_path = _artifact_path(html_record)
-                html_display_path = _ollmo_relative_path(html_path) if html_path else _artifact_source_name(html_record)
+                html_display_path = (
+                    _ollmo_relative_path(html_path)
+                    if html_path
+                    else _artifact_source_name(html_record)
+                )
                 content_payload = '\n'.join(
                     [
                         f'Target text artifact: {css_display_path or css_name}',
                         f'Linked HTML artifact: {html_display_path}',
                         'HTML/CSS selector binding drift:',
-                        f'- HTML classes not targeted by linked CSS: {", ".join(html_without_css[:16])}',
-                        f'- CSS class selectors not present in linked HTML: {", ".join(css_without_html[:16])}',
-                        *self._bounded_repair_content_block('Current saved HTML file content', html_content),
-                        *self._bounded_repair_content_block('Current saved CSS target file content', css_content),
+                        '- HTML classes not targeted by linked CSS: '
+                        + ', '.join(html_without_css[:16]),
+                        '- CSS class selectors not present in linked HTML: '
+                        + ', '.join(css_without_html[:16]),
+                        *self._bounded_repair_content_block(
+                            'Current saved HTML file content', html_content
+                        ),
+                        *self._bounded_repair_content_block(
+                            'Current saved CSS target file content', css_content
+                        ),
                         'Update only the target CSS artifact. Preserve declarations, copy, valid runtime artifact links, and visual intent. Rename or add selectors only as needed so the CSS targets the actual saved HTML classes.',
                     ]
                 ).strip()
@@ -13145,7 +13725,13 @@ class ResponseSemanticsRuntimeOwner:
                     'html_class_count': len(html_tokens),
                     'css_selector_class_count': len(css_tokens),
                 }
-                checks.append({key: value for key, value in check.items() if value not in (None, '', [], {})})
+                checks.append(
+                    {
+                        key: value
+                        for key, value in check.items()
+                        if value not in (None, '', [], {})
+                    }
+                )
         return checks
 
     def _text_artifact_syntax_sanity_checks(
@@ -14636,6 +15222,9 @@ class ResponseSemanticsRuntimeOwner:
             evidence = 'output_obligation_status' if output_obligations else 'phase_status'
             source_role = str(raw_source.get('role') or '').strip()
             requires_text_artifact = self.source_requires_text_artifact(raw_source, output_type)
+            text_artifact_revision_required = (
+                self._text_artifact_revision_required_for_closure(raw_source)
+            )
             source_depends_on = [
                 str(item or '').strip()
                 for item in (raw_source.get('depends_on') or [])
@@ -14653,6 +15242,17 @@ class ResponseSemanticsRuntimeOwner:
                 if isinstance(completed_branch_record, Mapping)
                 else ''
             ).strip()
+            text_artifact_revision_evidence = (
+                self._text_artifact_revision_closure_evidence(
+                    raw_source,
+                    artifact_payload=artifact_info,
+                    late_fill=late_fill,
+                    branch_id=branch_id,
+                    phase_id=phase_id,
+                )
+                if text_artifact_revision_required
+                else {}
+            )
             tts_audio_integrity_evidence = (
                 tts_integrity_evidence_for(branch_id, phase_id)
                 if capability == CAPABILITY_TEXT_TO_SPEECH
@@ -14729,6 +15329,29 @@ class ResponseSemanticsRuntimeOwner:
             elif branch_id and branch_id in cancelled_branch_ids:
                 status = 'waived'
                 evidence = 'late_fill_cancelled_branch'
+            elif text_artifact_revision_required:
+                revision_evidence = str(
+                    text_artifact_revision_evidence.get('evidence') or ''
+                ).strip()
+                if text_artifact_revision_evidence.get('status') == 'passed':
+                    status = 'fulfilled'
+                    evidence = revision_evidence or 'text_artifact_revision_write_proven'
+                else:
+                    status = (
+                        'blocked'
+                        if revision_evidence
+                        in {
+                            'text_artifact_revision_output_hash_mismatch',
+                            'text_artifact_revision_preservation_failed',
+                            'text_artifact_revision_saved_target_missing',
+                            'text_artifact_revision_write_proof_target_mismatch',
+                        }
+                        else 'pending'
+                    )
+                    evidence = (
+                        revision_evidence
+                        or 'text_artifact_revision_write_proof_missing_or_invalid'
+                    )
             elif completed_in_place_materialization_repair:
                 # A verified in-place rebind/repair updates an existing saved
                 # artifact; it must not consume a fictitious extra artifact.
@@ -14830,6 +15453,26 @@ class ResponseSemanticsRuntimeOwner:
                 'status': status,
                 'evidence': evidence,
             }
+            if text_artifact_revision_required:
+                check['text_artifact_revision_required'] = True
+                check['text_artifact_target_path'] = (
+                    text_artifact_revision_evidence.get('target_path')
+                )
+                check['text_artifact_revision_closure_evidence'] = (
+                    text_artifact_revision_evidence
+                )
+                if text_artifact_revision_evidence.get('status') != 'passed':
+                    check['reason'] = (
+                        'the required existing-file revision lacks matching '
+                        'current-branch write and preservation evidence'
+                    )
+                    check['repair_action'] = RECOVERY_ACTION_RETRY_SAME_BRANCH
+                    check['recovery_action'] = RECOVERY_ACTION_RETRY_SAME_BRANCH
+                    check['repair_action_reason'] = (
+                        'retry only this text-artifact revision against its '
+                        'contracted source and target path'
+                    )
+                    check['materialization_blocked'] = True
             if (
                 capability == CAPABILITY_TEXT_TO_SPEECH
                 and output_type == 'audio'
@@ -14874,7 +15517,17 @@ class ResponseSemanticsRuntimeOwner:
                     continue
                 for key in _CLOSURE_REPAIR_PAYLOAD_KEYS:
                     value = source.get(key)
-                    if value not in (None, '', [], {}) and check.get(key) in (None, '', [], {}):
+                    if (
+                        key in {'review_criteria', 'semantic_review_criteria'}
+                        and isinstance(value, list)
+                    ):
+                        merged_criteria = self._merge_string_list(
+                            check.get(key),
+                            value,
+                        )
+                        if merged_criteria:
+                            check[key] = merged_criteria
+                    elif value not in (None, '', [], {}) and check.get(key) in (None, '', [], {}):
                         check[key] = value
                 if check.get('depends_on') in (None, '', [], {}) and isinstance(source.get('depends_on'), list):
                     depends_on = [
@@ -15751,7 +16404,10 @@ class ResponseSemanticsRuntimeOwner:
             return prompt_text
         if not prompt_text:
             return prompt_prefix
-        return f'{prompt_prefix}\n\nCurrent user request:\n{prompt_text}'
+        prefixed_prompt_start = f'{prompt_prefix}\n\nCurrent user request:\n'
+        if prompt_text == prompt_prefix or prompt_text.startswith(prefixed_prompt_start):
+            return prompt_text
+        return f'{prefixed_prompt_start}{prompt_text}'
 
     def inject_selected_reference_into_chat_messages(
         self,
@@ -16112,6 +16768,40 @@ class ResponseSemanticsRuntimeOwner:
             'role': 'system',
             'content': '\n'.join(lines),
         }
+
+    def build_external_prepare_phase_bounded_task(
+        self,
+        *,
+        prepare_contract: Optional[dict[str, Any]] = None,
+        route_payload: Optional[dict[str, Any]] = None,
+        request_payload: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """Return the live external task for a graph-owned preparation phase."""
+
+        if not isinstance(prepare_contract, dict):
+            prepare_contract = self.resolve_prepare_phase_contract(
+                route_payload=route_payload,
+                request_payload=request_payload,
+            )
+        system_message = self.build_prepare_phase_system_message(prepare_contract)
+        if not system_message:
+            return ''
+        phase_contract = str(system_message.get('content') or '').strip()
+        if not phase_contract:
+            return ''
+        return '\n'.join(
+            [
+                phase_contract,
+                '',
+                'The complete user request is supplied separately in '
+                '<ollmo_promoted_context> as reference-only intent for this phase.',
+                'Do not perform filesystem writes, invoke downstream media generation, '
+                'or claim that downstream artifacts were created.',
+                'Return only the current preparation result to Ollmo. Ollmo retains '
+                'authority for downstream execution, materialization, integrity checks, '
+                'Closure, and publication.',
+            ]
+        )
 
     def inject_prepare_phase_contract_into_chat_messages(
         self,

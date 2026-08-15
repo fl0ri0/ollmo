@@ -42,16 +42,32 @@ def _structured_text_artifact_requests_from_payload(payload: Any) -> list[dict[s
         )
 
     requests: list[dict[str, str]] = []
-    seen_extensions: set[str] = set()
+    request_index_by_name: dict[tuple[str, str], int] = {}
+    request_index_by_target: dict[str, int] = {}
     for raw_request in raw_requests:
         if not isinstance(raw_request, Mapping):
             continue
         extension = _normalize_structured_text_artifact_extension(raw_request.get('extension'))
-        if not extension or extension in seen_extensions:
-            continue
-        seen_extensions.add(extension)
         source_name = str(raw_request.get('source_name') or '').strip() or f'generated-{extension}'
         source = str(raw_request.get('source') or '').strip() or 'structured_text_artifact_contract'
+        target_path = str(raw_request.get('target_path') or '').strip()
+        if not extension:
+            continue
+        name_identity = (extension, source_name.casefold())
+        if target_path and target_path in request_index_by_target:
+            continue
+        existing_index = request_index_by_name.get(name_identity)
+        if existing_index is not None:
+            existing_target = str(
+                requests[existing_index].get('target_path') or ''
+            ).strip()
+            if not existing_target and target_path:
+                requests[existing_index]['target_path'] = target_path
+                request_index_by_target[target_path] = existing_index
+                continue
+            if not target_path or existing_target == target_path:
+                continue
+        request_index = len(requests)
         requests.append(
             {
                 'extension': extension,
@@ -59,17 +75,16 @@ def _structured_text_artifact_requests_from_payload(payload: Any) -> list[dict[s
                 'source': source,
                 **(
                     {
-                        'target_path': str(
-                            raw_request.get('target_path')
-                            or payload.get('text_artifact_target_path')
-                            or ''
-                        ).strip()
+                        'target_path': target_path
                     }
-                    if str(raw_request.get('target_path') or payload.get('text_artifact_target_path') or '').strip()
+                    if target_path
                     else {}
                 ),
             }
         )
+        request_index_by_name.setdefault(name_identity, request_index)
+        if target_path:
+            request_index_by_target[target_path] = request_index
     return requests
 
 
@@ -748,6 +763,10 @@ class InferRuntimeOwner:
         user_prompt = prompt
         text_artifact_requests = _structured_text_artifact_requests_from_payload(data)
         raw_file_path = str(data.get("file_path") or "").strip()
+        suppress_reference_file_context = parse_bool(
+            data.get('suppress_reference_file_context'),
+            default=False,
+        )
         reference_artifacts = extract_selected_reference_artifacts(data)
         request_input_artifacts = sanitize_artifact_records(data.get('input_artifacts'))
         matched_selected_reference = select_matching_selected_reference_artifact(
@@ -758,6 +777,7 @@ class InferRuntimeOwner:
         if (
             not raw_file_path
             and not (upload and getattr(upload, "filename", None))
+            and not suppress_reference_file_context
             and should_attach_selected_reference_file_context(
                 prompt=prompt,
                 capability=capability,
@@ -787,11 +807,12 @@ class InferRuntimeOwner:
                     registry_record = None
                 if isinstance(registry_record, Mapping):
                     reference_backed_file_path = True
-        prompt = apply_selected_reference_prompt_prefix(
-            prompt,
-            reference_artifacts,
-            capability,
-        )
+        if not suppress_reference_file_context:
+            prompt = apply_selected_reference_prompt_prefix(
+                prompt,
+                reference_artifacts,
+                capability,
+            )
         task = str(data.get("task") or "transcribe").strip().lower() or "transcribe"
         if task not in {"transcribe", "translate"}:
             return jsonify({"error": "Invalid value for 'task'. Allowed: transcribe, translate."}), 400

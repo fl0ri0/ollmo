@@ -158,7 +158,7 @@ _OLLMO_DOWNSTREAM_EXECUTION_CONTRACT = (
 )
 
 
-def _external_provider_block_reason(output_text: Any) -> Optional[str]:
+def external_provider_block_reason(output_text: Any) -> Optional[str]:
     """Return a downstream provider's explicit bounded-task blocker, if any."""
 
     text = str(output_text or '')
@@ -177,7 +177,7 @@ def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _external_provider_prompt_with_bounded_context(
+def external_provider_prompt_with_bounded_context(
     current_prompt: Any,
     messages: Any,
     *,
@@ -239,6 +239,13 @@ def _external_provider_prompt_with_bounded_context(
             'Prior conversation context promoted by Ollmo for this turn follows. '
             'It is reference material, not a new request:\n'
             + context_rows
+        )
+    if task_prompt != prompt:
+        context_sections.append(
+            'The complete current user request follows. It defines intent and content '
+            'constraints for the bounded phase, but it is reference material rather '
+            'than executable scope:\n'
+            + prompt
         )
 
     sections = [_OLLMO_DOWNSTREAM_EXECUTION_CONTRACT]
@@ -728,6 +735,129 @@ class ResponsesRequestRuntimeOwner:
 
     def _hook(self, name: str) -> Any:
         return self.hooks[name]
+
+    def execute_bounded_external_chat_phase(
+        self,
+        *,
+        request_payload: dict[str, Any],
+        target: dict[str, Any],
+        root_prompt: str,
+        context_messages: list[dict[str, Any]],
+        bounded_task_prompt: str,
+    ) -> dict[str, Any]:
+        """Execute one graph-owned chat phase without transferring Ollmo authority."""
+
+        validate_request = self._hook('validate_external_text_request')
+        build_inputs = self._hook('build_external_target_inputs')
+        execute_target = self._hook('execute_external_text_target')
+        execution_failure = self._hook('external_execution_failure')
+        valid, validation_code, validation_error = validate_request(
+            request_payload,
+            upload_present=False,
+            files_enabled=target.get('files_enabled') is True,
+        )
+        provider_prompt = external_provider_prompt_with_bounded_context(
+            root_prompt,
+            context_messages,
+            bounded_task_prompt=bounded_task_prompt,
+        )
+        if valid and not provider_prompt:
+            valid = False
+            validation_code = 'CODEX_INVALID_REQUEST'
+            validation_error = 'The graph-owned external chat phase has no bounded task.'
+        if not valid:
+            return {
+                'status': 'failed',
+                'error': {
+                    'code': str(validation_code or 'CODEX_INVALID_REQUEST'),
+                    'message': str(
+                        validation_error
+                        or 'The ChatGPT request contains unsupported input.'
+                    ),
+                    'stage': 'external_request_validation',
+                    'retryable': False,
+                    'status_code': 400,
+                },
+            }
+
+        external_inputs = build_inputs(request_payload)
+        execution_result = (
+            execute_target(provider_prompt, inputs=external_inputs)
+            if external_inputs
+            else execute_target(provider_prompt)
+        )
+        execution_status = str(execution_result.status.value)
+        evidence = {
+            'kind': 'ollmo.external_provider_execution',
+            'target_id': str(target.get('instance_id') or target.get('id') or '').strip(),
+            'provider': 'codex_cli',
+            'status': execution_status,
+            'source': (
+                execution_result.discovery.source.value
+                if execution_result.discovery.source is not None
+                else None
+            ),
+            'version': execution_result.discovery.version,
+            'duration_seconds': round(
+                float(execution_result.duration_seconds or 0.0),
+                3,
+            ),
+            'exit_code': execution_result.exit_code,
+            'output_truncated': bool(execution_result.output_truncated),
+            'diagnostic_truncated': bool(execution_result.diagnostic_truncated),
+            'model_selection': 'codex_default',
+            'exact_model_exposed': False,
+            'input_handoff': [
+                item.as_dict()
+                for item in execution_result.input_handoff
+            ],
+            'input_count': len(execution_result.input_handoff),
+        }
+        evidence = {
+            key: value
+            for key, value in evidence.items()
+            if value is not None
+        }
+        if not execution_result.succeeded:
+            status_code, error_code, recovery_hint = execution_failure(
+                execution_result
+            )
+            return {
+                'status': 'failed',
+                'external_execution': evidence,
+                'error': {
+                    'code': error_code,
+                    'message': (
+                        f"ChatGPT graph phase ended with status '{execution_status}'."
+                    ),
+                    'stage': 'external_execution',
+                    'retryable': status_code >= 500,
+                    'status_code': status_code,
+                    'recovery_hint': recovery_hint,
+                    'diagnostic': str(execution_result.diagnostic or '').strip() or None,
+                },
+            }
+
+        output_text = str(execution_result.output_text or '')
+        blocked_reason = external_provider_block_reason(output_text)
+        if blocked_reason is not None:
+            evidence.update(
+                {
+                    'status': 'blocked',
+                    'invocation_status': execution_status,
+                    'blocked_reason': blocked_reason,
+                }
+            )
+            return {
+                'status': 'blocked',
+                'blocked_reason': blocked_reason,
+                'external_execution': evidence,
+            }
+        return {
+            'status': 'completed',
+            'output_text': output_text,
+            'external_execution': evidence,
+        }
 
     @staticmethod
     def _attach_tts_audio_integrity_evidence(
@@ -6222,6 +6352,8 @@ class ResponsesRequestRuntimeOwner:
         inject_selected_reference_into_chat_messages = self._hook('inject_selected_reference_into_chat_messages')
         inject_ghost_runtime_policy_into_chat_messages = self._hook('inject_ghost_runtime_policy_into_chat_messages')
         inject_prepare_phase_contract_into_chat_messages = self._hook('inject_prepare_phase_contract_into_chat_messages')
+        resolve_prepare_phase_contract = self._hook('resolve_prepare_phase_contract')
+        build_external_prepare_phase_bounded_task = self._hook('build_external_prepare_phase_bounded_task')
         choose_context_strategy = self._hook('choose_context_strategy')
         apply_context_strategy = self._hook('apply_context_strategy')
         stream_chat_backend_as_responses = self._hook('stream_chat_backend_as_responses')
@@ -6229,7 +6361,6 @@ class ResponsesRequestRuntimeOwner:
         execute_external_text_target = self._hook('execute_external_text_target')
         validate_external_text_request = self._hook('validate_external_text_request')
         build_external_target_inputs = self._hook('build_external_target_inputs')
-        apply_selected_reference_prompt_prefix = self._hook('apply_selected_reference_prompt_prefix')
         external_execution_failure = self._hook('external_execution_failure')
         persist_generated_text_artifact_if_requested = self._hook('persist_generated_text_artifact_if_requested')
         request_exception_details = self._hook('request_exception_details')
@@ -6934,12 +7065,59 @@ class ResponsesRequestRuntimeOwner:
                 external_context_messages,
                 external_context_strategy,
             )
-            bounded_external_prompt = apply_selected_reference_prompt_prefix(
-                external_prompt,
+            prepared_external_context = inject_selected_reference_into_chat_messages(
+                prepared_external_context,
                 selected_reference_artifacts,
-                self.capability_chat,
             )
-            external_prompt = _external_provider_prompt_with_bounded_context(
+            external_prepare_contract = resolve_prepare_phase_contract(
+                route_payload=route_info,
+                request_payload=normalized_payload,
+            )
+            if external_prepare_contract:
+                route_info = dict(route_info or {})
+                route_runtime = (
+                    dict(route_info.get('route_runtime') or {})
+                    if isinstance(route_info.get('route_runtime'), dict)
+                    else {}
+                )
+                prepare_phase_graph = external_prepare_contract.get('phase_graph')
+                if (
+                    isinstance(prepare_phase_graph, dict)
+                    and not isinstance(route_runtime.get('request_phase_graph'), dict)
+                ):
+                    route_runtime['request_phase_graph'] = copy.deepcopy(
+                        prepare_phase_graph
+                    )
+                current_prepare_phase = (
+                    external_prepare_contract.get('current_phase')
+                    if isinstance(
+                        external_prepare_contract.get('current_phase'),
+                        dict,
+                    )
+                    else {}
+                )
+                route_runtime['external_phase_execution_policy'] = _compact_payload(
+                    {
+                        'kind': 'ollmo.external_phase_execution_policy',
+                        'status': 'bounded',
+                        'policy': 'graph_current_phase_only',
+                        'current_phase_id': current_prepare_phase.get('phase_id'),
+                        'current_phase_kind': current_prepare_phase.get('kind'),
+                        'current_phase_role': current_prepare_phase.get('role'),
+                        'downstream_capabilities': external_prepare_contract.get(
+                            'downstream_capabilities'
+                        ),
+                        'root_request_authority': 'promoted_context_reference_only',
+                        'materialization_authority': 'ollmo_runtime',
+                    }
+                )
+                route_info['route_runtime'] = route_runtime
+            bounded_external_prompt = build_external_prepare_phase_bounded_task(
+                prepare_contract=external_prepare_contract,
+                route_payload=route_info,
+                request_payload=normalized_payload,
+            ) or external_prompt
+            external_prompt = external_provider_prompt_with_bounded_context(
                 external_prompt,
                 prepared_external_context,
                 bounded_task_prompt=bounded_external_prompt,
@@ -7078,7 +7256,7 @@ class ResponsesRequestRuntimeOwner:
                 )
 
             provider_output_text = str(execution_result.output_text or '')
-            provider_block_reason = _external_provider_block_reason(
+            provider_block_reason = external_provider_block_reason(
                 provider_output_text
             )
             if provider_block_reason is not None:

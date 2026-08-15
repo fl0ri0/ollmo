@@ -3701,6 +3701,64 @@ class ResponsesApiTests(unittest.TestCase):
     @patch("ollmo_webserver._persist_text_artifact_locally")
     @patch("ollmo_webserver._execute_chat_backend_request")
     @patch("ollmo_webserver._lookup_instance")
+    def test_canonical_responses_chat_persists_named_json_in_multifile_manifest(
+        self,
+        mock_lookup,
+        mock_execute,
+        mock_persist_text_artifact,
+    ):
+        mock_lookup.return_value = {
+            "instance_id": "chat-1",
+            "model": "gpt-oss:20b",
+            "backend": "ollama",
+            "capability": "chat",
+            "port": 11435,
+        }
+        pricing = '[{"material":"Titanium Base","price_chf":24000}]'
+        mock_execute.return_value = (
+            "```html\n<!doctype html><h1>Atelier</h1>\n```\n"
+            "```html\n<!doctype html><h1>Configurator</h1>\n```\n"
+            f"```json\n{pricing}\n```\n"
+            "```css\nbody { color: white; }\n```"
+        )
+        mock_persist_text_artifact.side_effect = [
+            "/tmp/artifacts/documents/index.html",
+            "/tmp/artifacts/documents/styles.css",
+            "/tmp/artifacts/documents/configurator.html",
+            "/tmp/artifacts/documents/pricing.json",
+        ]
+
+        response = self.client.post(
+            "/api/responses",
+            json={
+                "instance_id": "chat-1",
+                "prompt": (
+                    "Create exactly four web files: index.html, configurator.html, "
+                    "pricing.json, and styles.css."
+                ),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_persist_text_artifact.call_count, 4)
+        persisted = {
+            (call.kwargs["source_name"], call.kwargs["extension"]): call.args[0]
+            for call in mock_persist_text_artifact.call_args_list
+        }
+        self.assertEqual(persisted[("pricing", "json")], pricing)
+        self.assertEqual(
+            set(persisted),
+            {
+                ("index", "html"),
+                ("configurator", "html"),
+                ("pricing", "json"),
+                ("styles", "css"),
+            },
+        )
+
+    @patch("ollmo_webserver._persist_text_artifact_locally")
+    @patch("ollmo_webserver._execute_chat_backend_request")
+    @patch("ollmo_webserver._lookup_instance")
     def test_canonical_responses_chat_persists_selected_text_source_edit(
         self,
         mock_lookup,
@@ -3715,39 +3773,203 @@ class ResponsesApiTests(unittest.TestCase):
             "port": 11435,
         }
         mock_execute.return_value = "```html\n<!doctype html><style>body{color:red}</style><h1>Hello</h1>\n```"
-        mock_persist_text_artifact.return_value = "/tmp/artifacts/documents/index.html"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'index.html'
+            target_path.write_text(
+                '<!doctype html><style>body{color:black}</style><h1>Hello</h1>',
+                encoding='utf-8',
+            )
 
-        response = self.client.post(
-            "/api/responses",
-            json={
-                "instance_id": "chat-1",
-                "prompt": "please change the font to red.",
-                "reference_artifacts": [
-                    {
-                        "type": "text",
-                        "path": "/tmp/artifacts/documents/index.html",
-                        "mime_type": "text/html",
-                    }
-                ],
-            },
-        )
+            def persist_revision(content, **kwargs):
+                target = Path(kwargs['target_path'])
+                target.write_text(content, encoding='utf-8')
+                return str(target)
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["saved_text_path"], "/tmp/artifacts/documents/index.html")
-        self.assertEqual(payload["text_artifact_request"]["source"], "selected_source_edit")
-        self.assertEqual(payload["text_artifact_request"]["extension"], "html")
-        mock_persist_text_artifact.assert_called_once()
-        self.assertEqual(
-            mock_persist_text_artifact.call_args.args[0],
-            "<!doctype html><style>body{color:red}</style><h1>Hello</h1>",
-        )
-        self.assertEqual(mock_persist_text_artifact.call_args.kwargs["extension"], "html")
-        self.assertEqual(mock_persist_text_artifact.call_args.kwargs["source_name"], "index")
-        self.assertEqual(
-            mock_persist_text_artifact.call_args.kwargs["target_path"],
-            "/tmp/artifacts/documents/index.html",
-        )
+            mock_persist_text_artifact.side_effect = persist_revision
+            response = self.client.post(
+                "/api/responses",
+                json={
+                    "instance_id": "chat-1",
+                    "prompt": "please change the font to red.",
+                    "reference_artifacts": [
+                        {
+                            "type": "text",
+                            "path": str(target_path),
+                            "mime_type": "text/html",
+                        }
+                    ],
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["saved_text_path"], str(target_path))
+            self.assertEqual(payload["text_artifact_request"]["source"], "selected_source_edit")
+            self.assertEqual(payload["text_artifact_request"]["extension"], "html")
+            self.assertEqual(
+                payload['saved_text_artifacts'][0][
+                    'text_artifact_revision_write_proof'
+                ]['output_sha256'],
+                hashlib.sha256(target_path.read_bytes()).hexdigest(),
+            )
+            mock_persist_text_artifact.assert_called_once()
+            self.assertEqual(
+                mock_persist_text_artifact.call_args.args[0],
+                "<!doctype html><style>body{color:red}</style><h1>Hello</h1>",
+            )
+            self.assertEqual(mock_persist_text_artifact.call_args.kwargs["extension"], "html")
+            self.assertEqual(mock_persist_text_artifact.call_args.kwargs["source_name"], "index")
+            self.assertEqual(
+                mock_persist_text_artifact.call_args.kwargs["target_path"],
+                str(target_path),
+            )
+
+    @patch("ollmo_webserver._resolve_saved_text_artifact_path")
+    @patch("ollmo_webserver._persist_text_artifact_locally")
+    def test_direct_selected_source_preservation_rejects_truncation_before_write(
+        self,
+        mock_persist_text_artifact,
+        mock_resolve_text_artifact,
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'styles.css'
+            original = (
+                '.global-nav { display: flex; }\n'
+                '.nav-link { color: silver; }\n'
+                '.hero-section { min-height: 80vh; }\n'
+                '.hero-content { position: relative; }\n'
+                '.brand-title { letter-spacing: .3em; }\n'
+                '.philosophy-section { padding: 8rem 0; }\n'
+                '.atelier-showcase { padding: 6rem 0; }\n'
+                '.showcase-split { display: grid; }\n'
+                '.configurator-engine { min-height: 80vh; }\n'
+                '.preview-stage { overflow: hidden; }\n'
+            )
+            target_path.write_text(original, encoding='utf-8')
+            mock_resolve_text_artifact.return_value = target_path
+
+            payload = _persist_generated_text_artifact_if_requested(
+                (
+                    '```css\n'
+                    '.configurator-engine { min-height: 80vh; }\n'
+                    '.preview-stage { overflow: hidden; }\n'
+                    '.preview-watch-img { object-fit: contain; }\n'
+                    '```'
+                ),
+                prompt=(
+                    'Update styles.css for the new material visualizer and keep the rest '
+                    'of the existing design intact.'
+                ),
+                model_name='chat-model',
+                mode='chat',
+                request_payload={
+                    'selected_reference_artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(target_path),
+                            'mime_type': 'text/css',
+                        }
+                    ]
+                },
+            )
+
+            mock_persist_text_artifact.assert_not_called()
+            rejection = payload['text_artifact_revision_preservation_rejections'][0]
+            self.assertEqual(
+                rejection['code'],
+                'TEXT_ARTIFACT_REVISION_PRESERVATION_FAILED',
+            )
+            self.assertEqual(
+                rejection['text_artifact_revision_preservation_evidence']['status'],
+                'failed',
+            )
+            self.assertEqual(target_path.read_text(encoding='utf-8'), original)
+
+    @patch("ollmo_webserver._resolve_saved_text_artifact_path")
+    @patch("ollmo_webserver._persist_text_artifact_locally")
+    def test_direct_named_predecessor_edit_binds_every_exact_file_target(
+        self,
+        mock_persist_text_artifact,
+        mock_resolve_text_artifact,
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            configurator_path = root / 'configurator.html'
+            styles_path = root / 'styles.css'
+            configurator_path.write_text(
+                '<!doctype html><html><main class="visualizer">Old</main></html>',
+                encoding='utf-8',
+            )
+            styles_path.write_text(
+                '.visualizer { color: silver; }\n.nav-link { color: cyan; }',
+                encoding='utf-8',
+            )
+            mock_resolve_text_artifact.side_effect = lambda raw_path: Path(raw_path)
+            def persist_revision(content, **kwargs):
+                target = Path(kwargs['target_path'])
+                target.write_text(content, encoding='utf-8')
+                return str(target)
+
+            mock_persist_text_artifact.side_effect = persist_revision
+
+            payload = _persist_generated_text_artifact_if_requested(
+                (
+                    '```html\n<!doctype html><html><main class="visualizer">New</main></html>\n```\n'
+                    '```css\n.visualizer { color: white; }\n.nav-link { color: cyan; }\n```'
+                ),
+                prompt=(
+                    'Update configurator.html and styles.css for the visualizer. '
+                    'Keep the rest of the existing design intact.'
+                ),
+                model_name='chat-model',
+                mode='chat',
+                request_payload={
+                    'selected_reference_artifacts': [
+                        {'type': 'text', 'path': str(configurator_path), 'mime_type': 'text/html'},
+                        {'type': 'text', 'path': str(styles_path), 'mime_type': 'text/css'},
+                    ],
+                    'current_predecessor_context': {
+                        'status': 'authorized',
+                        'authorization': 'canonical_same_conversation_predecessor',
+                        'promotion_mode': 'named_text_edit',
+                        'matched_text_artifacts': [
+                            {
+                                'filename': 'configurator.html',
+                                'path': str(configurator_path),
+                            },
+                            {
+                                'filename': 'styles.css',
+                                'path': str(styles_path),
+                            },
+                        ],
+                    },
+                },
+            )
+
+            self.assertEqual(mock_persist_text_artifact.call_count, 2)
+            self.assertEqual(
+                [call.kwargs['target_path'] for call in mock_persist_text_artifact.call_args_list],
+                [str(configurator_path), str(styles_path)],
+            )
+            self.assertEqual(
+                [item['text_artifact_request']['source'] for item in payload['saved_text_artifacts']],
+                ['selected_source_edit', 'selected_source_edit'],
+            )
+            for item, expected_target in zip(
+                payload['saved_text_artifacts'],
+                (configurator_path, styles_path),
+            ):
+                proof = item['text_artifact_revision_write_proof']
+                self.assertEqual(proof['status'], 'applied')
+                self.assertEqual(proof['target_path'], str(expected_target))
+                self.assertEqual(
+                    proof['output_sha256'],
+                    hashlib.sha256(expected_target.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(
+                    item['text_artifact_revision_preservation_evidence']['status'],
+                    'passed',
+                )
 
     @patch("ollmo_webserver._persist_text_artifact_locally")
     def test_r5c_audio_branch_edit_does_not_persist_selected_transcript(self, mock_persist_text_artifact):
@@ -3824,43 +4046,54 @@ class ResponsesApiTests(unittest.TestCase):
             },
             200,
         )
-        mock_persist_text_artifact.return_value = "/tmp/artifacts/documents/index.html"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'index.html'
+            target_path.write_text(
+                '<!doctype html><h1 style="color: black">Multiple Gardens</h1>',
+                encoding='utf-8',
+            )
 
-        response = self.client.post(
-            "/api/responses",
-            json={
-                "instance_id": "chat-1",
-                "prompt": "Change the font color to red and save the updated artifact.",
-                "selected_reference_artifacts": [
-                    {
-                        "type": "text",
-                        "path": "/tmp/artifacts/documents/index.html",
-                        "mime_type": "text/html",
-                    }
-                ],
-            },
-        )
+            def persist_revision(content, **kwargs):
+                target = Path(kwargs['target_path'])
+                target.write_text(content, encoding='utf-8')
+                return str(target)
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["saved_text_path"], "/tmp/artifacts/documents/index.html")
-        self.assertEqual(payload["artifacts"][0]["type"], "text")
-        self.assertEqual(payload["artifacts"][0]["path"], "/tmp/artifacts/documents/index.html")
-        self.assertEqual(payload["text_artifact_request"]["source"], "selected_source_edit")
-        self.assertEqual(payload["text_artifact_request"]["extension"], "html")
-        infer_payload = mock_invoke.call_args.kwargs["payload"]
-        self.assertEqual(infer_payload["file_path"], "/tmp/artifacts/documents/index.html")
-        mock_persist_text_artifact.assert_called_once()
-        self.assertEqual(
-            mock_persist_text_artifact.call_args.args[0],
-            '<!doctype html><h1 style="color: red">Multiple Gardens</h1>',
-        )
-        self.assertEqual(mock_persist_text_artifact.call_args.kwargs["extension"], "html")
-        self.assertEqual(mock_persist_text_artifact.call_args.kwargs["source_name"], "index")
-        self.assertEqual(
-            mock_persist_text_artifact.call_args.kwargs["target_path"],
-            "/tmp/artifacts/documents/index.html",
-        )
+            mock_persist_text_artifact.side_effect = persist_revision
+            response = self.client.post(
+                "/api/responses",
+                json={
+                    "instance_id": "chat-1",
+                    "prompt": "Change the font color to red and save the updated artifact.",
+                    "selected_reference_artifacts": [
+                        {
+                            "type": "text",
+                            "path": str(target_path),
+                            "mime_type": "text/html",
+                        }
+                    ],
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertEqual(payload["saved_text_path"], str(target_path))
+            self.assertEqual(payload["artifacts"][0]["type"], "text")
+            self.assertEqual(payload["artifacts"][0]["path"], str(target_path))
+            self.assertEqual(payload["text_artifact_request"]["source"], "selected_source_edit")
+            self.assertEqual(payload["text_artifact_request"]["extension"], "html")
+            infer_payload = mock_invoke.call_args.kwargs["payload"]
+            self.assertEqual(infer_payload["file_path"], str(target_path))
+            mock_persist_text_artifact.assert_called_once()
+            self.assertEqual(
+                mock_persist_text_artifact.call_args.args[0],
+                '<!doctype html><h1 style="color: red">Multiple Gardens</h1>',
+            )
+            self.assertEqual(mock_persist_text_artifact.call_args.kwargs["extension"], "html")
+            self.assertEqual(mock_persist_text_artifact.call_args.kwargs["source_name"], "index")
+            self.assertEqual(
+                mock_persist_text_artifact.call_args.kwargs["target_path"],
+                str(target_path),
+            )
 
     @patch("ollmo_webserver._persist_text_artifact_locally")
     @patch("ollmo_webserver._execute_chat_backend_request")
@@ -6803,6 +7036,444 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertIn("Output only the complete corrected file body", instruction)
         self.assertIn("Do not redesign", instruction)
         self.assertNotIn("Original user request for bounded intent context", instruction)
+
+    def test_selected_predecessor_text_revision_uses_complete_source_snapshot(self):
+        prompt = (
+            'Reference the current configurator.html. Update only its material visualizer '
+            'and keep the rest of the existing design and content intact.'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'configurator.html'
+            source_content = (
+                '<!doctype html><html><body>'
+                '<section id="legacy-copy">Keep this complete section.</section>'
+                '<section id="visualizer">Old visualizer.</section>'
+                '<footer>Keep this footer.</footer>'
+                '</body></html>'
+            )
+            target_path.write_text(source_content, encoding='utf-8')
+            branch = {
+                'branch_id': 'branch-text-artifact-1',
+                'phase_id': 'phase-5',
+                'capability': 'chat',
+                'output_type': 'text',
+                'stage_direction': 'materialize_requested_text_artifact',
+                'requires_artifact': True,
+                'text_artifact_extension': 'html',
+                'text_artifact_source_name': 'configurator',
+                'text_artifact_source': 'canonical_predecessor_artifact',
+                'text_artifact_target_path': str(target_path),
+                'text_artifact_revision_required': True,
+                'text_artifact_revision_source': 'canonical_predecessor_artifact',
+                'text_artifact_revision_binding_state': 'bound',
+                'text_artifact_source_is_input': True,
+                'artifact_request': {
+                    'extension': 'html',
+                    'source_name': 'configurator',
+                    'source': 'canonical_predecessor_artifact',
+                    'target_path': str(target_path),
+                },
+            }
+
+            spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+                branch=branch,
+                artifact_gap={},
+                current_payload={
+                    'id': 'resp_predecessor_revision_source',
+                    'request': {
+                        'reference_artifacts': [
+                            {
+                                'type': 'message',
+                                'message_id': 'stale-reply',
+                                'content': 'Create an unrelated lighthouse image.',
+                            }
+                        ]
+                    },
+                    'runtime': {'request_phase_graph': {'current_phase_capability': 'chat'}},
+                },
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': prompt,
+                    'reference_artifacts': [
+                        {
+                            'type': 'message',
+                            'message_id': 'stale-reply',
+                            'content': 'Create an unrelated lighthouse image.',
+                        }
+                    ],
+                },
+                assistant_message='Artifacts generated.',
+                source_route_payload=None,
+                failed_instance_id=None,
+            )
+
+            gap = spec['prepare_args']['artifact_gap']
+            self.assertEqual(gap['content_payload'], source_content)
+            self.assertEqual(
+                gap['content_payload_source'],
+                'canonical_predecessor_text_artifact_snapshot',
+            )
+            self.assertEqual(
+                gap['dependency_payload_policy'],
+                'preserve_text_artifact_revision_source',
+            )
+            self.assertTrue(gap['suppress_reference_file_context'])
+            self.assertRegex(gap['text_artifact_revision_source_sha256'], r'^[0-9a-f]{64}$')
+            self.assertTrue(gap['text_artifact_revision_preservation_required'])
+            self.assertEqual(
+                gap['text_artifact_revision_preservation_policy'],
+                'structural_anchor_retention_v1',
+            )
+
+            instruction = _LATE_FILL_RUNTIME._text_artifact_materialization_instruction(
+                prompt,
+                gap,
+            )
+            self.assertIn('authoritative edit delta', instruction)
+            self.assertIn('Keep this complete section.', instruction)
+            self.assertIn('Keep this footer.', instruction)
+            self.assertIn('Do not redesign, summarize, omit unchanged sections', instruction)
+            self.assertNotIn('Create an unrelated lighthouse image.', instruction)
+
+    def test_text_revision_old_target_is_input_until_current_branch_writes_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'styles.css'
+            original = '.legacy { color: silver; }\n.visualizer { background: black; }\n'
+            updated_content = (
+                '.legacy { color: silver; }\n'
+                '.visualizer { background: url("new-titanium.png"); }\n'
+            )
+            target_path.write_text(original, encoding='utf-8')
+            branch = {
+                'branch_id': 'branch-text-artifact-2',
+                'phase_id': 'phase-6',
+                'capability': 'chat',
+                'output_type': 'text',
+                'stage_direction': 'materialize_requested_text_artifact',
+                'requires_artifact': True,
+                'text_artifact_extension': 'css',
+                'text_artifact_source_name': 'styles',
+                'text_artifact_source': 'canonical_predecessor_artifact',
+                'text_artifact_target_path': str(target_path),
+                'text_artifact_revision_required': True,
+                'text_artifact_revision_source': 'canonical_predecessor_artifact',
+                'text_artifact_source_is_input': True,
+                'text_artifact_revision_preservation_required': True,
+                'text_artifact_revision_source_sha256': hashlib.sha256(
+                    original.encode('utf-8')
+                ).hexdigest(),
+                'artifact_request': {
+                    'extension': 'css',
+                    'source_name': 'styles',
+                    'source': 'canonical_predecessor_artifact',
+                    'target_path': str(target_path),
+                },
+            }
+            old_payload = {
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(target_path),
+                        'text_artifact_extension': 'css',
+                        'text_artifact_source_name': 'styles',
+                    }
+                ]
+            }
+
+            self.assertEqual(
+                _LATE_FILL_RUNTIME._canonical_text_artifact_branch_fulfillment(
+                    branch,
+                    old_payload,
+                ),
+                {},
+            )
+            missing_result, missing_error = (
+                _LATE_FILL_RUNTIME._materialize_required_text_artifact_target_path(
+                    branch,
+                    {},
+                    {},
+                    extension='css',
+                    source_name='styles',
+                )
+            )
+            self.assertEqual(missing_result, {})
+            self.assertEqual(missing_error['code'], 'TEXT_ARTIFACT_REVISION_OUTPUT_MISSING')
+            self.assertEqual(target_path.read_text(encoding='utf-8'), original)
+
+            written_result, written_error = (
+                _LATE_FILL_RUNTIME._materialize_required_text_artifact_target_path(
+                    branch,
+                    {'output_text': updated_content},
+                    {
+                        'content_payload': original,
+                        'content_payload_source': (
+                            'canonical_predecessor_text_artifact_snapshot'
+                        ),
+                        'text_artifact_revision_preservation_required': True,
+                    },
+                    extension='css',
+                    source_name='styles',
+                )
+            )
+            self.assertIsNone(written_error)
+            self.assertEqual(target_path.read_text(encoding='utf-8'), updated_content.strip())
+            self.assertEqual(written_result['text_artifact_source'], 'target_path_revision_output')
+            proof = written_result['text_artifact_revision_write_proof']
+            self.assertEqual(proof['status'], 'applied')
+            self.assertEqual(proof['target_path'], str(target_path))
+            self.assertEqual(
+                proof['output_sha256'],
+                hashlib.sha256(updated_content.strip().encode('utf-8')).hexdigest(),
+            )
+            self.assertEqual(
+                written_result['text_artifact_revision_preservation_evidence']['status'],
+                'passed',
+            )
+
+    def test_text_revision_preservation_blocks_shared_css_truncation_before_write(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'styles.css'
+            original = (
+                '.global-nav { display: flex; }\n'
+                '.nav-link { color: silver; }\n'
+                '.hero-section { min-height: 80vh; }\n'
+                '.hero-image-wrapper { position: absolute; }\n'
+                '.hero-content { position: relative; }\n'
+                '.brand-title { letter-spacing: .3em; }\n'
+                '.philosophy-section { padding: 8rem 0; }\n'
+                '.philosophy-grid { display: grid; }\n'
+                '.atelier-showcase { padding: 6rem 0; }\n'
+                '.showcase-split { display: grid; }\n'
+                '.configurator-engine { min-height: 80vh; }\n'
+                '.preview-stage { overflow: hidden; }\n'
+            )
+            truncated = (
+                '.global-nav { display: flex; }\n'
+                '.nav-link { color: silver; }\n'
+                '.configurator-engine { min-height: 80vh; }\n'
+                '.preview-stage { overflow: hidden; }\n'
+                '.preview-watch-img { object-fit: contain; }\n'
+            )
+            target_path.write_text(original, encoding='utf-8')
+            branch = {
+                'branch_id': 'branch-text-artifact-css-preserve',
+                'phase_id': 'phase-6',
+                'capability': 'chat',
+                'stage_direction': 'materialize_requested_text_artifact',
+                'requires_artifact': True,
+                'text_artifact_extension': 'css',
+                'text_artifact_source_name': 'styles',
+                'text_artifact_target_path': str(target_path),
+                'text_artifact_revision_required': True,
+                'text_artifact_revision_source': 'canonical_predecessor_artifact',
+                'text_artifact_source_is_input': True,
+                'text_artifact_revision_preservation_required': True,
+                'artifact_request': {
+                    'extension': 'css',
+                    'source_name': 'styles',
+                    'source': 'canonical_predecessor_artifact',
+                    'target_path': str(target_path),
+                },
+            }
+
+            result, error = (
+                _LATE_FILL_RUNTIME._materialize_required_text_artifact_target_path(
+                    branch,
+                    {'output_text': truncated},
+                    {
+                        'content_payload': original,
+                        'content_payload_source': (
+                            'canonical_predecessor_text_artifact_snapshot'
+                        ),
+                        'text_artifact_revision_preservation_required': True,
+                    },
+                    extension='css',
+                    source_name='styles',
+                )
+            )
+
+            self.assertEqual(result, {'output_text': truncated})
+            self.assertEqual(error['code'], 'TEXT_ARTIFACT_REVISION_PRESERVATION_FAILED')
+            evidence = error['text_artifact_revision_preservation_evidence']
+            self.assertEqual(evidence['status'], 'failed')
+            self.assertEqual(evidence['failure_reason'], 'structural_anchor_loss')
+            self.assertLess(evidence['anchor_retention_ratio'], 0.78)
+            self.assertIn('selector:.hero-section', evidence['missing_anchors'])
+            self.assertEqual(target_path.read_text(encoding='utf-8'), original)
+
+    def test_text_revision_full_replacement_does_not_invent_preservation_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir) / 'styles.css'
+            target_path.write_text('.legacy { color: silver; }', encoding='utf-8')
+            branch = {
+                'branch_id': 'branch-text-artifact-replace',
+                'phase_id': 'phase-2',
+                'capability': 'chat',
+                'requires_artifact': True,
+                'text_artifact_extension': 'css',
+                'text_artifact_source_name': 'styles',
+                'text_artifact_target_path': str(target_path),
+                'text_artifact_revision_required': True,
+                'text_artifact_revision_source': 'canonical_predecessor_artifact',
+                'artifact_request': {
+                    'extension': 'css',
+                    'source_name': 'styles',
+                    'target_path': str(target_path),
+                },
+            }
+
+            spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+                branch=branch,
+                artifact_gap={},
+                current_payload={
+                    'id': 'resp_replace_revision',
+                    'runtime': {'request_phase_graph': {'current_phase_capability': 'chat'}},
+                },
+                request_payload={
+                    'ghost_route': True,
+                    'prompt': 'Replace styles.css completely with a new minimal stylesheet.',
+                },
+                assistant_message='Artifacts generated.',
+                source_route_payload=None,
+                failed_instance_id=None,
+            )
+
+            gap = spec['prepare_args']['artifact_gap']
+            self.assertNotIn('text_artifact_revision_preservation_required', gap)
+            self.assertNotIn('text_artifact_revision_preservation_policy', gap)
+
+    def test_current_turn_image_manifest_suppresses_stale_reference_reply_prompt(self):
+        artifact_prompt = (
+            'A front-facing macro shot of a hyper-luxury watch case made of brushed titanium '
+            'on a dark background.'
+        )
+        branch = {
+            'branch_id': 'branch-image_generation-1',
+            'phase_id': 'phase-2',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'requires_artifact': True,
+            'artifact_prompt': artifact_prompt,
+            'artifact_prompt_source': 'current_turn_explicit_image_manifest',
+        }
+        selected_reply = {
+            'type': 'message',
+            'message_id': 'old-reply',
+            'content': 'Finally, create one image of a lighthouse.',
+        }
+
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=branch,
+            artifact_gap={'trigger': 'execution_planner_deferred_follow_up'},
+            current_payload={
+                'id': 'resp_current_manifest_reference_suppression',
+                'request': {'reference_artifacts': [selected_reply]},
+                'runtime': {'request_phase_graph': {'current_phase_capability': 'chat'}},
+            },
+            request_payload={
+                'ghost_route': True,
+                'prompt': 'Generate exactly 3 new cinematic images.',
+                'reference_artifacts': [selected_reply],
+            },
+            assistant_message='Artifacts generated.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        gap = spec['prepare_args']['artifact_gap']
+        self.assertEqual(gap['artifact_prompt'], artifact_prompt)
+        self.assertTrue(gap['suppress_reference_file_context'])
+        self.assertEqual(
+            gap['selected_reference_prompt_policy'],
+            'suppressed_for_current_turn_branch_prompt',
+        )
+
+    def test_semantic_prepare_image_prompt_suppresses_ambient_selected_reply(self):
+        artifact_prompt = (
+            'A square cinematic macro photograph of a forged-carbon watch case, '
+            'front-facing under directional bench light.'
+        )
+        selected_reply = {
+            'type': 'message',
+            'message_id': 'old-pricing-reply',
+            'content': '{"materials": ["old unrelated reference"]}',
+        }
+        branch = {
+            'branch_id': 'branch-image_generation-2',
+            'phase_id': 'phase-3',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'requires_artifact': True,
+            'artifact_prompt': artifact_prompt,
+            'artifact_prompt_source': 'semantic_prepare_phase_output',
+            'input_refs': [
+                {'kind': 'phase_output', 'phase_id': 'phase-1', 'role': 'dependency'}
+            ],
+        }
+
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=branch,
+            artifact_gap={'trigger': 'execution_planner_deferred_follow_up'},
+            current_payload={
+                'id': 'resp_semantic_prepare_reference_suppression',
+                'request': {'reference_artifacts': [selected_reply]},
+                'runtime': {'request_phase_graph': {'current_phase_capability': 'chat'}},
+            },
+            request_payload={
+                'ghost_route': True,
+                'prompt': 'Create three watch material images.',
+                'reference_artifacts': [selected_reply],
+            },
+            assistant_message='Artifacts prepared.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        gap = spec['prepare_args']['artifact_gap']
+        self.assertEqual(gap['artifact_prompt'], artifact_prompt)
+        self.assertTrue(gap['suppress_reference_file_context'])
+        self.assertEqual(
+            gap['selected_reference_prompt_policy'],
+            'suppressed_for_branch_local_image_prompt',
+        )
+
+    def test_branch_local_image_prompt_keeps_explicit_selected_reference_dependency(self):
+        branch = {
+            'branch_id': 'branch-image_generation-edit-1',
+            'phase_id': 'phase-2',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'requires_artifact': True,
+            'artifact_prompt': 'Edit the selected watch image to use a rose-gold case.',
+            'artifact_prompt_source': 'current_turn_explicit_image_manifest',
+            'input_refs': [
+                {
+                    'kind': 'selected_reference_artifact',
+                    'artifact_ref': 'artifact:selected-watch',
+                    'role': 'preserved_visual_artifact',
+                }
+            ],
+        }
+
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=branch,
+            artifact_gap={'trigger': 'execution_planner_deferred_follow_up'},
+            current_payload={
+                'id': 'resp_explicit_image_reference_dependency',
+                'runtime': {'request_phase_graph': {'current_phase_capability': 'chat'}},
+            },
+            request_payload={
+                'ghost_route': True,
+                'prompt': 'Edit the selected watch image.',
+            },
+            assistant_message='Edit prepared.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        gap = spec['prepare_args']['artifact_gap']
+        self.assertFalse(gap.get('suppress_reference_file_context', False))
+        self.assertNotIn('selected_reference_prompt_policy', gap)
 
     @patch("ollmo_webserver._schedule_response_late_fill", return_value=True)
     @patch("ollmo_webserver._execute_chat_backend_request")
@@ -11355,6 +12026,8 @@ class ResponsesApiTests(unittest.TestCase):
                 "phase_id": phase_id,
                 "capability": "chat",
                 "output_type": "text",
+                "task_id": f"task-{branch_id}",
+                "obligation_id": f"obligation-{branch_id}",
                 "stage_direction": "materialize_requested_text_artifact",
                 "requires_artifact": True,
                 "text_artifact_extension": extension,
@@ -11380,6 +12053,12 @@ class ResponsesApiTests(unittest.TestCase):
         coalesced_specs = _LATE_FILL_RUNTIME._coalesce_required_text_artifact_branch_specs(
             [
                 branch_spec("branch-chat-index", "phase-index", "html", "index"),
+                branch_spec(
+                    "branch-chat-configurator",
+                    "phase-configurator",
+                    "html",
+                    "configurator",
+                ),
                 branch_spec("branch-chat-styles", "phase-styles", "css", "styles"),
             ]
         )
@@ -11388,13 +12067,22 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertTrue(coalesced_spec["coalesced_text_artifact_wave"])
         self.assertEqual(
             [item["branch_id"] for item in coalesced_spec["coalesced_text_artifact_branches"]],
-            ["branch-chat-index", "branch-chat-styles"],
+            [
+                "branch-chat-index",
+                "branch-chat-configurator",
+                "branch-chat-styles",
+            ],
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "index.html"
+            configurator_path = Path(tmpdir) / "configurator.html"
             css_path = Path(tmpdir) / "styles.css"
             html_path.write_text("<!doctype html><h1>Hello</h1>", encoding="utf-8")
+            configurator_path.write_text(
+                "<!doctype html><h1>Configure</h1>",
+                encoding="utf-8",
+            )
             css_path.write_text("body { color: red; }", encoding="utf-8")
             coalesced_branch_id = coalesced_spec["branch_id"]
             expanded = _LATE_FILL_RUNTIME._expand_coalesced_text_artifact_materialization(
@@ -11424,6 +12112,13 @@ class ResponsesApiTests(unittest.TestCase):
                                         },
                                     },
                                     {
+                                        "path": str(configurator_path),
+                                        "text_artifact_request": {
+                                            "extension": "html",
+                                            "source_name": "configurator",
+                                        },
+                                    },
+                                    {
                                         "path": str(css_path),
                                         "text_artifact_request": {
                                             "extension": "css",
@@ -11440,19 +12135,202 @@ class ResponsesApiTests(unittest.TestCase):
 
         self.assertEqual(
             set(expanded["branch_results"]),
-            {"branch-chat-index", "branch-chat-styles"},
+            {
+                "branch-chat-index",
+                "branch-chat-configurator",
+                "branch-chat-styles",
+            },
         )
         self.assertEqual(
             [item["branch_id"] for item in expanded["prepared_branch_plans"]],
-            ["branch-chat-index", "branch-chat-styles"],
+            [
+                "branch-chat-index",
+                "branch-chat-configurator",
+                "branch-chat-styles",
+            ],
         )
         self.assertEqual(
             expanded["branch_results"]["branch-chat-index"]["infer_result"]["saved_text_path"],
             str(html_path),
         )
         self.assertEqual(
+            expanded["branch_results"]["branch-chat-configurator"][
+                "infer_result"
+            ]["saved_text_path"],
+            str(configurator_path),
+        )
+        self.assertEqual(
             expanded["branch_results"]["branch-chat-styles"]["infer_result"]["saved_text_path"],
             str(css_path),
+        )
+        for branch_id in (
+            "branch-chat-index",
+            "branch-chat-configurator",
+            "branch-chat-styles",
+        ):
+            contract = expanded["branch_results"][branch_id]["execution_contract"]
+            self.assertEqual(contract["branch_id"], branch_id)
+            self.assertEqual(contract["workload_task_ref"]["task_id"], f"task-{branch_id}")
+            self.assertEqual(
+                contract["output_obligation_ref"]["obligation_id"],
+                f"obligation-{branch_id}",
+            )
+
+        blocked_expanded = (
+            _LATE_FILL_RUNTIME._expand_coalesced_text_artifact_materialization(
+                {
+                    'prepared_branch_plans': [
+                        {
+                            'branch_id': coalesced_branch_id,
+                            'phase_id': coalesced_branch_id,
+                            'capability': 'chat',
+                            'branch': coalesced_spec,
+                        }
+                    ],
+                    'branch_results': {
+                        coalesced_branch_id: {
+                            'branch_id': coalesced_branch_id,
+                            'capability': 'chat',
+                            'infer_result': {
+                                'external_provider_block': {
+                                    'code': 'EXTERNAL_PROVIDER_BLOCKED',
+                                    'reason': 'Bounded provider block.',
+                                }
+                            },
+                        }
+                    },
+                    'branch_errors': {},
+                }
+            )
+        )
+        self.assertEqual(blocked_expanded['branch_errors'], {})
+        self.assertEqual(
+            set(blocked_expanded['branch_results']),
+            {
+                'branch-chat-index',
+                'branch-chat-configurator',
+                'branch-chat-styles',
+            },
+        )
+        self.assertTrue(
+            all(
+                item['infer_result']['external_provider_block']['code']
+                == 'EXTERNAL_PROVIDER_BLOCKED'
+                for item in blocked_expanded['branch_results'].values()
+            )
+        )
+
+    def test_text_recovery_authority_survives_normalization_and_disables_coalescing(
+        self,
+    ):
+        raw_recovery_branch = {
+            'branch_id': 'branch-chat-recovery',
+            'phase_id': 'phase-chat-recovery',
+            'capability': 'chat',
+            'output_type': 'text',
+            'stage_direction': 'materialize_requested_text_artifact',
+            'requires_artifact': True,
+            'text_artifact_extension': 'html',
+            'text_artifact_source_name': 'index',
+            'artifact_request': {
+                'extension': 'html',
+                'source_name': 'index',
+            },
+            'exclude_instance_ids': ['chat-failed'],
+            'auto_execute': True,
+            'repair_work_available': True,
+            'auto_executable_repair_retry_count': 1,
+            'auto_executable_repair_max_attempts': 3,
+            'recovery_state': {
+                'kind': 'ollmo.late_fill_recovery_state',
+                'status': 'attempting',
+                'failed_instance_id': 'chat-failed',
+                'exclude_instance_ids': ['chat-failed'],
+            },
+        }
+        normalized = _normalize_late_fill_branches(
+            [raw_recovery_branch]
+        )[0]
+        self.assertEqual(
+            normalized['excluded_instance_ids'],
+            ['chat-failed'],
+        )
+        self.assertTrue(normalized['auto_execute'])
+        self.assertTrue(normalized['repair_work_available'])
+        self.assertEqual(
+            normalized['auto_executable_repair_retry_count'],
+            1,
+        )
+        self.assertEqual(
+            normalized['auto_executable_repair_max_attempts'],
+            3,
+        )
+        normalized_image = _normalize_late_fill_branches(
+            [
+                {
+                    'branch_id': 'branch-image-recovery',
+                    'capability': 'image_generation',
+                    'autoExecute': True,
+                    'repairWorkAvailable': False,
+                    'autoExecutableRepairRetryCount': 1,
+                    'autoExecutableRepairMaxAttempts': 2,
+                }
+            ]
+        )[0]
+        self.assertTrue(normalized_image['auto_execute'])
+        self.assertFalse(normalized_image['repair_work_available'])
+        self.assertEqual(
+            normalized_image['auto_executable_repair_retry_count'],
+            1,
+        )
+        self.assertEqual(
+            normalized_image['auto_executable_repair_max_attempts'],
+            2,
+        )
+
+        def branch_spec(branch):
+            return {
+                'branch_id': branch['branch_id'],
+                'phase_id': branch['phase_id'],
+                'capability': 'chat',
+                'reservation_group': 'chat',
+                'branch': branch,
+                'prepare_args': {
+                    'expected_capability': 'chat',
+                    'artifact_gap': dict(branch),
+                },
+            }
+
+        fresh_branch = {
+            **raw_recovery_branch,
+            'branch_id': 'branch-chat-fresh',
+            'phase_id': 'phase-chat-fresh',
+            'text_artifact_source_name': 'configurator',
+            'artifact_request': {
+                'extension': 'html',
+                'source_name': 'configurator',
+            },
+        }
+        for key in (
+            'exclude_instance_ids',
+            'auto_execute',
+            'repair_work_available',
+            'auto_executable_repair_retry_count',
+            'auto_executable_repair_max_attempts',
+            'recovery_state',
+        ):
+            fresh_branch.pop(key, None)
+        coalesced = (
+            _LATE_FILL_RUNTIME._coalesce_required_text_artifact_branch_specs(
+                [branch_spec(normalized), branch_spec(fresh_branch)]
+            )
+        )
+        self.assertEqual(len(coalesced), 2)
+        self.assertFalse(
+            any(
+                item.get('coalesced_text_artifact_wave') is True
+                for item in coalesced
+            )
         )
 
     def test_coalesced_required_text_artifact_expansion_uses_canonical_source_artifacts(self):
@@ -11552,8 +12430,8 @@ class ResponsesApiTests(unittest.TestCase):
             str(css_path),
         )
 
-    def test_coalesced_text_no_saved_file_retry_uses_original_text_branches(self):
-        response_id = "resp_coalesced_text_split_retry_after_no_saved_file"
+    def test_coalesced_text_no_saved_file_retry_preserves_atomic_cohort(self):
+        response_id = "resp_coalesced_text_atomic_retry_after_no_saved_file"
         prompt = "Create saved local artifacts index.html and styles.css."
         branches = [
             {
@@ -11623,8 +12501,15 @@ class ResponsesApiTests(unittest.TestCase):
                         "concurrency_policy": {"scheduler": "test-coalesced"},
                     }
 
+                self.assertEqual(len(branch_ids), 1)
+                self.assertEqual(branch_ids[0], executed_branch_ids[0][0])
+                recovery = branch_specs[0][
+                    "coalesced_text_artifact_recovery"
+                ]
+                self.assertEqual(recovery["attempt_number"], 2)
+                self.assertEqual(recovery["maximum_attempts"], 2)
                 self.assertEqual(
-                    branch_ids,
+                    recovery["member_branch_ids"],
                     ["branch-text_artifact-1", "branch-text_artifact-2"],
                 )
                 index_path.write_text(
@@ -11635,13 +12520,17 @@ class ResponsesApiTests(unittest.TestCase):
                 styles_path.write_text("body { color: #111; }\n", encoding="utf-8")
                 return {
                     "prepared_branch_plans": [
-                        {"branch_id": "branch-text_artifact-1", "capability": "chat"},
-                        {"branch_id": "branch-text_artifact-2", "capability": "chat"},
+                        {
+                            "branch_id": branch_ids[0],
+                            "phase_id": branch_ids[0],
+                            "capability": "chat",
+                            "branch": branch_specs[0],
+                        },
                     ],
                     "branch_results": {
-                        "branch-text_artifact-1": {
-                            "branch_id": "branch-text_artifact-1",
-                            "phase_id": "phase-index",
+                        branch_ids[0]: {
+                            "branch_id": branch_ids[0],
+                            "phase_id": branch_ids[0],
                             "capability": "chat",
                             "infer_result": {
                                 "mode": "chat",
@@ -11653,32 +12542,16 @@ class ResponsesApiTests(unittest.TestCase):
                                             "extension": "html",
                                             "source_name": "index",
                                         },
-                                    }
-                                ],
-                                "text_artifact_extension": "html",
-                                "text_artifact_source_name": "index",
-                                "output_text": index_path.read_text(encoding="utf-8"),
-                            },
-                        },
-                        "branch-text_artifact-2": {
-                            "branch_id": "branch-text_artifact-2",
-                            "phase_id": "phase-styles",
-                            "capability": "chat",
-                            "infer_result": {
-                                "mode": "chat",
-                                "saved_text_path": str(styles_path),
-                                "saved_text_artifacts": [
+                                    },
                                     {
                                         "path": str(styles_path),
                                         "text_artifact_request": {
                                             "extension": "css",
                                             "source_name": "styles",
                                         },
-                                    }
+                                    },
                                 ],
-                                "text_artifact_extension": "css",
-                                "text_artifact_source_name": "styles",
-                                "output_text": styles_path.read_text(encoding="utf-8"),
+                                "output_text": "Saved the complete bundle.",
                             },
                         },
                     },
@@ -11728,7 +12601,7 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertTrue(executed_branch_ids[0][0].startswith("coalesced-text-artifacts-"))
         self.assertEqual(
             executed_branch_ids[1],
-            ["branch-text_artifact-1", "branch-text_artifact-2"],
+            executed_branch_ids[0],
         )
         late_fill = _RESPONSE_LOOKUP[response_id]["response_payload"]["late_fill"]
         self.assertEqual(late_fill["status"], "completed")
@@ -11744,6 +12617,15 @@ class ResponsesApiTests(unittest.TestCase):
                 if str(item.get("saved_text_path") or "")
             },
             {"index.html", "styles.css"},
+        )
+        recovery_history = late_fill[
+            "coalesced_text_artifact_recovery_history"
+        ]
+        self.assertEqual(len(recovery_history), 1)
+        self.assertEqual(recovery_history[0]["status"], "completed")
+        self.assertEqual(
+            recovery_history[0]["member_branch_ids"],
+            ["branch-text_artifact-1", "branch-text_artifact-2"],
         )
 
     def test_coalesced_text_missing_branch_result_uses_canonical_evidence_without_failed_event(self):
@@ -11895,6 +12777,174 @@ class ResponsesApiTests(unittest.TestCase):
                 in str(event.get("message") or "")
             ]
         )
+
+    def test_existing_named_text_artifacts_prefulfill_all_branches_including_json(self):
+        response_id = "resp_existing_named_text_artifacts_include_json"
+        requests = [
+            ("html", "index"),
+            ("css", "styles"),
+            ("html", "configurator"),
+            ("json", "pricing"),
+        ]
+        branches = [
+            {
+                "branch_id": f"branch-text_artifact-{index}",
+                "phase_id": f"phase-{index + 1}",
+                "capability": "chat",
+                "output_type": "text",
+                "stage_direction": "materialize_requested_text_artifact",
+                "requires_artifact": True,
+                "text_artifact_extension": extension,
+                "text_artifact_source_name": source_name,
+                "artifact_request": {
+                    "extension": extension,
+                    "source_name": source_name,
+                    "source": "explicit_extension",
+                },
+            }
+            for index, (extension, source_name) in enumerate(requests, start=1)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = {
+                "index": root / "20260804T183934Z_responses_stream_chat_text_artifact_model_index.html",
+                "styles": root / "20260804T183934Z_responses_stream_chat_text_artifact_model_styles.css",
+                "configurator": root
+                / "20260804T183934Z_responses_stream_chat_text_artifact_model_configurator.html",
+                "pricing": root / "20260804T183934Z_responses_stream_chat_text_artifact_model_pricing.json",
+            }
+            paths["index"].write_text(
+                "<!doctype html><html><body><h1>Index</h1></body></html>",
+                encoding="utf-8",
+            )
+            paths["styles"].write_text("body { color: #111; }", encoding="utf-8")
+            paths["configurator"].write_text(
+                "<!doctype html><html><body><h1>Configurator</h1></body></html>",
+                encoding="utf-8",
+            )
+            paths["pricing"].write_text(
+                '[{"material":"titanium","price_chf":1500}]',
+                encoding="utf-8",
+            )
+            response_payload = {
+                "id": response_id,
+                "mode": "chat",
+                "status": "completed",
+                "output_text": "The requested files are available.",
+                # These are canonical current-response files whose generated
+                # filenames retain the requested source name, but whose branch
+                # projection has not yet been attached.
+                "artifacts": [
+                    {
+                        "type": "text",
+                        "kind": "text",
+                        "path": str(paths[source_name]),
+                        "mime_type": {
+                            "html": "text/html",
+                            "css": "text/css",
+                            "json": "application/json",
+                        }[extension],
+                    }
+                    for extension, source_name in requests
+                ],
+                "runtime": {
+                    "request_phase_graph": {
+                        "current_phase_id": "phase-1",
+                        "current_phase_resolution": "graph_resolved",
+                        "phases": [
+                            {"phase_id": "phase-1", "capability": "chat", "status": "completed"},
+                            *branches,
+                        ],
+                    },
+                },
+                "late_fill": {
+                    "status": "pending",
+                    "expected_capability": "chat",
+                    "pending_branches": list(branches),
+                },
+            }
+            execute_materialization_branches = Mock()
+            with patch.object(
+                _LATE_FILL_RUNTIME,
+                "execute_materialization_branches",
+                new=execute_materialization_branches,
+            ):
+                _complete_response_late_fill(
+                    response_payload=response_payload,
+                    request_payload={"prompt": "Create index.html, styles.css, configurator.html, and pricing.json."},
+                    assistant_message=response_payload["output_text"],
+                    artifact_gap={
+                        "expected_capability": "chat",
+                        "pending_branches": list(branches),
+                    },
+                    source_route_payload={"route_runtime": response_payload["runtime"]},
+                )
+            execute_materialization_branches.assert_not_called()
+
+            finalized = _RESPONSE_LOOKUP[response_id]["response_payload"]
+            text_results = {
+                item.get("branch_id"): item
+                for item in finalized["late_fill"].get("fill_results") or []
+                if str(item.get("branch_id") or "").startswith("branch-text_artifact-")
+            }
+            self.assertEqual(set(text_results), {branch["branch_id"] for branch in branches})
+            self.assertEqual(
+                text_results["branch-text_artifact-4"]["saved_text_path"],
+                str(paths["pricing"]),
+            )
+            self.assertTrue(
+                all(
+                    item.get("text_artifact_source") == "canonical_text_artifact_evidence"
+                    for item in text_results.values()
+                )
+            )
+            public_pricing_paths = {
+                str(item.get("path") or "")
+                for item in finalized.get("artifacts") or []
+                if str(item.get("path") or "").endswith("_pricing.json")
+            }
+            self.assertEqual(public_pricing_paths, {str(paths["pricing"])})
+
+    def test_canonical_named_text_artifact_evidence_rejects_ambiguous_pricing_files(self):
+        branch = {
+            "branch_id": "branch-text_artifact-4",
+            "phase_id": "phase-5",
+            "capability": "chat",
+            "output_type": "text",
+            "stage_direction": "materialize_requested_text_artifact",
+            "requires_artifact": True,
+            "text_artifact_extension": "json",
+            "text_artifact_source_name": "pricing",
+            "artifact_request": {
+                "extension": "json",
+                "source_name": "pricing",
+                "source": "explicit_extension",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pricing_paths = [
+                root / "20260804T183934Z_chat_text_artifact_model_pricing.json",
+                root / "20260804T184833Z_chat_text_artifact_other_model_pricing.json",
+            ]
+            for index, path in enumerate(pricing_paths, start=1):
+                path.write_text(
+                    json.dumps({"material": "titanium", "price_chf": 1000 + index}),
+                    encoding="utf-8",
+                )
+            payload = {
+                "artifacts": [
+                    {"type": "text", "kind": "text", "path": str(path)}
+                    for path in pricing_paths
+                ]
+            }
+
+            fulfillment = _LATE_FILL_RUNTIME._canonical_text_artifact_branch_fulfillment(
+                branch,
+                payload,
+            )
+
+        self.assertEqual(fulfillment, {})
 
     def test_coalesced_text_missing_branch_result_repairs_canonical_html_without_failed_event(self):
         response_id = "resp_coalesced_text_repairable_canonical_evidence"
@@ -13138,6 +14188,7 @@ class ResponsesApiTests(unittest.TestCase):
             prepared_calls.append(
                 {
                     "instance_id": instance_id,
+                    "failed_instance_id": failed_instance_id,
                     "excluded_instance_ids": list(excluded_instance_ids or []),
                     "artifact_prompt": str(artifact_gap.get("artifact_prompt") or "").strip(),
                 }
@@ -13186,6 +14237,7 @@ class ResponsesApiTests(unittest.TestCase):
 
         response_payload = {
             "id": response_id,
+            "instance_id": "chat-prepare-completed",
             "mode": "chat",
             "output_text": "Three image prompts were prepared.",
             "status": "completed",
@@ -13262,7 +14314,7 @@ class ResponsesApiTests(unittest.TestCase):
             "route_runtime": response_payload["runtime"],
         }
         artifact_gap = {
-            "trigger": "execution_planner_deferred_follow_up",
+            "trigger": "pre_freeze_closure_review",
             "expected_capability": "image_generation",
             "pending_branches": list(response_payload["late_fill"]["pending_branches"]),
             "batch_prompts": list(response_payload["late_fill"]["batch_prompts"]),
@@ -13279,6 +14331,9 @@ class ResponsesApiTests(unittest.TestCase):
         )
 
         self.assertEqual(len(prepared_calls), 3)
+        self.assertTrue(
+            all(item["failed_instance_id"] is None for item in prepared_calls)
+        )
         self.assertEqual(prepared_calls[0]["excluded_instance_ids"], [])
         self.assertEqual(prepared_calls[1]["excluded_instance_ids"], ["img-1"])
         self.assertEqual(prepared_calls[2]["excluded_instance_ids"], ["img-1", "img-2"])
@@ -17361,6 +18416,130 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertFalse(payload['status_semantics']['has_open_continuation'])
         self.assertFalse(payload['status_semantics']['is_terminal'])
 
+    def test_completed_late_fill_closes_exactly_fulfilled_promoted_repair_contract(self):
+        target_path = '/tmp/artifacts/documents/index.html'
+        artifact_request = {
+            'extension': 'html',
+            'source': 'closure_syntax_repair',
+            'source_name': 'index',
+            'target_path': target_path,
+        }
+        late_fill = {
+            'status': 'completed',
+            'final_materialization_contract_status': 'fulfilled',
+            'repair_action': 'retry_same_branch',
+            'repair_actions': ['retry_same_branch'],
+            'pending_branches': [],
+            'active_branches': [],
+            'failed_branches': [],
+            'recovery_candidates': [],
+            'completed_branches': [
+                {
+                    'branch_id': 'repair-chat',
+                    'phase_id': 'repair-chat',
+                    'status': 'fulfilled',
+                    'capability': 'chat',
+                    'output_type': 'text',
+                    'artifact_request': dict(artifact_request),
+                }
+            ],
+            'repair_loop': {
+                'status': 'promoted',
+                'repair_work_available': True,
+                'repair_work_available_count': 1,
+                'executable_contract_count': 1,
+                'promoted_contracts': [
+                    {
+                        'contract_id': 'repair-contract-chat',
+                        'status': 'promoted',
+                        'capability': 'chat',
+                        'output_type': 'text',
+                        'artifact_request': dict(artifact_request),
+                    }
+                ],
+            },
+        }
+        late_fill['ghost_repair_feedback'] = {
+            'status': 'repair_required',
+            'repair_loop': copy.deepcopy(late_fill['repair_loop']),
+        }
+
+        self.assertFalse(late_fill_has_actionable_repair_work(late_fill))
+        mismatched = copy.deepcopy(late_fill)
+        mismatched['completed_branches'][0]['artifact_request']['target_path'] = (
+            '/tmp/artifacts/documents/other.html'
+        )
+        self.assertTrue(late_fill_has_actionable_repair_work(mismatched))
+        identity_mismatch = copy.deepcopy(mismatched)
+        identity_mismatch['repair_loop']['promoted_contracts'][0]['branch_id'] = 'repair-chat'
+        self.assertTrue(late_fill_has_actionable_repair_work(identity_mismatch))
+        duplicate_contract = copy.deepcopy(late_fill)
+        second_contract = copy.deepcopy(
+            duplicate_contract['repair_loop']['promoted_contracts'][0]
+        )
+        second_contract['contract_id'] = 'repair-contract-chat-2'
+        duplicate_contract['repair_loop']['promoted_contracts'].append(second_contract)
+        self.assertTrue(late_fill_has_actionable_repair_work(duplicate_contract))
+        partial_identity = copy.deepcopy(late_fill)
+        partial_contract = partial_identity['repair_loop']['promoted_contracts'][0]
+        partial_contract['branch_id'] = 'repair-chat'
+        partial_contract['artifact_request'].pop('source')
+        partial_contract['artifact_request'].pop('source_name')
+        self.assertFalse(late_fill_has_actionable_repair_work(partial_identity))
+        partial_contract['obligation_id'] = 'missing-obligation'
+        self.assertTrue(late_fill_has_actionable_repair_work(partial_identity))
+        reconciled = _LATE_FILL_RUNTIME._reconcile_terminal_satisfied_repair_loop(late_fill)
+        self.assertEqual(reconciled['repair_loop']['status'], 'completed')
+        self.assertFalse(reconciled['repair_loop']['repair_work_available'])
+        self.assertEqual(reconciled['repair_loop']['executable_contract_count'], 0)
+        self.assertEqual(reconciled['repair_loop']['resolved_contract_count'], 1)
+        self.assertEqual(reconciled['ghost_repair_feedback']['status'], 'resolved')
+        self.assertNotIn('repair_action', reconciled)
+        self.assertEqual(
+            _LATE_FILL_RUNTIME._reconcile_terminal_satisfied_repair_loop(mismatched)[
+                'repair_loop'
+            ]['status'],
+            'promoted',
+        )
+        finalized, effective_status = _LATE_FILL_RUNTIME.finalize_terminal_materialization_contract(
+            {
+                'id': 'resp_terminal_exact_repair_contract',
+                'status': 'completed',
+                'output_text': 'The repaired artifact is complete.',
+                'late_fill': copy.deepcopy(late_fill),
+            },
+            request_payload={'prompt': 'Repair only the existing target artifact.'},
+            route_payload={'capability': 'chat'},
+            artifact_gap={'expected_capability': 'chat'},
+            terminal_status='completed',
+        )
+        self.assertEqual(effective_status, 'completed')
+        self.assertEqual(finalized['late_fill']['repair_loop']['status'], 'completed')
+        self.assertEqual(finalized['late_fill']['ghost_repair_feedback']['status'], 'resolved')
+
+        response_id = 'resp_completed_exact_repair_contract'
+        payload = _build_response_lookup_payload(
+            {
+                'id': response_id,
+                'message_id': 'msg_completed_exact_repair_contract',
+                'status': 'completed',
+                'lifecycle_state': 'repair_needed',
+                'response_payload': {
+                    'id': response_id,
+                    'object': 'response',
+                    'status': 'completed',
+                    'lifecycle_state': 'repair_needed',
+                    'output_text': 'The repaired artifact is complete.',
+                    'late_fill': reconciled,
+                    'runtime': {'graph_closure_review': {'status': 'fulfilled'}},
+                },
+            }
+        )
+
+        self.assertEqual(payload['lifecycle_state'], 'completed')
+        self.assertFalse(payload['status_semantics']['has_actionable_repair'])
+        self.assertTrue(payload['status_semantics']['is_terminal'])
+
     def test_finalize_response_frame_refreshes_stale_late_fill_pending_after_completion(self):
         response_id = "resp_stale_late_fill_pending_refresh"
         payload = _finalize_response_frame_payload(
@@ -20914,6 +22093,420 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             self.assertEqual(rebinds[0]['status'], 'applied')
             self.assertGreaterEqual(rebinds[0]['change_count'], 2)
 
+    def test_terminal_linked_artifact_rebind_uses_exact_named_static_fetch_outside_visual_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents = root / 'documents'
+            images = root / 'images'
+            documents.mkdir()
+            images.mkdir()
+            configurator_path = documents / '20260815_configurator.html'
+            pricing_path = documents / '20260815_pricing.json'
+            settings_path = documents / '20260815_settings.json'
+            chair_path = images / 'chair.png'
+            configurator_path.write_text(
+                "<script>fetch('pricing.json').then(response => response.json());</script>",
+                encoding='utf-8',
+            )
+            pricing_path.write_text('{"basePrice": 1250}\n', encoding='utf-8')
+            settings_path.write_text('{"theme": "light"}\n', encoding='utf-8')
+            chair_path.write_bytes(b'png')
+            payload = {
+                'runtime': {
+                    'request_phase_graph': {
+                        'phases': [
+                            {
+                                'phase_id': 'phase-image',
+                                'branch_id': 'branch-image',
+                                'capability': 'image_generation',
+                                'output_type': 'image',
+                            },
+                            {
+                                'phase_id': 'phase-configurator',
+                                'branch_id': 'branch-configurator',
+                                'capability': 'chat',
+                                'output_type': 'text',
+                                'depends_on': ['phase-image'],
+                                'dependency_contract': 'local_visual_asset_binding',
+                            },
+                        ],
+                    },
+                },
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(configurator_path),
+                        'extension': 'html',
+                        'source_name': 'configurator',
+                        'branch_id': 'branch-configurator',
+                        'phase_id': 'phase-configurator',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(pricing_path),
+                        'extension': 'json',
+                        'source_name': 'pricing',
+                        'branch_id': 'branch-pricing',
+                        'phase_id': 'phase-pricing',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(settings_path),
+                        'extension': 'json',
+                        'source_name': 'settings',
+                    },
+                    {
+                        'type': 'image',
+                        'path': str(chair_path),
+                        'branch_id': 'branch-image',
+                        'phase_id': 'phase-image',
+                    },
+                ],
+                'late_fill': {'status': 'completed', 'fill_results': []},
+            }
+
+            updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+
+            html = configurator_path.read_text(encoding='utf-8')
+            self.assertIn("fetch('20260815_pricing.json')", html)
+            self.assertNotIn('20260815_settings.json', html)
+            changes = updated['late_fill']['linked_artifact_rebinds'][0]['changes']
+            fetch_change = next(item for item in changes if item['kind'] == 'static_fetch_link')
+            self.assertEqual(fetch_change['linked_path'], str(pricing_path))
+            self.assertEqual(
+                fetch_change['selection_policy'],
+                'exact_named_static_fetch_dependency',
+            )
+            self.assertEqual(
+                _LATE_FILL_RUNTIME._terminal_unresolved_local_dependency_link_open_checks(updated),
+                [],
+            )
+
+    def test_terminal_finalizer_rebinds_a_dependency_created_by_repair(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            html_path = root / 'configurator.html'
+            json_path = root / '20260815_catalog.json'
+            html_path.write_text(
+                "<script>fetch('catalog.json');</script>",
+                encoding='utf-8',
+            )
+            payload = {
+                'id': 'resp_rebind_after_terminal_repair',
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'extension': 'html',
+                        'source_name': 'configurator',
+                        'path': str(html_path),
+                    }
+                ],
+                'late_fill': {
+                    'status': 'completed',
+                    'completed_branches': [],
+                    'pending_branches': [],
+                    'active_branches': [],
+                    'failed_branches': [],
+                },
+            }
+
+            def create_repaired_dependency(current):
+                json_path.write_text('{"items": []}\n', encoding='utf-8')
+                repaired = dict(current)
+                repaired['artifacts'] = [
+                    *(current.get('artifacts') or []),
+                    {
+                        'type': 'text',
+                        'extension': 'json',
+                        'source_name': 'catalog',
+                        'path': str(json_path),
+                    },
+                ]
+                return repaired
+
+            with patch.object(
+                _LATE_FILL_RUNTIME,
+                '_repair_terminal_text_artifact_syntax',
+                side_effect=create_repaired_dependency,
+            ):
+                updated, effective_status = _LATE_FILL_RUNTIME.finalize_terminal_materialization_contract(
+                    payload,
+                    request_payload={'prompt': 'Create a local configurator and catalog.'},
+                    route_payload=None,
+                    artifact_gap=None,
+                    terminal_status='completed',
+                )
+
+            self.assertEqual(effective_status, 'completed')
+            self.assertEqual(
+                updated['late_fill']['final_materialization_contract_status'],
+                'fulfilled',
+            )
+            self.assertIn("fetch('20260815_catalog.json')", html_path.read_text(encoding='utf-8'))
+            self.assertEqual(
+                _LATE_FILL_RUNTIME._terminal_unresolved_local_dependency_link_open_checks(updated),
+                [],
+            )
+
+    def test_terminal_linked_artifact_rebind_uses_consumer_dependencies_for_extensionless_image_slots(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents = root / 'documents'
+            images = root / 'images'
+            documents.mkdir()
+            images.mkdir()
+            html_paths = [documents / 'index.html', documents / 'configurator.html']
+            image_paths = [
+                images / 'titanium-watch.png',
+                images / 'carbon-watch.png',
+                images / 'rose-gold-watch.png',
+            ]
+            placeholders = ('PATH_TITANIUM', 'PATH_CARBON', 'PATH_ROSEGOLD')
+            for html_path in html_paths:
+                html_path.write_text(
+                    '<!doctype html><html><body>'
+                    + ''.join(f'<img src="{{{{{placeholder}}}}}">' for placeholder in placeholders)
+                    + '</body></html>',
+                    encoding='utf-8',
+                )
+            for image_path in image_paths:
+                image_path.write_bytes(b'png')
+
+            image_phases = [f'phase-image-{index}' for index in range(1, 4)]
+            text_phases = ['phase-index', 'phase-configurator']
+            payload = {
+                'id': 'resp_extensionless_consumer_image_slots',
+                'runtime': {
+                    'request_phase_graph': {
+                        'phases': [
+                            *[
+                                {
+                                    'phase_id': phase_id,
+                                    'branch_id': f'branch-image-{index}',
+                                    'capability': 'image_generation',
+                                    'output_type': 'image',
+                                }
+                                for index, phase_id in enumerate(image_phases, start=1)
+                            ],
+                            *[
+                                {
+                                    'phase_id': phase_id,
+                                    'branch_id': f'branch-text-{index}',
+                                    'capability': 'chat',
+                                    'output_type': 'text',
+                                    'depends_on': list(image_phases),
+                                    'dependency_contract': 'local_visual_asset_binding',
+                                }
+                                for index, phase_id in enumerate(text_phases, start=1)
+                            ],
+                        ],
+                    },
+                },
+                'artifacts': [
+                    *[
+                        {
+                            'type': 'text',
+                            'path': str(html_path),
+                            'artifact_ref': f'artifact:{html_path.stem}',
+                            'branch_id': f'branch-text-{index}',
+                            'phase_id': text_phases[index - 1],
+                        }
+                        for index, html_path in enumerate(html_paths, start=1)
+                    ],
+                    *[
+                        {
+                            'type': 'image',
+                            'path': str(image_path),
+                            'artifact_ref': f'artifact:image-{index}',
+                            'branch_id': f'branch-image-{index}',
+                            'phase_id': image_phases[index - 1],
+                            'prompt': prompt,
+                        }
+                        for index, (image_path, prompt) in enumerate(
+                            zip(
+                                image_paths,
+                                (
+                                    'Titanium watch on an obsidian background.',
+                                    'Forged carbon watch with visible carbon weave.',
+                                    'Rose gold watch with warm polished metal.',
+                                ),
+                            ),
+                            start=1,
+                        )
+                    ],
+                ],
+                'late_fill': {'status': 'completed', 'fill_results': []},
+            }
+
+            updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+
+            for html_path in html_paths:
+                html = html_path.read_text(encoding='utf-8')
+                self.assertNotIn('PATH_', html)
+                for image_path in image_paths:
+                    self.assertIn(f'src="../images/{image_path.name}"', html)
+            rebinds = updated['late_fill']['linked_artifact_rebinds']
+            self.assertEqual(len(rebinds), 2)
+            self.assertTrue(
+                all(
+                    change['selection_policy'].startswith('consumer_declared_dependency_binding')
+                    and change['consumer_dependency_ids']
+                    for rebind in rebinds
+                    for change in rebind['changes']
+                )
+            )
+            self.assertTrue(_LATE_FILL_RUNTIME._terminal_linked_artifact_contract_is_fulfilled(updated))
+
+    def test_terminal_linked_artifact_rebind_rewrites_only_typed_json_path_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents = root / 'documents'
+            images = root / 'images'
+            documents.mkdir()
+            images.mkdir()
+            json_path = documents / 'pricing.json'
+            image_paths = [
+                images / 'titanium-watch.png',
+                images / 'carbon-watch.png',
+                images / 'rose-gold-watch.png',
+            ]
+            json_path.write_text(
+                json.dumps(
+                    {
+                        'imagePath': '{{PATH_TITANIUM}}',
+                        'assetUrls': [
+                            'images/carbon-watch.jpg',
+                            '{{PATH_ROSEGOLD}}',
+                        ],
+                        'description': 'Literal {{PATH_TITANIUM}} prose must remain unchanged.',
+                        'price': 78000,
+                    }
+                )
+                + '\n',
+                encoding='utf-8',
+            )
+            for image_path in image_paths:
+                image_path.write_bytes(b'png')
+            image_phases = [f'phase-image-{index}' for index in range(1, 4)]
+            payload = {
+                'id': 'resp_structural_json_path_rebind',
+                'runtime': {
+                    'request_phase_graph': {
+                        'phases': [
+                            *[
+                                {
+                                    'phase_id': phase_id,
+                                    'branch_id': f'branch-image-{index}',
+                                    'capability': 'image_generation',
+                                    'output_type': 'image',
+                                }
+                                for index, phase_id in enumerate(image_phases, start=1)
+                            ],
+                            {
+                                'phase_id': 'phase-pricing',
+                                'branch_id': 'branch-pricing',
+                                'capability': 'chat',
+                                'output_type': 'text',
+                                'depends_on': list(image_phases),
+                                'dependency_contract': 'local_visual_asset_binding',
+                            },
+                        ],
+                    },
+                },
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(json_path),
+                        'artifact_ref': 'artifact:pricing',
+                        'branch_id': 'branch-pricing',
+                        'phase_id': 'phase-pricing',
+                    },
+                    *[
+                        {
+                            'type': 'image',
+                            'path': str(image_path),
+                            'artifact_ref': f'artifact:image-{index}',
+                            'branch_id': f'branch-image-{index}',
+                            'phase_id': image_phases[index - 1],
+                            'prompt': prompt,
+                        }
+                        for index, (image_path, prompt) in enumerate(
+                            zip(
+                                image_paths,
+                                ('Titanium watch', 'Forged carbon watch', 'Rose gold watch'),
+                            ),
+                            start=1,
+                        )
+                    ],
+                ],
+                'late_fill': {'status': 'completed', 'fill_results': []},
+            }
+
+            updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+
+            rebound = json.loads(json_path.read_text(encoding='utf-8'))
+            self.assertEqual(rebound['imagePath'], '../images/titanium-watch.png')
+            self.assertEqual(
+                rebound['assetUrls'],
+                ['../images/carbon-watch.png', '../images/rose-gold-watch.png'],
+            )
+            self.assertEqual(
+                rebound['description'],
+                'Literal {{PATH_TITANIUM}} prose must remain unchanged.',
+            )
+            self.assertEqual(rebound['price'], 78000)
+            changes = updated['late_fill']['linked_artifact_rebinds'][0]['changes']
+            self.assertEqual([change['kind'] for change in changes], ['json_path_link'] * 3)
+            self.assertTrue(_LATE_FILL_RUNTIME._terminal_linked_artifact_contract_is_fulfilled(updated))
+
+    def test_current_turn_explicit_image_manifest_prompt_is_not_overridden_by_batch_fallback(self):
+        branch = {
+            'artifact_prompt': 'Macro photograph of a forged carbon watch with visible weave.',
+            'artifact_prompt_source': 'current_turn_explicit_image_manifest',
+        }
+
+        self.assertFalse(
+            _LATE_FILL_RUNTIME._image_branch_prompt_allows_batch_prompt_override(
+                branch,
+                {},
+            )
+        )
+
+    def test_incomplete_image_prompt_batch_fails_closed_for_explicit_third_branch(self):
+        branch = {
+            'branch_id': 'branch-image_generation-3',
+            'phase_id': 'phase-image-3',
+            'queue_index': 3,
+        }
+        content = (
+            'A: Wide cinematic photograph of a titanium watch on black stone with cold side lighting.\n'
+            'B: Macro photograph of a forged carbon watch with visible weave and controlled reflections.'
+        )
+
+        self.assertEqual(_LATE_FILL_RUNTIME._branch_prompt_selection_index(branch, 2), 0)
+        focused = _LATE_FILL_RUNTIME.focus_late_fill_branch_gap_payload(
+            branch,
+            {'content_payload': content},
+            capability='image_generation',
+        )
+
+        self.assertTrue(focused['materialization_blocked'])
+        self.assertEqual(focused['branch_contract_error'], 'incomplete_image_prompt_batch')
+        self.assertEqual(focused['repair_action'], 'repair_branch_contract')
+        self.assertNotIn('artifact_prompt', focused)
+
+    def test_late_fill_image_batch_prompt_rejects_heading_and_fence_residue(self):
+        self.assertFalse(
+            _LATE_FILL_RUNTIME._late_fill_image_batch_prompt_is_viable(
+                'text // Image Generation Prompts (for downstream pipeline)'
+            )
+        )
+        self.assertTrue(
+            _LATE_FILL_RUNTIME._late_fill_image_batch_prompt_is_viable(
+                'Hyper-detailed macro photograph of a tourbillon movement under precise watchmaker-bench lighting.'
+            )
+        )
+
     def test_direct_text_artifact_closure_rebinds_from_conversation_registry_context(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -23125,6 +24718,68 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 repaired_obligation['evidence'],
                 'late_fill_completed_in_place_materialization_repair',
             )
+
+    def test_terminal_materialization_contract_closes_stale_syntax_check_from_full_long_css(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt, graph, payload, _index_path, styles_path, _image_paths = (
+                self._terminal_materialization_contract_payload_with_stale_open_checks(
+                    Path(tmpdir)
+                )
+            )
+            long_valid_css = (
+                'body { color: #eee; background: #111; }\n'
+                + (' ' * 17_000)
+                + '\n.late-rule { display: grid; }\n'
+            )
+            styles_path.write_text(long_valid_css, encoding='utf-8')
+            payload['runtime']['graph_closure_review']['checks'].append(
+                {
+                    'check_kind': 'text_artifact_syntax_sanity',
+                    'status': 'pending',
+                    'evidence': 'text_artifact_syntax_issue',
+                    'role': 'text_artifact_syntax_repair',
+                    'branch_id': 'branch-text_artifact-2',
+                    'phase_id': 'phase-6',
+                    'requires_artifact': True,
+                    'text_artifact_target_path': str(styles_path),
+                }
+            )
+
+            updated, effective_status = (
+                _LATE_FILL_RUNTIME.finalize_terminal_materialization_contract(
+                    payload,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={
+                        'route_runtime': {'request_phase_graph': graph}
+                    },
+                    artifact_gap={'expected_capability': 'chat'},
+                    terminal_status='partial_failed',
+                )
+            )
+
+        late_fill = updated['late_fill']
+        styles_record = next(
+            item
+            for item in updated['artifacts']
+            if item.get('text_artifact_extension') == 'css'
+        )
+        self.assertEqual(effective_status, 'completed')
+        self.assertEqual(late_fill['status'], 'completed')
+        self.assertEqual(
+            late_fill['final_materialization_contract_status'],
+            'fulfilled',
+        )
+        self.assertFalse(late_fill.get('materialization_contract_open_checks'))
+        self.assertTrue(styles_record['content_preview_truncated'])
+        self.assertEqual(styles_record['content_length_chars'], len(long_valid_css))
+        self.assertEqual(
+            next(
+                item
+                for item in late_fill['final_text_artifact_refreshes']
+                if item.get('target_extension') == 'css'
+            )['syntax_sanity_status'],
+            'ok',
+        )
 
     def test_terminal_materialization_contract_ignores_hero_image_class_when_links_resolve(self):
         prompt = (
@@ -25944,7 +27599,7 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             self.assertEqual(adequacy['expected_capability_counts']['chat'], 1)
             self.assertEqual(adequacy['graph_capability_counts']['chat'], 1)
 
-    def test_terminal_materialization_contract_closes_selector_binding_repair_from_saved_target(self):
+    def test_terminal_materialization_contract_keeps_fresh_selector_drift_blocking(self):
         prompt = (
             'Create a premium landing page with exactly three generated images, index.html, and styles.css. '
             'The saved HTML and CSS must be linked and final.'
@@ -26136,14 +27791,22 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             )
 
         late_fill = updated['late_fill']
-        self.assertEqual(effective_status, 'completed')
-        self.assertEqual(late_fill['status'], 'completed')
-        self.assertFalse(late_fill.get('pending_branches'))
-        self.assertFalse(late_fill.get('active_branches'))
-        self.assertFalse(late_fill.get('materialization_contract_open_checks'))
-        self.assertEqual(late_fill['final_materialization_contract_status'], 'fulfilled')
-        self.assertEqual(finalized['lifecycle_state'], 'completed')
-        self.assertFalse(finalized['status_semantics']['has_actionable_repair'])
+        self.assertEqual(effective_status, 'partial_failed')
+        self.assertEqual(late_fill['status'], 'partial_failed')
+        self.assertTrue(late_fill.get('pending_branches'))
+        self.assertEqual(
+            {
+                item.get('check_kind')
+                for item in late_fill.get(
+                    'materialization_contract_open_checks'
+                )
+                or []
+            },
+            {'html_css_selector_binding'},
+        )
+        self.assertEqual(late_fill['final_materialization_contract_status'], 'unmet')
+        self.assertEqual(finalized['lifecycle_state'], 'repair_needed')
+        self.assertTrue(finalized['status_semantics']['has_actionable_repair'])
 
     def test_responses_infer_execution_payload_uses_audio_input_artifact_for_stt(self):
         with app.test_request_context('/api/responses', method='POST'):
@@ -26349,6 +28012,62 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         )
         self.assertEqual(infer_payload['artifact_request']['source_name'], 'safety-protocol')
         self.assertTrue(infer_payload['suppress_image_state_enrichment'])
+
+    def test_responses_infer_execution_payload_preserves_multi_file_same_extension_contract(self):
+        requests = [
+            {'extension': 'html', 'source_name': 'index', 'source': 'runtime_contract'},
+            {'extension': 'css', 'source_name': 'styles', 'source': 'runtime_contract'},
+            {'extension': 'html', 'source_name': 'configurator', 'source': 'runtime_contract'},
+            {'extension': 'json', 'source_name': 'pricing', 'source': 'runtime_contract'},
+        ]
+        with app.test_request_context('/api/responses', method='POST'):
+            infer_payload, _route_info, _has_file_context, _expose_input_artifacts = (
+                _build_responses_infer_execution_payload(
+                    {
+                        'ghost_route': True,
+                        'prompt': 'Materialize the complete four-file contract.',
+                        'text_artifact_requests': requests,
+                        'artifact_request': requests[0],
+                        'text_artifact_extension': 'html',
+                        'text_artifact_source_name': 'index',
+                        'text_artifact_source': 'runtime_contract',
+                        'text_artifact_target_path': '/tmp/artifacts/documents/index.html',
+                    },
+                    route_info={
+                        'capability': 'chat',
+                        'route_source': 'phase_continuation',
+                    },
+                    instance={
+                        'instance_id': 'chat-1',
+                        'model': 'gemma4:26b',
+                        'backend': 'ollama',
+                        'capability': 'chat',
+                    },
+                    instance_id='chat-1',
+                    backend='ollama',
+                    capability='chat',
+                    request_model_override='gemma4:26b',
+                    upload_present=False,
+                )
+            )
+
+        self.assertEqual(
+            [
+                (item['source_name'], item['extension'])
+                for item in infer_payload['text_artifact_requests']
+            ],
+            [
+                ('index', 'html'),
+                ('styles', 'css'),
+                ('configurator', 'html'),
+                ('pricing', 'json'),
+            ],
+        )
+        self.assertEqual(infer_payload['artifact_request']['source_name'], 'index')
+        self.assertEqual(
+            infer_payload['text_artifact_requests'][0]['target_path'],
+            '/tmp/artifacts/documents/index.html',
+        )
 
     def test_responses_infer_execution_payload_preserves_execution_contract(self):
         execution_contract = {
@@ -32706,6 +34425,123 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertNotIn("data:image/png;base64", encoded)
         self.assertLess(len(encoded), 20000)
 
+    def test_response_ui_lookup_retains_distinct_image_bindings_with_compact_completed_branches(self):
+        response_id = "resp_ui_lookup_distinct_compact_image_branches"
+        image_bindings = [
+            (
+                "output-phase-2",
+                "branch-image_generation-1",
+                "phase-2",
+                "artifact:image-one",
+                "/tmp/generated/image-one.png",
+            ),
+            (
+                "output-phase-3",
+                "branch-image_generation-2",
+                "phase-3",
+                "artifact:image-two",
+                "/tmp/generated/image-two.png",
+            ),
+            (
+                "output-phase-4",
+                "branch-image_generation-3",
+                "phase-4",
+                "artifact:image-three",
+                "/tmp/generated/image-three.png",
+            ),
+        ]
+        outputs = [
+            {
+                "slot_id": slot_id,
+                "branch_id": branch_id,
+                "phase_id": phase_id,
+                "type": "image",
+                "status": "fulfilled",
+                "lifecycle": "materialized_output",
+                "artifact_ref": artifact_ref,
+            }
+            for slot_id, branch_id, phase_id, artifact_ref, _path in image_bindings
+        ]
+        output_slots = [
+            {
+                **dict(output),
+                "path": path,
+                "saved_image_path": path,
+            }
+            for output, (_slot_id, _branch_id, _phase_id, _artifact_ref, path) in zip(
+                outputs,
+                image_bindings,
+            )
+        ]
+        record = {
+            "id": response_id,
+            "message_id": "msg_ui_lookup_distinct_compact_image_branches",
+            "status": "completed",
+            "lifecycle_state": "completed",
+            "response_payload": {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "lifecycle_state": "completed",
+                "output_text": "Artifacts generated.",
+                "outputs": [dict(item) for item in outputs],
+                "output_slots": [dict(item) for item in output_slots],
+                "artifacts": [
+                    {
+                        "type": "image",
+                        "artifact_ref": artifact_ref,
+                        "path": path,
+                    }
+                    for _slot_id, _branch_id, _phase_id, artifact_ref, path in image_bindings
+                ],
+                "late_fill": {
+                    "status": "completed",
+                    "completed_branches": [
+                        {
+                            "branch_id": branch_id,
+                            "phase_id": phase_id,
+                            "capability": "image_generation",
+                            "output_type": "image",
+                            "status": "fulfilled",
+                        }
+                        for _slot_id, branch_id, phase_id, _artifact_ref, _path in image_bindings
+                    ],
+                },
+            },
+        }
+
+        ui_payload = _build_response_ui_lookup_payload(record)
+
+        expected_by_branch = {
+            branch_id: (artifact_ref, path)
+            for _slot_id, branch_id, _phase_id, artifact_ref, path in image_bindings
+        }
+        actual_by_branch = {
+            item["branch_id"]: (
+                item.get("artifact_ref"),
+                item.get("path"),
+            )
+            for item in ui_payload["output_slots"]
+            if item.get("type") == "image"
+        }
+        self.assertEqual(actual_by_branch, expected_by_branch)
+        self.assertEqual(
+            {
+                item.get("artifact_ref")
+                for item in ui_payload["outputs"]
+                if item.get("type") == "image"
+            },
+            {artifact_ref for artifact_ref, _path in expected_by_branch.values()},
+        )
+        self.assertEqual(
+            {
+                (item.get("artifact_ref"), item.get("path"))
+                for item in ui_payload["artifacts"]
+                if item.get("type") == "image"
+            },
+            set(expected_by_branch.values()),
+        )
+
     def test_response_lookup_endpoint_returns_ui_payload_when_requested(self):
         response_id = "resp_ui_lookup_endpoint"
         _RESPONSE_LOOKUP[response_id] = {
@@ -33936,6 +35772,158 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertEqual(route_info['capability'], 'image_generation')
         self.assertTrue(route_info['route_runtime']['phase_continuation']['active'])
         mock_resolve_ghost_auto_route.assert_not_called()
+
+    @patch('ollmo_webserver._external_targets_payload')
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_external_source_continuation_is_graph_owned_chat_only(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+        mock_external_targets,
+    ):
+        external = {
+            'id': 'external:codex',
+            'instance_id': 'external:codex',
+            'target_kind': 'external',
+            'model': 'codex:auto',
+            'backend': 'codex_cli',
+            'capability': 'chat',
+            'supported_capabilities': ['chat'],
+            'available': True,
+            'enabled': True,
+            'selectable': True,
+            'readiness': 'ready',
+            'activity': 'idle',
+        }
+        mock_external_targets.return_value = [external]
+        response_truth = {
+            'working_frame': {
+                'target': {
+                    'instance_id': 'external:codex',
+                    'backend': 'codex_cli',
+                    'capability': 'chat',
+                    'mode': 'external_chat',
+                    'model': 'codex:auto',
+                },
+            },
+            'runtime': {
+                'external_target': {
+                    'id': 'external:codex',
+                    'provider': 'codex_cli',
+                    'target_kind': 'external',
+                },
+                'external_execution': {
+                    'target_id': 'external:codex',
+                    'provider': 'codex_cli',
+                    'status': 'completed',
+                },
+                'external_phase_execution_policy': {
+                    'status': 'bounded',
+                    'root_request_authority': (
+                        'promoted_context_reference_only'
+                    ),
+                    'materialization_authority': 'ollmo_runtime',
+                },
+            },
+        }
+        source_route = (
+            _LATE_FILL_RUNTIME._source_route_with_response_external_runtime(
+                {'source': 'ghost_carried'},
+                response_truth,
+            )
+        )
+        self.assertNotIn('instance', source_route)
+        self.assertNotIn('instance_id', source_route)
+        self.assertEqual(
+            source_route['route_runtime']['external_target']['id'],
+            'external:codex',
+        )
+        graph_gap = {
+            'trigger': 'pre_freeze_closure_review',
+            'branch_id': 'branch-chat-file-1',
+            'phase_id': 'phase-2',
+            'execution_contract': {
+                'kind': 'ollmo.execution_contract',
+                'branch_id': 'branch-chat-file-1',
+                'phase_id': 'phase-2',
+                'capability': 'chat',
+                'output_type': 'text_artifact',
+            },
+        }
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'prompt': 'Write the complete index.html body.'},
+            expected_capability='chat',
+            failed_instance_id=None,
+            artifact_gap=graph_gap,
+            source_route_payload=source_route,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'external:codex')
+        self.assertEqual(
+            route_info['route_runtime']['selection_policy'],
+            'selected_external_provider_for_graph_chat_phase',
+        )
+        self.assertEqual(
+            route_info['route_runtime']['materialization_authority'],
+            'ollmo_runtime',
+        )
+        mock_load_running_instances.assert_not_called()
+
+        local_chat = {
+            'instance_id': 'chat-local',
+            'model': 'gemma4:26b',
+            'backend': 'ollama',
+            'capability': 'chat',
+            'runtime_status': {'readiness': 'ready', 'activity': 'idle'},
+        }
+        mock_load_running_instances.return_value = [local_chat]
+        mock_merge_instances.return_value = [local_chat]
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'prompt': 'Write the complete index.html body.'},
+            expected_capability='chat',
+            failed_instance_id='external:codex',
+            excluded_instance_ids=['external:codex'],
+            artifact_gap=graph_gap,
+            source_route_payload=source_route,
+        )
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'chat-local')
+
+        for capability, local_id in (
+            ('image_generation', 'image-local'),
+            ('text_to_speech', 'tts-local'),
+        ):
+            with self.subTest(capability=capability):
+                local_media = {
+                    'instance_id': local_id,
+                    'model': f'test/{local_id}',
+                    'backend': 'ollama',
+                    'capability': capability,
+                    'runtime_status': {
+                        'readiness': 'ready',
+                        'activity': 'idle',
+                    },
+                }
+                mock_load_running_instances.return_value = [local_media]
+                mock_merge_instances.return_value = [local_media]
+                media_gap = copy.deepcopy(graph_gap)
+                media_gap['execution_contract']['capability'] = capability
+                _payload, media_route, media_error = _resolve_late_fill_route(
+                    {'prompt': f'Execute {capability} branch.'},
+                    expected_capability=capability,
+                    failed_instance_id=None,
+                    artifact_gap=media_gap,
+                    source_route_payload=source_route,
+                )
+                self.assertIsNone(media_error)
+                self.assertEqual(media_route['instance_id'], local_id)
+                self.assertNotEqual(
+                    media_route['instance'].get('target_kind'),
+                    'external',
+                )
 
     @staticmethod
     def _tts_recovery_instance(instance_id):

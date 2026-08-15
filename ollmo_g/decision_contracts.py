@@ -30,6 +30,8 @@ _DETERMINISTIC_REVIEW_CRITERIA = {
     'runtime_status_reaches_fulfilled_blocked_failed_waived_or_pending',
     'runtime_status_reaches_fulfilled_blocked_failed_waived_superseded_or_pending',
     'runtime_text_artifact_exists_when_fulfilled',
+    'runtime_text_artifact_revision_preservation_passed_when_required',
+    'runtime_text_artifact_revision_write_proven_when_fulfilled',
     'runtime_text_exists_when_fulfilled',
     'uses_dependency_evidence',
 }

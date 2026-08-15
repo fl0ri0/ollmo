@@ -229,6 +229,82 @@ _JSON_TEXT_ARTIFACT_QUOTED_FILENAME_ACTION_RE = re.compile(
     r'\b(?:create|save)\s+(?:(?:the|a)\s+)?file\s*$',
     re.IGNORECASE,
 )
+_JSON_TEXT_ARTIFACT_MANIFEST_ACTION_RE = re.compile(
+    r'\b(?:'
+    r'create|generate|make|write|produce|return|provide|build|emit|save|materialize|materialise|'
+    r'erzeuge|erstelle|generiere|schreibe|liefere|baue|speichere|materialisiere'
+    r')\b|'
+    r'\b(?:must|should|shall|will|need(?:s)?\s+to|have\s+to|are\s+to)\s+(?:be\s+)?'
+    r'(?:created|generated|made|written|produced|returned|provided|built|emitted|saved|'
+    r'materialized|materialised)\b|'
+    r'\b(?:muss|muessen|müssen|soll|sollen)\s+(?:erstellt|generiert|geschrieben|geliefert|'
+    r'gebaut|gespeichert|materialisiert)\s+werden\b',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_MANIFEST_TARGET_RE = re.compile(
+    r'\b(?:files?|artifacts?|artefacts?|documents?|bundles?|packages?|'
+    r'datei(?:en)?|artefakt(?:e|en)?|dokument(?:e|en)?|paket(?:e|en)?)\b',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_MANIFEST_SOURCE_CONTEXT_RE = re.compile(
+    r'\b(?:source|input|reference|referenced|selected|existing|uploaded|provided)\s+'
+    r'(?:files?|artifacts?|artefacts?|documents?|bundles?|packages?|'
+    r'datei(?:en)?|artefakt(?:e|en)?|dokument(?:e|en)?|paket(?:e|en)?)\b|'
+    r'\b(?:using|from|based\s+on|about|inspect|review|read|mention|describe|'
+    r'aus|anhand|pruefe|prüfe|lies|beschreibe)\b[^:;.!?\n]{0,96}\b'
+    r'(?:files?|artifacts?|artefacts?|documents?|bundles?|packages?|'
+    r'datei(?:en)?|artefakt(?:e|en)?|dokument(?:e|en)?|paket(?:e|en)?)\b',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_NON_OUTPUT_LIST_CONTEXT_RE = re.compile(
+    r'\b(?:comparison|summary|analysis|report|documentation|description|explanation|'
+    r'overview|table|list|inventory|catalog|checksums?|hash(?:es)?|digests?|status|metadata|'
+    r'references?|paths?|vergleich|zusammenfassung|analyse|bericht|'
+    r'dokumentation|beschreibung|erklaerung|erklärung|uebersicht|übersicht|tabelle|liste|inventar|katalog)\b'
+    r'(?:[^:;.!?\n]{0,64}\b(?:of|about|between|for|over|zu|ueber|über|zwischen|fuer|für)\b|'
+    r'[^:;.!?\n]{0,24}:\s*$)|'
+    r'\b(?:compare|summarize|analyse|analyze|document|describe|explain|mention|reference|'
+    r'list|plan|vergleich|fasse|analysiere|dokumentiere|beschreibe|erklaere|erkläre|erwaehne|'
+    r'erwähne|referenziere|liste|plane)\w*\b',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_MANIFEST_DELIBERATION_RE = re.compile(
+    r'\b(?:which|whether|tell\s+me|decide|assess|determine|evaluate|classify|choose|'
+    r'suggested|candidate|optional|possible|potential|draft|planned|proposed|recommended|'
+    r'welche|welcher|welches|ob|sage\s+mir|entscheide|bewerte|bestimme|klassifiziere|waehle|wähle|'
+    r'vorgeschlagen|optional|moeglich|möglich|potenziell|entwurf|geplant|empfohlen)\b',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_IMPLICIT_MANIFEST_TARGET_RE = re.compile(
+    r'\b(?:the\s+following|these|those|folgende(?:n|r|s)?|diese(?:n|r|s)?)\b',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_MULTILINE_QUOTED_SPAN_RE = re.compile(
+    r'"[^"\n]*\n[^\"]*"|“[^”\n]*\n[^”]*”'
+)
+_JSON_TEXT_ARTIFACT_DIRECT_FILENAME_LIST_PREFIX_RE = re.compile(
+    r'\s*(?:(?:exactly|only|the|these|those|following|named|new|local|separate|individual|'
+    r'all|just|genau|nur|die|diese|folgende|genannte|neue|lokale|separate|einzelne|alle|'
+    r'\d+|one|two|three|four|five|six|ein(?:e|en|em|er|es)?|zwei|drei|vier|fuenf|fünf|sechs)\s+)*',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_SITE_COMPONENT_LIST_PREFIX_RE = re.compile(
+    r'\b(?:site|website|web\s+(?:site|app|application)|app|application)\b'
+    r'[^.;!?\n]{0,64}\b(?:with|containing|comprising|including)\s*$',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_META_ACTION_PREFIX_RE = re.compile(
+    r'\b(?:explain|describe|show|tell)(?:\s+(?:to\s+)?(?:me|us))?\s+'
+    r'(?:how|why|whether)\s+(?:to\s+)?$',
+    re.IGNORECASE,
+)
+_JSON_TEXT_ARTIFACT_RELATIVE_PATH_SUFFIX_RE = re.compile(
+    r'(?:(?:\./)|(?:\./)?(?:[A-Za-z0-9][A-Za-z0-9._-]{0,80}/){1,6})\s*$'
+)
+_JSON_TEXT_ARTIFACT_MANIFEST_ITEM_RE = re.compile(
+    r'^[ \t]*(?:[-*+]|\d{1,3}[.)])\s+',
+    re.IGNORECASE | re.MULTILINE,
+)
 _JSON_TEXT_ARTIFACT_DIRECT_FILE_RE = re.compile(
     r'\bjson\b\s*(?:[-–—]\s*)?'
     r'(?:file|artifact|artefact|artefakt|datei|document|dokument)\b'
@@ -498,10 +574,13 @@ _TEXT_ARTIFACT_LANGUAGE_EXTENSIONS = {
 }
 _TEXT_ARTIFACT_CONTROL_JSON_KEYS = {
     'candidate_graph',
+    'decision_contract',
     'output_candidates',
     'output_obligations',
     'promotion_review',
     'request_ir',
+    'request_phase_graph',
+    'user_facing_response',
     'workload_graph',
 }
 
@@ -805,6 +884,245 @@ def _json_text_artifact_candidate_state(text: str, start: int, end: int) -> tupl
     return negated, has_action
 
 
+def _json_text_artifact_span_is_inside_quoted_instruction(
+    text: str,
+    start: int,
+    end: int,
+) -> bool:
+    source = str(text or '')
+    quoted_spans = [
+        *_JSON_TEXT_ARTIFACT_QUOTED_SPAN_RE.finditer(source),
+        *_JSON_TEXT_ARTIFACT_MULTILINE_QUOTED_SPAN_RE.finditer(source),
+        *_TEXT_ARTIFACT_FENCED_BLOCK_RE.finditer(source),
+    ]
+    return any(quoted.start() < start and end < quoted.end() for quoted in quoted_spans)
+
+
+def _json_text_artifact_manifest_header_has_output_authority(
+    header: str,
+    *,
+    allow_implicit_target: bool = False,
+    allow_terminal_period: bool = False,
+) -> bool:
+    candidate = str(header or '').strip()
+    if not candidate or not (
+        candidate.endswith(':')
+        or (allow_terminal_period and candidate.endswith('.'))
+    ):
+        return False
+    for action in reversed(list(_JSON_TEXT_ARTIFACT_MANIFEST_ACTION_RE.finditer(candidate))):
+        if _json_text_artifact_span_is_inside_quoted_instruction(
+            candidate,
+            action.start(),
+            action.end(),
+        ):
+            continue
+        negated, _ = _json_text_artifact_candidate_state(
+            candidate,
+            action.start(),
+            action.end(),
+        )
+        if negated:
+            continue
+        scope, _, _ = _text_artifact_match_scope(candidate, action.start(), action.end())
+        if (
+            (
+                _JSON_TEXT_ARTIFACT_MANIFEST_TARGET_RE.search(scope)
+                or (
+                    allow_implicit_target
+                    and _JSON_TEXT_ARTIFACT_IMPLICIT_MANIFEST_TARGET_RE.search(scope)
+                )
+            )
+            and not _JSON_TEXT_ARTIFACT_MANIFEST_SOURCE_CONTEXT_RE.search(scope)
+            and not _JSON_TEXT_ARTIFACT_NON_OUTPUT_LIST_CONTEXT_RE.search(scope)
+            and not _JSON_TEXT_ARTIFACT_MANIFEST_DELIBERATION_RE.search(scope)
+        ):
+            return True
+    return False
+
+
+def _json_text_artifact_list_separator_only(value: str) -> bool:
+    candidate = re.sub(r'["\'`“”‘’]', '', str(value or ''))
+    candidate = _JSON_TEXT_ARTIFACT_RELATIVE_PATH_SUFFIX_RE.sub('', candidate)
+    candidate = re.sub(
+        r'\b(?:and|or|plus|und|oder|sowie|as\s+well\s+as)\b',
+        '',
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r'\d{1,3}[.)]', '', candidate)
+    candidate = re.sub(r'[\s,;/&+]+', '', candidate)
+    return not candidate
+
+
+def _json_text_artifact_manifest_item_line(value: str) -> bool:
+    candidate = str(value or '').strip()
+    marker = _JSON_TEXT_ARTIFACT_MANIFEST_ITEM_RE.match(candidate)
+    if marker:
+        candidate = candidate[marker.end():].strip()
+    filename = _TEXT_ARTIFACT_EXTENSION_RE.search(candidate)
+    filename_prefix = candidate[:filename.start()].strip(' \t"\'`“”‘’') if filename else ''
+    if (
+        not filename
+        or (
+            filename_prefix
+            and not _JSON_TEXT_ARTIFACT_RELATIVE_PATH_SUFFIX_RE.fullmatch(filename_prefix)
+        )
+    ):
+        return False
+    suffix = candidate[filename.end():].strip(' \t"\'`“”‘’')
+    return bool(
+        not suffix
+        or re.fullmatch(r'\([^()\n]{1,160}\)', suffix)
+        or re.fullmatch(r'[-–—:]\s+[^\n]{1,160}', suffix)
+    )
+
+
+def _json_text_artifact_manifest_sibling_line(value: str) -> bool:
+    candidate = str(value or '')
+    return bool(
+        _json_text_artifact_manifest_item_line(candidate)
+        or _JSON_TEXT_ARTIFACT_MANIFEST_ITEM_RE.match(candidate)
+        or re.match(r'^[ \t]{2,}\S', candidate)
+    )
+
+
+def _json_text_artifact_filename_has_manifest_authority(
+    text: str,
+    start: int,
+    end: int,
+) -> bool:
+    """Bind one named JSON file to a bounded explicit file manifest."""
+
+    prompt = str(text or '')
+    target_start = max(0, int(start or 0))
+    target_end = min(len(prompt), max(target_start, int(end or target_start)))
+    if _json_text_artifact_span_is_inside_quoted_instruction(
+        prompt,
+        target_start,
+        target_end,
+    ):
+        return False
+    line_start = prompt.rfind('\n', 0, target_start) + 1
+    line_end = prompt.find('\n', target_end)
+    if line_end < 0:
+        line_end = len(prompt)
+    line = prompt[line_start:line_end]
+    local_target_start = target_start - line_start
+    local_target_end = target_end - line_start
+
+    if _json_text_artifact_manifest_item_line(line):
+        block_prefix = prompt[:line_start]
+        blank_boundaries = list(re.finditer(r'\n[ \t]*\n', block_prefix))
+        block_start = blank_boundaries[-1].end() if blank_boundaries else 0
+        preceding_block = prompt[block_start:line_start]
+        preceding_lines = preceding_block.splitlines()
+        first_item_index = next(
+            (
+                index
+                for index, preceding_line in enumerate(preceding_lines)
+                if _json_text_artifact_manifest_sibling_line(preceding_line)
+            ),
+            len(preceding_lines),
+        )
+        header = '\n'.join(preceding_lines[:first_item_index])
+        item_lines = preceding_lines[first_item_index:]
+        if not header.strip() and item_lines and block_start > 0:
+            earlier = prompt[:block_start].rstrip()
+            earlier_boundaries = list(re.finditer(r'\n[ \t]*\n', earlier))
+            earlier_start = earlier_boundaries[-1].end() if earlier_boundaries else 0
+            header = earlier[earlier_start:]
+        if all(
+            not item_line.strip() or _json_text_artifact_manifest_sibling_line(item_line)
+            for item_line in item_lines
+        ) and _json_text_artifact_manifest_header_has_output_authority(
+            header,
+            allow_implicit_target=True,
+            allow_terminal_period=True,
+        ):
+            return True
+
+    filename_matches = list(_TEXT_ARTIFACT_EXTENSION_RE.finditer(line))
+    target_index = next(
+        (
+            index
+            for index, filename in enumerate(filename_matches)
+            if filename.start() < local_target_end and local_target_start < filename.end()
+        ),
+        -1,
+    )
+    if target_index < 0:
+        return False
+    target_match = filename_matches[target_index]
+    action_matches = [
+        action
+        for action in _JSON_TEXT_ARTIFACT_MANIFEST_ACTION_RE.finditer(line)
+        if action.end() <= target_match.start()
+        and not _json_text_artifact_span_is_inside_quoted_instruction(
+            line,
+            action.start(),
+            action.end(),
+        )
+    ]
+    for action in reversed(action_matches):
+        negated, _ = _json_text_artifact_candidate_state(line, action.start(), action.end())
+        if negated or _JSON_TEXT_ARTIFACT_META_ACTION_PREFIX_RE.search(
+            line[:action.start()]
+        ):
+            continue
+        chain = [
+            filename
+            for filename in filename_matches
+            if filename.start() >= action.end()
+        ]
+        if not chain or target_match not in chain:
+            continue
+        prefix = line[action.end():chain[0].start()]
+        classified_prefix = _JSON_TEXT_ARTIFACT_RELATIVE_PATH_SUFFIX_RE.sub('', prefix)
+        if (
+            len(classified_prefix) > 200
+            or re.search(r'[.!?]', classified_prefix)
+            or _JSON_TEXT_ARTIFACT_MANIFEST_SOURCE_CONTEXT_RE.search(classified_prefix)
+            or _JSON_TEXT_ARTIFACT_NON_OUTPUT_LIST_CONTEXT_RE.search(classified_prefix)
+        ):
+            continue
+        action_token = str(action.group(0) or '').strip().lower()
+        if (
+            action_token in {'return', 'provide'}
+            and re.search(
+                r'\b(?:review|inspect|read|analyse|analyze|pruefe|prüfe|lies|analysiere)\b'
+                r'[^.;!?\n]{0,64}\b(?:and|then|und|dann)\s*$',
+                line[:action.start()],
+                flags=re.IGNORECASE,
+            )
+        ):
+            continue
+        coordinated_chain = [chain[0]]
+        for previous, candidate in zip(chain, chain[1:]):
+            if not _json_text_artifact_list_separator_only(
+                line[previous.end():candidate.start()]
+            ):
+                break
+            coordinated_chain.append(candidate)
+        if target_match not in coordinated_chain:
+            continue
+        has_manifest_target = bool(
+            _JSON_TEXT_ARTIFACT_MANIFEST_TARGET_RE.search(classified_prefix)
+            or _JSON_TEXT_ARTIFACT_SITE_COMPONENT_LIST_PREFIX_RE.search(classified_prefix)
+        )
+        has_direct_filename_prefix = bool(
+            _JSON_TEXT_ARTIFACT_DIRECT_FILENAME_LIST_PREFIX_RE.fullmatch(classified_prefix)
+        )
+        if len(coordinated_chain) > 1 and (
+            has_manifest_target or has_direct_filename_prefix
+        ):
+            return True
+        inline_header = line[:chain[0].start()]
+        if _json_text_artifact_manifest_header_has_output_authority(inline_header):
+            return True
+    return False
+
+
 def _json_text_artifact_intent(text: str) -> _JsonTextArtifactIntent:
     """Separate JSON response formatting from explicit JSON file materialization."""
 
@@ -853,7 +1171,11 @@ def _json_text_artifact_intent(text: str) -> _JsonTextArtifactIntent:
         )
         if negated:
             negated_materialization = True
-        elif has_action:
+        elif has_action or _json_text_artifact_filename_has_manifest_authority(
+            prompt,
+            extension_match.start(),
+            extension_match.end(),
+        ):
             extension_spans.add((extension_match.start(), extension_match.end()))
 
     quoted_spans = list(_JSON_TEXT_ARTIFACT_QUOTED_SPAN_RE.finditer(prompt))
@@ -869,8 +1191,15 @@ def _json_text_artifact_intent(text: str) -> _JsonTextArtifactIntent:
             quoted_filename.start(),
             quoted_filename.end(),
         )
-        if not _JSON_TEXT_ARTIFACT_QUOTED_FILENAME_ACTION_RE.search(
-            prompt[scope_start:quoted_filename.start()]
+        if (
+            not _JSON_TEXT_ARTIFACT_QUOTED_FILENAME_ACTION_RE.search(
+                prompt[scope_start:quoted_filename.start()]
+            )
+            and not _json_text_artifact_filename_has_manifest_authority(
+                prompt,
+                quoted_filename.start(),
+                quoted_filename.end(),
+            )
         ):
             continue
         negated, _ = _json_text_artifact_candidate_state(
@@ -1078,6 +1407,25 @@ def detect_text_artifact_requests(
                     existing['source_name'] = source_name
                     seen.add(key)
                     return
+        elif source == 'selected_source_edit':
+            for existing in requests:
+                if (
+                    existing.get('extension') == extension
+                    and existing.get('source_name') == source_name
+                ):
+                    existing.update(
+                        {
+                            'source': source,
+                            'source_name': source_name,
+                            **(
+                                {'target_path': str(request.get('target_path') or '').strip()}
+                                if str(request.get('target_path') or '').strip()
+                                else {}
+                            ),
+                        }
+                    )
+                    seen.add(key)
+                    return
         elif (
             source != 'each_part_file_cue'
             and any(item.get('extension') == extension for item in requests)
@@ -1187,6 +1535,8 @@ def detect_text_artifact_requests(
 
     if has_file_cue or has_action_cue:
         for extension_match in _TEXT_ARTIFACT_EXTENSION_RE.finditer(text):
+            if _text_artifact_format_match_is_negated(text, extension_match):
+                continue
             if _text_artifact_filename_match_is_validation_only(text, extension_match):
                 continue
             extension = _normalize_text_artifact_extension(extension_match.group('ext') or '')
@@ -1424,14 +1774,22 @@ def _typed_text_artifact_payload_is_plausible(content: str, extension: str) -> b
 
 
 def _json_text_artifact_value_has_control_shape(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_json_text_artifact_value_has_control_shape(item) for item in value)
     if not isinstance(value, dict):
         return False
-    if any(key in value for key in _TEXT_ARTIFACT_CONTROL_JSON_KEYS):
+    normalized = {
+        str(key or '').strip().lower(): child
+        for key, child in value.items()
+        if str(key or '').strip()
+    }
+    if set(normalized).intersection(_TEXT_ARTIFACT_CONTROL_JSON_KEYS):
         return True
-    payload = value.get('payload')
-    if isinstance(payload, dict) and any(key in payload for key in _TEXT_ARTIFACT_CONTROL_JSON_KEYS):
-        return True
-    return False
+    return any(
+        _json_text_artifact_value_has_control_shape(child)
+        for child in normalized.values()
+        if isinstance(child, (dict, list))
+    )
 
 
 def _json_text_artifact_wrapper_candidates(text: str) -> list[Any]:
@@ -4133,6 +4491,11 @@ def _run_chat_fallback(
         )
     persist_text_artifact = ops.get('persist_text_artifact_locally')
     artifact_payloads = extract_text_artifact_payloads(content, artifact_requests)
+    if len(artifact_requests) > 1 and len(artifact_payloads) != len(artifact_requests):
+        # A multi-file materialization is one output-set contract.  Do not
+        # publish parser-accepted members before every requested identity is
+        # present; Late Fill owns retry and final fulfillment truth.
+        artifact_payloads = []
     saved_text_artifacts: list[dict[str, Any]] = []
     if artifact_payloads and persist_text_artifact:
         for artifact_payload in artifact_payloads:

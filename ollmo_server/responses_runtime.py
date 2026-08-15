@@ -99,6 +99,130 @@ def _late_fill_has_repair_signal(late_fill: Mapping[str, Any], *branch_groups: l
     return any(_late_fill_branches_need_repair(group) for group in branch_groups)
 
 
+def _repair_contract_artifact_identity(record: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    artifact_request = (
+        record.get('artifact_request')
+        if isinstance(record.get('artifact_request'), Mapping)
+        else {}
+    )
+    return (
+        str(record.get('text_artifact_extension') or artifact_request.get('extension') or '')
+        .strip()
+        .lower()
+        .lstrip('.'),
+        str(record.get('text_artifact_source') or artifact_request.get('source') or '')
+        .strip()
+        .lower(),
+        str(record.get('text_artifact_source_name') or artifact_request.get('source_name') or '')
+        .strip()
+        .lower(),
+        str(record.get('text_artifact_target_path') or artifact_request.get('target_path') or '')
+        .strip(),
+    )
+
+
+def _repair_contract_matches_completion(
+    contract: Mapping[str, Any],
+    branch: Mapping[str, Any],
+) -> bool:
+    status = str(branch.get('status') or '').strip().lower()
+    if status not in {'completed', 'fulfilled'}:
+        return False
+    identity_keys = ('branch_id', 'phase_id', 'obligation_id', 'task_id')
+    contract_identities = {
+        key: str(contract.get(key) or '').strip()
+        for key in identity_keys
+        if str(contract.get(key) or '').strip()
+    }
+    contract_artifact_identity = _repair_contract_artifact_identity(contract)
+    artifact_identity_fields = {
+        index: value
+        for index, value in enumerate(contract_artifact_identity)
+        if value
+    }
+    has_artifact_identity = bool(artifact_identity_fields)
+    if not contract_identities and not has_artifact_identity:
+        return False
+
+    if contract_identities:
+        if any(
+            str(branch.get(key) or '').strip() != value
+            for key, value in contract_identities.items()
+        ):
+            return False
+    if has_artifact_identity:
+        branch_artifact_identity = _repair_contract_artifact_identity(branch)
+        return all(
+            branch_artifact_identity[index] == value
+            for index, value in artifact_identity_fields.items()
+        )
+    return True
+
+
+def terminal_repair_loop_is_fully_satisfied(
+    late_fill: Mapping[str, Any],
+    repair_loop: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    loop = (
+        repair_loop
+        if isinstance(repair_loop, Mapping)
+        else late_fill.get('repair_loop')
+        if isinstance(late_fill.get('repair_loop'), Mapping)
+        else {}
+    )
+    if str(late_fill.get('status') or '').strip().lower() != 'completed':
+        return False
+    if str(late_fill.get('final_materialization_contract_status') or '').strip().lower() != 'fulfilled':
+        return False
+    if any(
+        isinstance(late_fill.get(key), list) and late_fill.get(key)
+        for key in ('pending_branches', 'active_branches', 'failed_branches', 'recovery_candidates')
+    ):
+        return False
+    recovery_state = (
+        late_fill.get('recovery_state')
+        if isinstance(late_fill.get('recovery_state'), Mapping)
+        else {}
+    )
+    if str(recovery_state.get('status') or '').strip().lower() in {
+        'active',
+        'blocked',
+        'candidate',
+        'pending',
+        'queued',
+        'ready',
+        'running',
+        'scheduled',
+    }:
+        return False
+    promoted_contracts = [
+        item
+        for item in (loop.get('promoted_contracts') or [])
+        if isinstance(item, Mapping)
+    ]
+    if not promoted_contracts:
+        return False
+    completed_branches = [
+        item
+        for item in (late_fill.get('completed_branches') or [])
+        if isinstance(item, Mapping)
+    ]
+    available_branches = list(completed_branches)
+    for contract in promoted_contracts:
+        match_index = next(
+            (
+                index
+                for index, branch in enumerate(available_branches)
+                if _repair_contract_matches_completion(contract, branch)
+            ),
+            None,
+        )
+        if match_index is None:
+            return False
+        available_branches.pop(match_index)
+    return True
+
+
 def late_fill_has_actionable_repair_work(late_fill: Optional[Mapping[str, Any]]) -> bool:
     """Return current nested repair-loop work, excluding stale terminal labels."""
 
@@ -114,6 +238,8 @@ def late_fill_has_actionable_repair_work(late_fill: Optional[Mapping[str, Any]])
         'running',
         'scheduled',
     }:
+        return False
+    if terminal_repair_loop_is_fully_satisfied(payload, repair_loop):
         return False
     if repair_loop.get('repair_work_available') is True:
         return True

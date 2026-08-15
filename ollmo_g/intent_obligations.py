@@ -361,16 +361,22 @@ def build_intent_obligation_ledger(
         item for item in text_obligations
         if item.get('target_extension') == 'css' and item.get('phase_id')
     ]
+    json_text_obligations = [
+        item for item in text_obligations
+        if item.get('target_extension') == 'json' and item.get('phase_id')
+    ]
 
-    if image_obligations and html_text_obligations and _local_visual_binding_required(analysis, prompt):
+    local_visual_targets = list(html_text_obligations)
+    if analysis.get('local_visual_asset_requirement'):
+        local_visual_targets.extend(css_text_obligations)
+        local_visual_targets.extend(json_text_obligations)
+
+    if image_obligations and local_visual_targets and _local_visual_binding_required(analysis, prompt):
         image_obligation_ids = [
             item['obligation_id'] for item in image_obligations if item.get('obligation_id')
         ]
         image_phase_ids = [item['phase_id'] for item in image_obligations if item.get('phase_id')]
-        targets = list(html_text_obligations)
-        if analysis.get('local_visual_asset_requirement'):
-            targets.extend(css_text_obligations)
-        for target in targets:
+        for target in local_visual_targets:
             target_phase_id = _clean_text(target.get('phase_id'))
             if not target_phase_id:
                 continue

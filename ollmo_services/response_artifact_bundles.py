@@ -22,8 +22,18 @@ AUDIO_EXTENSIONS = {'wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'oga', 'opus'}
 HTML_EXTENSIONS = {'html', 'htm'}
 CSS_EXTENSIONS = {'css'}
 JS_EXTENSIONS = {'js', 'mjs', 'cjs'}
+JSON_EXTENSIONS = {'json'}
+LINK_REFERENCE_EXTENSIONS = HTML_EXTENSIONS | CSS_EXTENSIONS | JS_EXTENSIONS | JSON_EXTENSIONS
 SYNTAX_CHECK_EXTENSIONS = {'html', 'htm', 'css', 'json'}
 IGNORED_LINK_SCHEMES = ('http:', 'https:', 'data:', 'blob:', 'mailto:', 'tel:', 'javascript:')
+JSON_LOCAL_ARTIFACT_EXTENSIONS = (
+    TEXT_EXTENSIONS
+    | IMAGE_EXTENSIONS
+    | AUDIO_EXTENSIONS
+    | {'ico', 'mp4', 'pdf', 'ttf', 'wasm', 'webm', 'woff', 'woff2'}
+)
+JSON_PATH_KEY_RE = re.compile(r'(?:^|_)(?:paths?|urls?)$', re.IGNORECASE)
+JSON_PATH_TEMPLATE_RE = re.compile(r'\{\{[^{}]+\}\}|\$\{[^{}]+\}')
 
 
 def _utc_timestamp() -> str:
@@ -297,6 +307,122 @@ def _filter_public_bundle_artifacts(
     return filtered
 
 
+def _authorized_carried_predecessor_artifacts(
+    response_payload: Mapping[str, Any],
+    public_artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve immutable dependencies from one exact authorized predecessor."""
+
+    contexts: list[Mapping[str, Any]] = []
+    direct_context = response_payload.get('current_predecessor_context')
+    if isinstance(direct_context, Mapping):
+        contexts.append(direct_context)
+    request_payload = (
+        response_payload.get('request')
+        if isinstance(response_payload.get('request'), Mapping)
+        else {}
+    )
+    request_context = request_payload.get('current_predecessor_context')
+    if isinstance(request_context, Mapping):
+        contexts.append(request_context)
+    response_frame = (
+        response_payload.get('response_frame')
+        if isinstance(response_payload.get('response_frame'), Mapping)
+        else {}
+    )
+    frame_request = (
+        response_frame.get('request')
+        if isinstance(response_frame.get('request'), Mapping)
+        else {}
+    )
+    frame_context = frame_request.get('current_predecessor_context')
+    if isinstance(frame_context, Mapping):
+        contexts.append(frame_context)
+
+    context = next(
+        (
+            item
+            for item in reversed(contexts)
+            if str(item.get('kind') or '').strip()
+            == 'ollmo.current_predecessor_context'
+            and str(item.get('status') or '').strip().lower() == 'authorized'
+            and str(item.get('authorization') or '').strip()
+            == 'canonical_same_conversation_predecessor'
+            and str(item.get('promotion_mode') or '').strip()
+            == 'named_text_edit'
+        ),
+        None,
+    )
+    if not isinstance(context, Mapping):
+        return []
+
+    source_response_id = _clean_text(context.get('source_response_id'))
+    matched_targets = [
+        _resolve_existing_file(item.get('path'))
+        for item in (context.get('matched_text_artifacts') or [])
+        if isinstance(item, Mapping)
+    ]
+    normalized_matched_targets = {
+        str(path.resolve(strict=False))
+        for path in matched_targets
+        if path is not None
+    }
+    normalized_public_paths = {
+        str(path.resolve(strict=False))
+        for path in (
+            _resolve_existing_file(item.get('source_path') or item.get('path'))
+            for item in public_artifacts
+        )
+        if path is not None
+    }
+    if (
+        not source_response_id
+        or not normalized_matched_targets
+        or not normalized_matched_targets.issubset(normalized_public_paths)
+    ):
+        return []
+
+    carried: list[dict[str, Any]] = []
+    seen_paths: set[str] = set(normalized_public_paths)
+    for item in context.get('carried_public_dependencies') or []:
+        if not isinstance(item, Mapping):
+            continue
+        if (
+            item.get('carried_public_dependency') is not True
+            or _clean_text(item.get('origin'))
+            != 'canonical_predecessor_bundle_dependency'
+            or _clean_text(item.get('source_response_id'))
+            != source_response_id
+        ):
+            continue
+        path = _resolve_existing_file(item.get('source_path') or item.get('path'))
+        if path is None:
+            continue
+        normalized_path = str(path.resolve(strict=False))
+        if normalized_path in seen_paths:
+            continue
+        normalized = sanitize_artifact_record(item, include_content=True)
+        if not normalized:
+            continue
+        seen_paths.add(normalized_path)
+        extension = _extension_for_artifact(path, normalized)
+        artifact_type = _type_for_artifact(path, normalized)
+        carried.append(
+            {
+                **dict(normalized),
+                'source_path': normalized_path,
+                'type': artifact_type,
+                'kind': artifact_type,
+                'extension': extension,
+                'basename': path.name,
+                'origin': 'canonical_predecessor_bundle_dependency',
+                'source_response_id': source_response_id,
+                'carried_public_dependency': True,
+            }
+        )
+    return carried
+
+
 def _is_bundleable_artifact(artifact: Mapping[str, Any]) -> bool:
     extension = _clean_text(artifact.get('extension')).lower()
     artifact_type = _clean_text(artifact.get('type') or artifact.get('kind')).lower()
@@ -354,7 +480,12 @@ def _dedupe_path(path: Path, used: set[Path]) -> Path:
 def _safe_filename(source: Path, artifact: Mapping[str, Any], *, is_entrypoint: bool) -> str:
     extension = _clean_text(artifact.get('extension')).lower()
     suffix = f'.{extension}' if extension and not source.name.lower().endswith(f'.{extension}') else source.suffix
-    if is_entrypoint and extension in HTML_EXTENSIONS:
+    semantic_name = Path(_clean_text(artifact.get('name'))).stem.lower()
+    if (
+        is_entrypoint
+        and extension in HTML_EXTENSIONS
+        and (source.stem.lower() == 'index' or semantic_name == 'index')
+    ):
         return f'index{suffix or ".html"}'
     name = _clean_text(artifact.get('name'))
     if name:
@@ -497,6 +628,94 @@ HTML_STYLE_SINGLE_RE = re.compile(r"\b(?P<attr>style)\s*=\s*'(?P<value>[^']*)'",
 CSS_URL_RE = re.compile(r'url\(\s*(?P<quote>["\']?)(?P<value>[^)"\']+)(?P=quote)\s*\)', re.IGNORECASE)
 CSS_IMPORT_RE = re.compile(r'@import\s+(?P<quote>["\'])(?P<value>[^"\']+)(?P=quote)', re.IGNORECASE)
 JS_QUOTED_RE = re.compile(r'(?P<quote>["\'])(?P<value>[^"\']+\.(?:png|jpe?g|webp|gif|svg|css|js|mjs|wav|mp3|m4a|ogg|json))(?P=quote)', re.IGNORECASE)
+FETCH_LITERAL_PREFIX_RE = re.compile(
+    r'(?P<prefix>\bfetch\s*\(\s*)(?P<quote>["\'])(?P<value>[^"\']+)(?P=quote)',
+    re.IGNORECASE,
+)
+STATIC_FETCH_RE = re.compile(
+    r'(?P<prefix>\bfetch\s*\(\s*)(?P<quote>["\'])(?P<value>[^"\']+)(?P=quote)(?=\s*[,\)])',
+    re.IGNORECASE,
+)
+
+
+def _is_static_local_fetch_reference(value: Any) -> bool:
+    token = _clean_text(value)
+    if _is_ignored_reference(token) or token.startswith(('/', '\\')):
+        return False
+    path_part, _suffix = _split_ref(token)
+    if not path_part:
+        return False
+    extension = Path(path_part.replace('\\', '/')).suffix.lower().lstrip('.')
+    return extension in JSON_LOCAL_ARTIFACT_EXTENSIONS
+
+
+def _json_key_is_path_like(value: Any) -> bool:
+    raw_token = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', _clean_text(value))
+    token = re.sub(r'[^a-z0-9]+', '_', raw_token.lower()).strip('_')
+    return token in {'href', 'hrefs', 'poster', 'posters', 'src', 'srcs'} or bool(
+        JSON_PATH_KEY_RE.search(token)
+    )
+
+
+def _looks_like_json_local_artifact_ref(value: Any) -> bool:
+    token = _clean_text(value)
+    if _is_ignored_reference(token):
+        return False
+    path_part, _suffix = _split_ref(token)
+    if not path_part:
+        return False
+    if JSON_PATH_TEMPLATE_RE.search(path_part):
+        return True
+    extension = Path(path_part.replace('\\', '/')).suffix.lower().lstrip('.')
+    return extension in JSON_LOCAL_ARTIFACT_EXTENSIONS
+
+
+def _json_key_path(parent: str, key: Any) -> str:
+    token = _clean_text(key)
+    return f'{parent}.{token}' if parent else token
+
+
+def _iter_json_local_ref_slots(
+    value: Any,
+    *,
+    parent_key_path: str = '',
+    values_are_paths: bool = False,
+) -> Iterable[tuple[Any, Any, str, str]]:
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            key_path = _json_key_path(parent_key_path, key)
+            key_is_path_like = _json_key_is_path_like(key)
+            if isinstance(item, str):
+                if key_is_path_like and _looks_like_json_local_artifact_ref(item):
+                    yield value, raw_key, key_path, item
+            elif isinstance(item, list):
+                yield from _iter_json_local_ref_slots(
+                    item,
+                    parent_key_path=key_path,
+                    values_are_paths=key_is_path_like,
+                )
+            elif isinstance(item, Mapping):
+                yield from _iter_json_local_ref_slots(item, parent_key_path=key_path)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            key_path = f'{parent_key_path}[{index}]'
+            if isinstance(item, str):
+                if values_are_paths and _looks_like_json_local_artifact_ref(item):
+                    yield value, index, key_path, item
+            elif isinstance(item, list):
+                yield from _iter_json_local_ref_slots(
+                    item,
+                    parent_key_path=key_path,
+                    values_are_paths=values_are_paths,
+                )
+            elif isinstance(item, Mapping):
+                yield from _iter_json_local_ref_slots(item, parent_key_path=key_path)
+
+
+def _iter_json_local_refs(value: Any) -> Iterable[tuple[str, str]]:
+    for _container, _key, key_path, item in _iter_json_local_ref_slots(value):
+        yield key_path, item
 
 
 def _iter_html_style_values(text: str) -> Iterable[str]:
@@ -521,9 +740,26 @@ def _rewrite_css_urls(
     return CSS_URL_RE.sub(replace_css_url, value)
 
 
+def _rewrite_static_fetch_refs(
+    value: str,
+    from_file: Path,
+    alias_map: Mapping[str, Path],
+    rewrites: list[dict[str, Any]],
+    kind: str,
+) -> str:
+    def replace_static_fetch(match: re.Match[str]) -> str:
+        value = match.group('value')
+        if not _is_static_local_fetch_reference(value):
+            return match.group(0)
+        rewritten = _rewrite_ref(value, from_file, alias_map, rewrites, kind)
+        return f'{match.group("prefix")}{match.group("quote")}{rewritten}{match.group("quote")}'
+
+    return STATIC_FETCH_RE.sub(replace_static_fetch, value)
+
+
 def _rewrite_text_file(path: Path, alias_map: Mapping[str, Path]) -> list[dict[str, Any]]:
     extension = path.suffix.lower().lstrip('.')
-    if extension not in HTML_EXTENSIONS | CSS_EXTENSIONS | JS_EXTENSIONS:
+    if extension not in LINK_REFERENCE_EXTENSIONS:
         return []
     try:
         original = path.read_text(encoding='utf-8')
@@ -554,6 +790,13 @@ def _rewrite_text_file(path: Path, alias_map: Mapping[str, Path]) -> list[dict[s
 
         updated = HTML_STYLE_DOUBLE_RE.sub(replace_style_double, updated)
         updated = HTML_STYLE_SINGLE_RE.sub(replace_style_single, updated)
+        updated = _rewrite_static_fetch_refs(
+            updated,
+            path,
+            alias_map,
+            rewrites,
+            'html_fetch',
+        )
     if extension in CSS_EXTENSIONS:
         def replace_css_import(match: re.Match[str]) -> str:
             value = match.group('value')
@@ -563,8 +806,22 @@ def _rewrite_text_file(path: Path, alias_map: Mapping[str, Path]) -> list[dict[s
         updated = _rewrite_css_urls(updated, path, alias_map, rewrites, 'css_url')
         updated = CSS_IMPORT_RE.sub(replace_css_import, updated)
     if extension in JS_EXTENSIONS:
+        updated = _rewrite_static_fetch_refs(
+            updated,
+            path,
+            alias_map,
+            rewrites,
+            'js_fetch',
+        )
+        static_fetch_values = {
+            match.group('value')
+            for match in FETCH_LITERAL_PREFIX_RE.finditer(updated)
+        }
+
         def replace_js(match: re.Match[str]) -> str:
             value = match.group('value')
+            if value in static_fetch_values:
+                return match.group(0)
             resolved = _resolve_reference(value, path, alias_map)
             if not resolved:
                 return match.group(0)
@@ -572,6 +829,24 @@ def _rewrite_text_file(path: Path, alias_map: Mapping[str, Path]) -> list[dict[s
             return f'{match.group("quote")}{rewritten}{match.group("quote")}'
 
         updated = JS_QUOTED_RE.sub(replace_js, updated)
+    if extension in JSON_EXTENSIONS:
+        try:
+            json_payload = json.loads(original)
+        except (TypeError, ValueError):
+            json_payload = None
+        if json_payload is not None:
+            json_changed = False
+            for container, key, key_path, value in _iter_json_local_ref_slots(json_payload):
+                previous_count = len(rewrites)
+                rewritten = _rewrite_ref(value, path, alias_map, rewrites, 'json_path')
+                if rewritten == value:
+                    continue
+                container[key] = rewritten
+                json_changed = True
+                if len(rewrites) > previous_count:
+                    rewrites[-1]['json_key_path'] = key_path
+            if json_changed:
+                updated = json.dumps(json_payload, ensure_ascii=False, indent=2) + '\n'
     if updated != original:
         path.write_text(updated, encoding='utf-8')
     return rewrites
@@ -579,7 +854,7 @@ def _rewrite_text_file(path: Path, alias_map: Mapping[str, Path]) -> list[dict[s
 
 def _iter_local_refs(path: Path) -> Iterable[tuple[str, str]]:
     extension = path.suffix.lower().lstrip('.')
-    if extension not in HTML_EXTENSIONS | CSS_EXTENSIONS | JS_EXTENSIONS:
+    if extension not in LINK_REFERENCE_EXTENSIONS:
         return
     try:
         text = path.read_text(encoding='utf-8')
@@ -599,14 +874,35 @@ def _iter_local_refs(path: Path) -> Iterable[tuple[str, str]]:
         for value in _iter_html_style_values(text):
             for match in CSS_URL_RE.finditer(value):
                 yield 'html_style_url', match.group('value')
+        for match in STATIC_FETCH_RE.finditer(text):
+            value = match.group('value')
+            if _is_static_local_fetch_reference(value):
+                yield 'html_fetch', value
     if extension in CSS_EXTENSIONS:
         for match in CSS_URL_RE.finditer(text):
             yield 'css_url', match.group('value')
         for match in CSS_IMPORT_RE.finditer(text):
             yield 'css_import', match.group('value')
     if extension in JS_EXTENSIONS:
+        static_fetch_values: set[str] = set()
+        for match in FETCH_LITERAL_PREFIX_RE.finditer(text):
+            value = match.group('value')
+            static_fetch_values.add(value)
+        for match in STATIC_FETCH_RE.finditer(text):
+            value = match.group('value')
+            if _is_static_local_fetch_reference(value):
+                yield 'js_fetch', value
         for match in JS_QUOTED_RE.finditer(text):
-            yield 'js_asset_string', match.group('value')
+            value = match.group('value')
+            if value not in static_fetch_values:
+                yield 'js_asset_string', value
+    if extension in JSON_EXTENSIONS:
+        try:
+            json_payload = json.loads(text)
+        except (TypeError, ValueError):
+            return
+        for key_path, value in _iter_json_local_refs(json_payload):
+            yield f'json_path:{key_path}', value
 
 
 def _artifact_for_dependency_path(path: Path, artifacts_by_path: Mapping[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -675,7 +971,7 @@ def _include_linked_bundle_dependencies(
             if key in seen_paths:
                 continue
             seen_paths.add(key)
-            if source_path.suffix.lower().lstrip('.') in HTML_EXTENSIONS | CSS_EXTENSIONS | JS_EXTENSIONS:
+            if source_path.suffix.lower().lstrip('.') in LINK_REFERENCE_EXTENSIONS:
                 queue.append(source_path)
         result.append(artifact)
 
@@ -706,7 +1002,7 @@ def _include_linked_bundle_dependencies(
                 continue
             seen_paths.add(dependency_key)
             result.append(artifact)
-            if dependency.suffix.lower().lstrip('.') in HTML_EXTENSIONS | CSS_EXTENSIONS | JS_EXTENSIONS:
+            if dependency.suffix.lower().lstrip('.') in LINK_REFERENCE_EXTENSIONS:
                 queue.append(dependency)
     return result
 
@@ -746,9 +1042,14 @@ def _link_check(bundle_dir: Path, copied_files: list[Path]) -> dict[str, Any]:
                     'issues': syntax_issues,
                 }
             )
-        for kind, value in _iter_local_refs(path):
+        for raw_kind, value in _iter_local_refs(path):
             if _is_ignored_reference(value):
                 continue
+            kind = raw_kind
+            json_key_path = ''
+            if raw_kind.startswith('json_path:'):
+                kind = 'json_path'
+                json_key_path = raw_kind.split(':', 1)[1]
             path_part, _suffix = _split_ref(value)
             if not path_part:
                 continue
@@ -756,10 +1057,16 @@ def _link_check(bundle_dir: Path, copied_files: list[Path]) -> dict[str, Any]:
             try:
                 target.relative_to(bundle_dir.resolve())
             except ValueError:
-                missing.append({'file': str(path), 'kind': kind, 'target': value, 'reason': 'outside_bundle'})
+                item = {'file': str(path), 'kind': kind, 'target': value, 'reason': 'outside_bundle'}
+                if json_key_path:
+                    item['json_key_path'] = json_key_path
+                missing.append(item)
                 continue
             if not target.exists():
-                missing.append({'file': str(path), 'kind': kind, 'target': value, 'reason': 'missing'})
+                item = {'file': str(path), 'kind': kind, 'target': value, 'reason': 'missing'}
+                if json_key_path:
+                    item['json_key_path'] = json_key_path
+                missing.append(item)
     return {'status': 'passed' if not missing else 'failed', 'missing': missing}
 
 
@@ -809,9 +1116,18 @@ def bundle_response_artifacts(
         raise ValueError('response_payload must be a mapping')
     existing_artifacts = _collect_existing_artifacts(response_payload)
     public_artifacts = _filter_public_bundle_artifacts(response_payload, existing_artifacts)
+    carried_predecessor_artifacts = _authorized_carried_predecessor_artifacts(
+        response_payload,
+        public_artifacts,
+    )
+    all_artifacts = [*existing_artifacts, *carried_predecessor_artifacts]
+    selected_artifacts = [*public_artifacts, *carried_predecessor_artifacts]
     artifacts = [
         item
-        for item in _include_linked_bundle_dependencies(public_artifacts, existing_artifacts)
+        for item in _include_linked_bundle_dependencies(
+            selected_artifacts,
+            all_artifacts,
+        )
         if _is_bundleable_artifact(item)
     ]
     if not artifacts:
@@ -855,6 +1171,10 @@ def bundle_response_artifacts(
     rewritten_links: list[dict[str, Any]] = []
     for path in copied_files:
         rewritten_links.extend(_rewrite_text_file(path, alias_map))
+    for item in copied_artifacts:
+        final_path = Path(_clean_text(item.get('path')))
+        item['sha256'] = _file_sha256(final_path)
+        item['size_bytes'] = final_path.stat().st_size
 
     link_check = _link_check(bundle_dir, copied_files)
     entrypoint_path = ''

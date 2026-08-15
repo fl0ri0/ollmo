@@ -3872,6 +3872,8 @@ _RESPONSES_REQUEST_RUNTIME = ResponsesRequestRuntimeOwner(
         'inject_selected_reference_into_chat_messages': lambda messages, selected_reference_artifacts: _inject_selected_reference_into_chat_messages(messages, selected_reference_artifacts),
         'inject_ghost_runtime_policy_into_chat_messages': lambda messages, **kwargs: _inject_ghost_runtime_policy_into_chat_messages(messages, **kwargs),
         'inject_prepare_phase_contract_into_chat_messages': lambda messages, **kwargs: _inject_prepare_phase_contract_into_chat_messages(messages, **kwargs),
+        'resolve_prepare_phase_contract': lambda **kwargs: _resolve_prepare_phase_contract(**kwargs),
+        'build_external_prepare_phase_bounded_task': lambda **kwargs: _build_external_prepare_phase_bounded_task(**kwargs),
         'choose_context_strategy': lambda **kwargs: _choose_context_strategy(**kwargs),
         'apply_context_strategy': lambda messages, context_strategy: _apply_context_strategy(messages, context_strategy),
         'stream_chat_backend_as_responses': lambda **kwargs: _stream_chat_backend_as_responses(**kwargs),
@@ -4012,6 +4014,12 @@ _LATE_FILL_RUNTIME = LateFillRuntimeOwner(
         _load_latest_response_observation_state(
             response_id,
             frames_dir=RESPONSE_FRAMES_DIR,
+        )
+    ),
+    load_external_targets=lambda: _external_targets_payload(),
+    execute_external_chat_phase=lambda **kwargs: (
+        _RESPONSES_REQUEST_RUNTIME.execute_bounded_external_chat_phase(
+            **kwargs
         )
     ),
 )
@@ -5756,6 +5764,21 @@ def _normalize_capability_list(values: Any) -> list[str]:
 
 
 def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
+    def normalized_excluded_instance_ids(
+        source: Mapping[str, Any],
+        *keys: str,
+    ) -> list[str]:
+        normalized: list[str] = []
+        for key in keys:
+            raw_values = source.get(key)
+            if not isinstance(raw_values, list):
+                continue
+            for item in raw_values:
+                token = str(item or '').strip()
+                if token and token not in normalized:
+                    normalized.append(token)
+        return normalized
+
     branches: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for index, raw_value in enumerate(values or [], start=1):
@@ -5908,23 +5931,47 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             value = raw_branch.get(key)
             if value not in (None, '', [], {}):
                 branch[key] = value
+        for source_key, target_key in (
+            ('suggested_action', 'suggested_action'),
+            ('suggestedAction', 'suggested_action'),
+            ('repair_work_policy', 'repair_work_policy'),
+            ('repairWorkPolicy', 'repair_work_policy'),
+            ('repair_work_available', 'repair_work_available'),
+            ('repairWorkAvailable', 'repair_work_available'),
+            ('materialization_blocked', 'materialization_blocked'),
+            ('materializationBlocked', 'materialization_blocked'),
+            ('needs_external_input', 'needs_external_input'),
+            ('needsExternalInput', 'needs_external_input'),
+            ('blocked_scope', 'blocked_scope'),
+            ('blockedScope', 'blocked_scope'),
+            ('blocked_prerequisite', 'blocked_prerequisite'),
+            ('blockedPrerequisite', 'blocked_prerequisite'),
+            ('auto_execute', 'auto_execute'),
+            ('autoExecute', 'auto_execute'),
+            ('auto_executable_repair_retry_count', 'auto_executable_repair_retry_count'),
+            ('autoExecutableRepairRetryCount', 'auto_executable_repair_retry_count'),
+            ('auto_executable_repair_max_attempts', 'auto_executable_repair_max_attempts'),
+            ('autoExecutableRepairMaxAttempts', 'auto_executable_repair_max_attempts'),
+            ('repair_auto_execute_max_attempts', 'repair_auto_execute_max_attempts'),
+            ('repairAutoExecuteMaxAttempts', 'repair_auto_execute_max_attempts'),
+            ('max_auto_execute_attempts', 'max_auto_execute_attempts'),
+            ('maxAutoExecuteAttempts', 'max_auto_execute_attempts'),
+            ('execution_policy', 'execution_policy'),
+            ('executionPolicy', 'execution_policy'),
+            ('repair_execution_policy', 'repair_execution_policy'),
+            ('repairExecutionPolicy', 'repair_execution_policy'),
+        ):
+            value = raw_branch.get(source_key)
+            if value not in (None, '', [], {}):
+                branch[target_key] = value
         if capability == 'text_to_speech':
-            for key in (
-                'suggested_action',
-                'repair_work_policy',
-                'repair_work_available',
-                'materialization_blocked',
-                'needs_external_input',
-                'blocked_scope',
-                'blocked_prerequisite',
-                'auto_execute',
-                'auto_executable_repair_retry_count',
-                'auto_executable_repair_max_attempts',
-                'recovery_policy_id',
-            ):
-                value = raw_branch.get(key)
-                if value not in (None, '', [], {}):
-                    branch[key] = value
+            recovery_policy_id = str(
+                raw_branch.get('recovery_policy_id')
+                or raw_branch.get('recoveryPolicyId')
+                or ''
+            ).strip()
+            if recovery_policy_id:
+                branch['recovery_policy_id'] = recovery_policy_id
         batch_prompts = [
             str(item).strip()
             for item in (raw_branch.get('batch_prompts') or [])
@@ -5941,17 +5988,13 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
         ).strip()
         if failed_instance_id:
             branch['failed_instance_id'] = failed_instance_id
-        excluded_instance_ids = [
-            str(item).strip()
-            for item in (
-                raw_branch.get('excluded_instance_ids')
-                if isinstance(raw_branch.get('excluded_instance_ids'), list)
-                else raw_branch.get('excludedInstanceIds')
-                if isinstance(raw_branch.get('excludedInstanceIds'), list)
-                else []
-            )
-            if str(item).strip()
-        ]
+        excluded_instance_ids = normalized_excluded_instance_ids(
+            raw_branch,
+            'excluded_instance_ids',
+            'excludedInstanceIds',
+            'exclude_instance_ids',
+            'excludeInstanceIds',
+        )
         if excluded_instance_ids:
             branch['excluded_instance_ids'] = excluded_instance_ids
         error = raw_branch.get('error') if isinstance(raw_branch.get('error'), Mapping) else None
@@ -6117,18 +6160,13 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 value = recovery_context.get(source_key)
                 if isinstance(value, bool):
                     branch_recovery[target_key] = value
-            exclude_values = (
-                recovery_context.get('exclude_instance_ids')
-                if isinstance(recovery_context.get('exclude_instance_ids'), list)
-                else recovery_context.get('excludeInstanceIds')
-                if isinstance(recovery_context.get('excludeInstanceIds'), list)
-                else []
+            exclude_instance_ids = normalized_excluded_instance_ids(
+                recovery_context,
+                'exclude_instance_ids',
+                'excludeInstanceIds',
+                'excluded_instance_ids',
+                'excludedInstanceIds',
             )
-            exclude_instance_ids = [
-                str(item).strip()
-                for item in exclude_values
-                if str(item).strip()
-            ]
             if exclude_instance_ids:
                 branch_recovery['exclude_instance_ids'] = exclude_instance_ids
             if capability == 'text_to_speech':
@@ -6226,18 +6264,13 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 value = recovery_state.get(source_key)
                 if isinstance(value, bool):
                     branch_recovery_state[target_key] = value
-            exclude_values = (
-                recovery_state.get('exclude_instance_ids')
-                if isinstance(recovery_state.get('exclude_instance_ids'), list)
-                else recovery_state.get('excludeInstanceIds')
-                if isinstance(recovery_state.get('excludeInstanceIds'), list)
-                else []
+            recovery_exclude_instance_ids = normalized_excluded_instance_ids(
+                recovery_state,
+                'exclude_instance_ids',
+                'excludeInstanceIds',
+                'excluded_instance_ids',
+                'excludedInstanceIds',
             )
-            recovery_exclude_instance_ids = [
-                str(item).strip()
-                for item in exclude_values
-                if str(item).strip()
-            ]
             if recovery_exclude_instance_ids:
                 branch_recovery_state['exclude_instance_ids'] = recovery_exclude_instance_ids
             if capability == 'text_to_speech':
@@ -6310,18 +6343,13 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 value = recovery_attempt.get(source_key)
                 if isinstance(value, bool):
                     branch_recovery_attempt[target_key] = value
-            attempt_exclude_values = (
-                recovery_attempt.get('excluded_instance_ids')
-                if isinstance(recovery_attempt.get('excluded_instance_ids'), list)
-                else recovery_attempt.get('excludedInstanceIds')
-                if isinstance(recovery_attempt.get('excludedInstanceIds'), list)
-                else []
+            attempt_excluded_instance_ids = normalized_excluded_instance_ids(
+                recovery_attempt,
+                'excluded_instance_ids',
+                'excludedInstanceIds',
+                'exclude_instance_ids',
+                'excludeInstanceIds',
             )
-            attempt_excluded_instance_ids = [
-                str(item).strip()
-                for item in attempt_exclude_values
-                if str(item).strip()
-            ]
             if attempt_excluded_instance_ids:
                 branch_recovery_attempt['excluded_instance_ids'] = attempt_excluded_instance_ids
             if capability == 'text_to_speech':
@@ -6358,6 +6386,21 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                     ] = dict(prior_audio_integrity)
             if branch_recovery_attempt:
                 branch['recovery_attempt'] = branch_recovery_attempt
+        canonical_excluded_instance_ids: list[str] = []
+        for source, key in (
+            (branch, 'excluded_instance_ids'),
+            (branch.get('recovery_context'), 'exclude_instance_ids'),
+            (branch.get('recovery_state'), 'exclude_instance_ids'),
+            (branch.get('recovery_attempt'), 'excluded_instance_ids'),
+        ):
+            if not isinstance(source, Mapping):
+                continue
+            for item in source.get(key) or []:
+                token = str(item or '').strip()
+                if token and token not in canonical_excluded_instance_ids:
+                    canonical_excluded_instance_ids.append(token)
+        if canonical_excluded_instance_ids:
+            branch['excluded_instance_ids'] = canonical_excluded_instance_ids
         branches.append(branch)
     return branches
 
@@ -6591,6 +6634,7 @@ def _lookup_artifact_for_slot_record(
     slot: Mapping[str, Any],
     record: Mapping[str, Any],
     artifacts: list[Any],
+    allow_type_fallback: bool = False,
 ) -> dict[str, Any]:
     record_path = _lookup_record_artifact_path(record)
     record_ref = str(record.get('artifact_ref') or record.get('ref') or '').strip()
@@ -6605,7 +6649,14 @@ def _lookup_artifact_for_slot_record(
             return dict(raw_artifact)
         if record_path and artifact_path and record_path == artifact_path:
             return dict(raw_artifact)
-        if not record_path and slot_type and artifact_type and slot_type == artifact_type:
+        if (
+            allow_type_fallback
+            and not record_path
+            and not record_ref
+            and slot_type
+            and artifact_type
+            and slot_type == artifact_type
+        ):
             return dict(raw_artifact)
     return {}
 
@@ -6648,6 +6699,7 @@ def _reconcile_lookup_output_slots_with_late_fill_truth(payload: Mapping[str, An
     if not late_fill:
         return updated
     artifacts = updated.get('artifacts') if isinstance(updated.get('artifacts'), list) else []
+    outputs = updated.get('outputs') if isinstance(updated.get('outputs'), list) else []
     fill_results = late_fill.get('fill_results') if isinstance(late_fill.get('fill_results'), list) else []
     completed_branches = late_fill.get('completed_branches') if isinstance(late_fill.get('completed_branches'), list) else []
     failed_branches = late_fill.get('failed_branches') if isinstance(late_fill.get('failed_branches'), list) else []
@@ -6663,6 +6715,15 @@ def _reconcile_lookup_output_slots_with_late_fill_truth(payload: Mapping[str, An
         slot_type = str(raw_slot.get('type') or '').strip().lower()
         if slot_type and slot_type not in {'text', 'document'}:
             non_text_slot_type_counts[slot_type] = non_text_slot_type_counts.get(slot_type, 0) + 1
+    artifact_type_counts: dict[str, int] = {}
+    for raw_artifact in artifacts:
+        if not isinstance(raw_artifact, Mapping):
+            continue
+        artifact_type = str(
+            raw_artifact.get('type') or raw_artifact.get('kind') or ''
+        ).strip().lower()
+        if artifact_type:
+            artifact_type_counts[artifact_type] = artifact_type_counts.get(artifact_type, 0) + 1
 
     reconciled_slots: list[dict[str, Any]] = []
     changed = False
@@ -6686,12 +6747,43 @@ def _reconcile_lookup_output_slots_with_late_fill_truth(payload: Mapping[str, An
                 None,
             )
         if completed_record is not None and slot_type not in {'text', 'document'}:
+            matching_output = next(
+                (
+                    output
+                    for output in outputs
+                    if isinstance(output, Mapping)
+                    and slot_tokens
+                    and slot_tokens.intersection(_lookup_slot_tokens(output))
+                ),
+                {},
+            )
+            artifact_identity_record = (
+                completed_record
+                if _lookup_record_artifact_path(completed_record)
+                or str(
+                    completed_record.get('artifact_ref')
+                    or completed_record.get('ref')
+                    or ''
+                ).strip()
+                else matching_output
+                if isinstance(matching_output, Mapping) and matching_output
+                else slot
+            )
             artifact = _lookup_artifact_for_slot_record(
                 slot=slot,
-                record=completed_record,
+                record=artifact_identity_record,
                 artifacts=artifacts,
+                allow_type_fallback=(
+                    non_text_slot_type_counts.get(slot_type, 0) <= 1
+                    and artifact_type_counts.get(slot_type, 0) <= 1
+                ),
             )
-            path = _lookup_record_artifact_path(completed_record) or _lookup_record_artifact_path(artifact)
+            path = (
+                _lookup_record_artifact_path(completed_record)
+                or _lookup_record_artifact_path(matching_output)
+                or _lookup_record_artifact_path(slot)
+                or _lookup_record_artifact_path(artifact)
+            )
             slot['status'] = 'fulfilled'
             slot['lifecycle'] = 'materialized_output'
             if path:
@@ -6705,6 +6797,10 @@ def _reconcile_lookup_output_slots_with_late_fill_truth(payload: Mapping[str, An
             artifact_ref = str(
                 completed_record.get('artifact_ref')
                 or completed_record.get('ref')
+                or matching_output.get('artifact_ref')
+                or matching_output.get('ref')
+                or slot.get('artifact_ref')
+                or slot.get('ref')
                 or artifact.get('artifact_ref')
                 or artifact.get('ref')
                 or ''
@@ -7428,6 +7524,19 @@ def _format_prepare_phase_capability_label(capability: str) -> str:
 
 def _build_prepare_phase_system_message(prepare_contract: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
     return _RESPONSE_SEMANTICS_RUNTIME.build_prepare_phase_system_message(prepare_contract)
+
+
+def _build_external_prepare_phase_bounded_task(
+    *,
+    prepare_contract: Optional[dict[str, Any]] = None,
+    route_payload: Optional[dict[str, Any]] = None,
+    request_payload: Optional[dict[str, Any]] = None,
+) -> str:
+    return _RESPONSE_SEMANTICS_RUNTIME.build_external_prepare_phase_bounded_task(
+        prepare_contract=prepare_contract,
+        route_payload=route_payload,
+        request_payload=request_payload,
+    )
 
 
 def _inject_ghost_runtime_policy_into_chat_messages(
@@ -9594,7 +9703,39 @@ def _persist_generated_text_artifact_if_requested(
     artifact_payloads = extract_text_artifact_payloads(str(content or ''), artifact_requests)
     if not artifact_payloads:
         return {}
+    predecessor_edit_targets: dict[tuple[str, str], str] = {}
+    predecessor_context = (
+        request_payload.get('current_predecessor_context')
+        if isinstance(request_payload, dict)
+        and isinstance(request_payload.get('current_predecessor_context'), dict)
+        else {}
+    )
+    if (
+        predecessor_context.get('status') == 'authorized'
+        and predecessor_context.get('authorization')
+        == 'canonical_same_conversation_predecessor'
+        and predecessor_context.get('promotion_mode') == 'named_text_edit'
+    ):
+        ambiguous_target_keys: set[tuple[str, str]] = set()
+        for item in predecessor_context.get('matched_text_artifacts') or []:
+            if not isinstance(item, dict):
+                continue
+            filename = Path(str(item.get('filename') or '')).name
+            target_path = str(item.get('path') or '').strip()
+            identity = (
+                Path(filename).suffix.lower().lstrip('.'),
+                Path(filename).stem.lower(),
+            )
+            if not all(identity) or not target_path:
+                continue
+            if identity in predecessor_edit_targets:
+                ambiguous_target_keys.add(identity)
+                predecessor_edit_targets.pop(identity, None)
+                continue
+            if identity not in ambiguous_target_keys:
+                predecessor_edit_targets[identity] = target_path
     saved_text_artifacts: list[dict[str, Any]] = []
+    preservation_rejections: list[dict[str, Any]] = []
     for artifact_payload in artifact_payloads:
         artifact_request = (
             artifact_payload.get('artifact_request')
@@ -9604,25 +9745,123 @@ def _persist_generated_text_artifact_if_requested(
         artifact_content = str((artifact_payload or {}).get('content') or '').strip()
         if not artifact_content or not isinstance(artifact_request, dict):
             continue
+        request_identity = (
+            str(artifact_request.get('extension') or '').strip().lower().lstrip('.'),
+            str(artifact_request.get('source_name') or '').strip().lower(),
+        )
+        predecessor_target_path = predecessor_edit_targets.get(request_identity)
+        if predecessor_target_path:
+            artifact_request = {
+                **artifact_request,
+                'source': 'selected_source_edit',
+                'target_path': predecessor_target_path,
+            }
+        revision_preservation_evidence: dict[str, Any] = {}
+        revision_write_proof: dict[str, Any] = {}
+        target_path = str(artifact_request.get('target_path') or '').strip()
+        revision_required = bool(
+            target_path
+            and str(artifact_request.get('source') or '').strip().lower()
+            in {'selected_source_edit', 'canonical_predecessor_artifact'}
+        )
+        resolved_source = (
+            _resolve_saved_text_artifact_path(target_path)
+            if revision_required
+            else None
+        )
+        source_content = ''
+        source_sha256 = ''
+        if resolved_source:
+            try:
+                source_bytes = resolved_source.read_bytes()
+                source_content = source_bytes.decode('utf-8', errors='replace')
+                source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+            except OSError:
+                source_content = ''
+                source_sha256 = ''
+        if (
+            revision_required
+            and _LATE_FILL_RUNTIME._text_artifact_revision_preservation_requested(prompt)
+        ):
+            revision_preservation_evidence, preservation_error = (
+                _LATE_FILL_RUNTIME._text_artifact_revision_preservation_review(
+                    source_content,
+                    artifact_content,
+                    extension=str(artifact_request.get('extension') or ''),
+                    target_path=target_path,
+                )
+            )
+            if preservation_error:
+                preservation_rejections.append(preservation_error)
+                continue
+            artifact_request = {
+                **artifact_request,
+                'text_artifact_revision_preservation_required': True,
+                'text_artifact_revision_preservation_policy': (
+                    'structural_anchor_retention_v1'
+                ),
+            }
         saved_text_path = _persist_text_artifact_locally(
             artifact_content,
             model_name=model_name,
             source_name=artifact_request.get('source_name') or 'generated-text',
             mode=mode,
             extension=artifact_request.get('extension') or 'txt',
-            target_path=artifact_request.get('target_path'),
+            target_path=target_path or None,
         )
         if not saved_text_path:
             continue
+        if revision_required:
+            output_sha256 = ''
+            try:
+                output_sha256 = hashlib.sha256(
+                    Path(saved_text_path).read_bytes()
+                ).hexdigest()
+            except OSError:
+                output_sha256 = ''
+            revision_write_proof = {
+                key: value
+                for key, value in {
+                    'kind': 'ollmo.text_artifact_revision_write_proof',
+                    'version': 1,
+                    'status': 'applied',
+                    'target_path': target_path,
+                    'source_sha256': source_sha256 or None,
+                    'output_sha256': output_sha256 or None,
+                    'evidence': 'current_response_output_written_to_target',
+                }.items()
+                if value not in (None, '')
+            }
         saved_text_artifacts.append(
             {
                 'path': saved_text_path,
                 'text_artifact_request': artifact_request,
                 'document_output_kind': 'document',
+                **(
+                    {
+                        'text_artifact_revision_required': True,
+                        'text_artifact_revision_write_proof': revision_write_proof,
+                    }
+                    if revision_write_proof
+                    else {}
+                ),
+                **(
+                    {
+                        'text_artifact_revision_preservation_evidence': (
+                            revision_preservation_evidence
+                        )
+                    }
+                    if revision_preservation_evidence
+                    else {}
+                ),
             }
         )
     if not saved_text_artifacts:
-        return {}
+        return (
+            {'text_artifact_revision_preservation_rejections': preservation_rejections}
+            if preservation_rejections
+            else {}
+        )
     first_artifact = saved_text_artifacts[0]
     return {
         'saved_text_path': first_artifact['path'],
@@ -9634,6 +9873,35 @@ def _persist_generated_text_artifact_if_requested(
             for item in saved_text_artifacts
             if isinstance(item.get('text_artifact_request'), dict)
         ],
+        **(
+            {
+                'text_artifact_revision_write_proof': first_artifact.get(
+                    'text_artifact_revision_write_proof'
+                )
+            }
+            if isinstance(
+                first_artifact.get('text_artifact_revision_write_proof'),
+                dict,
+            )
+            else {}
+        ),
+        **(
+            {
+                'text_artifact_revision_preservation_evidence': first_artifact.get(
+                    'text_artifact_revision_preservation_evidence'
+                )
+            }
+            if isinstance(
+                first_artifact.get('text_artifact_revision_preservation_evidence'),
+                dict,
+            )
+            else {}
+        ),
+        **(
+            {'text_artifact_revision_preservation_rejections': preservation_rejections}
+            if preservation_rejections
+            else {}
+        ),
     }
 
 

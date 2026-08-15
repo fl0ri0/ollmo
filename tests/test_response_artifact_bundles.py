@@ -1,3 +1,5 @@
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,6 +62,269 @@ class ResponseArtifactBundleTests(unittest.TestCase):
             self.assertIn('html_style_url', {item['kind'] for item in payload['rewritten_links']})
             self.assertEqual(index_path.read_text(encoding='utf-8'), index_original)
             self.assertEqual(styles_path.read_text(encoding='utf-8'), styles_original)
+            for artifact in payload['copied_artifacts']:
+                final_bytes = Path(artifact['path']).read_bytes()
+                self.assertEqual(artifact['size_bytes'], len(final_bytes))
+                self.assertEqual(artifact['sha256'], hashlib.sha256(final_bytes).hexdigest())
+
+    def test_web_bundle_rewrites_static_html_fetch_and_preserves_nonlocal_or_dynamic_fetches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            document_dir.mkdir(parents=True)
+            index_path = document_dir / 'index.html'
+            pricing_path = document_dir / 'pricing.json'
+            index_original = (
+                '<!doctype html><script>'
+                'fetch("pricing.json");'
+                'fetch("https://example.com/pricing.json");'
+                'fetch("data:application/json,%7B%7D");'
+                'fetch("/api/pricing.json");'
+                'fetch("/api/pricing");'
+                'fetch("dynamic.json" + window.location.search);'
+                'const dynamicPath = window.pricingPath; fetch(dynamicPath);'
+                '</script>'
+            )
+            index_path.write_text(index_original, encoding='utf-8')
+            pricing_path.write_text('{"materials": []}\n', encoding='utf-8')
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_static_html_fetch',
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(index_path),
+                            'name': 'index',
+                            'artifact_ref': 'artifact:index',
+                        },
+                        {
+                            'type': 'text',
+                            'path': str(pricing_path),
+                            'name': 'pricing',
+                            'artifact_ref': 'artifact:pricing',
+                        },
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-15T13:30:00Z',
+            )
+
+            bundle_dir = Path(payload['bundle_path'])
+            bundled_html = (bundle_dir / 'index.html').read_text(encoding='utf-8')
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertEqual(payload['link_check']['status'], 'passed')
+            self.assertTrue((bundle_dir / 'assets/files/pricing.json').exists())
+            self.assertIn('fetch("assets/files/pricing.json")', bundled_html)
+            self.assertIn('fetch("https://example.com/pricing.json")', bundled_html)
+            self.assertIn('fetch("data:application/json,%7B%7D")', bundled_html)
+            self.assertIn('fetch("/api/pricing.json")', bundled_html)
+            self.assertIn('fetch("/api/pricing")', bundled_html)
+            self.assertIn('fetch("dynamic.json" + window.location.search)', bundled_html)
+            self.assertIn('fetch(dynamicPath)', bundled_html)
+            self.assertIn(
+                'html_fetch',
+                {item.get('kind') for item in payload['rewritten_links']},
+            )
+            self.assertEqual(index_path.read_text(encoding='utf-8'), index_original)
+
+    def test_web_bundle_fails_link_check_for_missing_static_js_fetch_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            document_dir.mkdir(parents=True)
+            index_path = document_dir / 'index.html'
+            script_path = document_dir / 'app.js'
+            index_path.write_text(
+                '<!doctype html><script src="app.js"></script>',
+                encoding='utf-8',
+            )
+            script_path.write_text(
+                "fetch('pricing.json');\n"
+                "fetch('https://example.com/pricing.json');\n"
+                "fetch('data:application/json,%7B%7D');\n"
+                "fetch('/api/pricing.json');\n"
+                "fetch('/api/pricing');\n"
+                "fetch('dynamic.json' + window.location.search);\n"
+                'const dynamicPath = window.pricingPath; fetch(dynamicPath);\n',
+                encoding='utf-8',
+            )
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_missing_static_js_fetch',
+                    'outputs': [
+                        {
+                            'type': 'text',
+                            'status': 'fulfilled',
+                            'artifact_ref': 'artifact:index',
+                        }
+                    ],
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(index_path),
+                            'name': 'index',
+                            'artifact_ref': 'artifact:index',
+                        },
+                        {
+                            'type': 'text',
+                            'path': str(script_path),
+                            'name': 'app',
+                            'artifact_ref': 'artifact:app',
+                        },
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-15T13:35:00Z',
+            )
+
+            self.assertEqual(payload['status'], 'failed')
+            self.assertEqual(payload['link_check']['status'], 'failed')
+            self.assertEqual(
+                [
+                    (item.get('kind'), item.get('target'))
+                    for item in payload['link_check']['missing']
+                    if item.get('reason') == 'missing'
+                ],
+                [('js_fetch', 'pricing.json')],
+            )
+
+    def test_bundle_rewrites_structural_json_asset_paths_and_includes_the_dependency(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            image_dir = root / 'artifacts' / 'images'
+            document_dir.mkdir(parents=True)
+            image_dir.mkdir(parents=True)
+            pricing_path = document_dir / 'pricing.json'
+            image_path = image_dir / 'hero.png'
+            image_path.write_bytes(b'png')
+            pricing_path.write_text(
+                json.dumps(
+                    {
+                        'items': [
+                            {
+                                'material': 'Titanium',
+                                'image_path': '../images/hero.png',
+                                'description': '../images/not-a-link.png',
+                            }
+                        ],
+                        'imagePaths': [str(image_path)],
+                        'catalogUrl': 'https://example.com/catalog.json',
+                    },
+                    indent=2,
+                ),
+                encoding='utf-8',
+            )
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_json_paths',
+                    'outputs': [
+                        {
+                            'type': 'text',
+                            'status': 'fulfilled',
+                            'artifact_ref': 'artifact:pricing',
+                        }
+                    ],
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(pricing_path),
+                            'name': 'pricing',
+                            'artifact_ref': 'artifact:pricing',
+                        }
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-04T19:00:00Z',
+            )
+
+            bundled_pricing = Path(payload['bundle_path']) / 'pricing.json'
+            bundled_payload = json.loads(bundled_pricing.read_text(encoding='utf-8'))
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertEqual(bundled_payload['items'][0]['image_path'], 'assets/images/hero.png')
+            self.assertEqual(bundled_payload['imagePaths'][0], 'assets/images/hero.png')
+            self.assertEqual(
+                bundled_payload['items'][0]['description'],
+                '../images/not-a-link.png',
+            )
+            self.assertEqual(bundled_payload['catalogUrl'], 'https://example.com/catalog.json')
+            self.assertTrue((Path(payload['bundle_path']) / 'assets/images/hero.png').exists())
+            json_rewrites = [
+                item for item in payload['rewritten_links'] if item.get('kind') == 'json_path'
+            ]
+            self.assertEqual(
+                {item.get('json_key_path') for item in json_rewrites},
+                {'items[0].image_path', 'imagePaths[0]'},
+            )
+
+    def test_bundle_fails_closed_for_unresolved_structural_json_asset_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            document_dir.mkdir(parents=True)
+            index_path = document_dir / 'index.html'
+            pricing_path = document_dir / 'pricing.json'
+            index_path.write_text('<!doctype html><main>Catalog</main>', encoding='utf-8')
+            pricing_path.write_text(
+                json.dumps(
+                    {
+                        'items': [
+                            {
+                                'image_path': '{{PATH_TITANIUM}}',
+                                'thumbnailUrl': 'images/missing.jpg',
+                                'description': 'images/not-a-structural-link.jpg',
+                                'note': '{{NOT_A_PATH_VALUE}}',
+                            }
+                        ]
+                    },
+                    indent=2,
+                ),
+                encoding='utf-8',
+            )
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_json_missing_paths',
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(index_path),
+                            'name': 'index',
+                            'artifact_ref': 'artifact:index',
+                        },
+                        {
+                            'type': 'text',
+                            'path': str(pricing_path),
+                            'name': 'pricing',
+                            'artifact_ref': 'artifact:pricing',
+                        },
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-04T19:05:00Z',
+            )
+
+            self.assertEqual(payload['status'], 'failed')
+            json_missing = [
+                item
+                for item in payload['link_check']['missing']
+                if item.get('kind') == 'json_path'
+            ]
+            self.assertEqual(
+                {item.get('target') for item in json_missing},
+                {'{{PATH_TITANIUM}}', 'images/missing.jpg'},
+            )
+            self.assertEqual(
+                {item.get('json_key_path') for item in json_missing},
+                {'items[0].image_path', 'items[0].thumbnailUrl'},
+            )
+            self.assertNotIn(
+                'images/not-a-structural-link.jpg',
+                {item.get('target') for item in payload['link_check']['missing']},
+            )
 
     def test_duplicate_filenames_are_deduped_in_bundle(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -405,6 +670,269 @@ class ResponseArtifactBundleTests(unittest.TestCase):
             self.assertIsNone(payload.get('entrypoint_relative_path'))
             self.assertTrue((Path(payload['bundle_path']) / 'assets/css/styles.css').exists())
             self.assertTrue((Path(payload['bundle_path']) / 'assets/images/hero.png').exists())
+
+    def test_non_index_html_entrypoint_keeps_identity_and_missing_index_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            document_dir.mkdir(parents=True)
+            configurator_path = document_dir / 'timestamp_model_configurator.html'
+            configurator_path.write_text(
+                '<!doctype html>'
+                '<nav><a href="index.html">Atelier</a>'
+                '<a href="configurator.html">Configurator</a></nav>',
+                encoding='utf-8',
+            )
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_configurator_without_index',
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(configurator_path),
+                            'name': 'configurator',
+                            'artifact_ref': 'artifact:configurator',
+                        }
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-05T04:30:00Z',
+            )
+
+            bundle_dir = Path(payload['bundle_path'])
+            bundled_configurator = bundle_dir / 'configurator.html'
+            self.assertEqual(payload['status'], 'failed')
+            self.assertEqual(payload['entrypoint'], str(bundled_configurator))
+            self.assertEqual(payload['entrypoint_relative_path'], 'configurator.html')
+            self.assertTrue(bundled_configurator.exists())
+            self.assertFalse((bundle_dir / 'index.html').exists())
+            self.assertEqual(
+                {
+                    item.get('target')
+                    for item in payload['link_check']['missing']
+                    if item.get('reason') == 'missing'
+                },
+                {'index.html'},
+            )
+            bundled_html = bundled_configurator.read_text(encoding='utf-8')
+            self.assertIn('href="configurator.html"', bundled_html)
+            self.assertNotIn('href="index.html">Configurator', bundled_html)
+
+    def test_named_follow_up_bundle_carries_only_authorized_immutable_predecessor_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            image_dir = root / 'artifacts' / 'images'
+            document_dir.mkdir(parents=True)
+            image_dir.mkdir(parents=True)
+            index_path = document_dir / 'stamp_index.html'
+            configurator_path = document_dir / 'stamp_configurator.html'
+            styles_path = document_dir / 'stamp_styles.css'
+            pricing_path = document_dir / 'stamp_pricing.json'
+            old_hero_path = image_dir / 'old-hero.png'
+            new_image_paths = [image_dir / f'material-{index}.png' for index in range(1, 4)]
+            index_path.write_text(
+                '<!doctype html>'
+                '<link rel="stylesheet" href="stamp_styles.css">'
+                '<a href="stamp_configurator.html">Configurator</a>'
+                '<img src="../images/old-hero.png">',
+                encoding='utf-8',
+            )
+            configurator_path.write_text(
+                '<!doctype html>'
+                '<link rel="stylesheet" href="stamp_styles.css">'
+                '<a href="stamp_index.html">Atelier</a>'
+                + ''.join(
+                    f'<img src="../images/{path.name}">' for path in new_image_paths
+                ),
+                encoding='utf-8',
+            )
+            styles_path.write_text('body { color: silver; }', encoding='utf-8')
+            pricing_path.write_text('{"materials": []}', encoding='utf-8')
+            old_hero_path.write_bytes(b'old-hero')
+            for path in new_image_paths:
+                path.write_bytes(path.name.encode('utf-8'))
+
+            carried_dependencies = [
+                {
+                    'type': 'text',
+                    'path': str(index_path),
+                    'name': 'index',
+                    'artifact_ref': 'artifact:old-index',
+                },
+                {
+                    'type': 'text',
+                    'path': str(pricing_path),
+                    'name': 'pricing',
+                    'artifact_ref': 'artifact:old-pricing',
+                },
+                {
+                    'type': 'image',
+                    'path': str(old_hero_path),
+                    'name': 'old-hero',
+                    'artifact_ref': 'artifact:old-hero',
+                },
+            ]
+            for item in carried_dependencies:
+                item.update(
+                    {
+                        'kind': item['type'],
+                        'source_path': item['path'],
+                        'source_response_id': 'resp-predecessor',
+                        'origin': 'canonical_predecessor_bundle_dependency',
+                        'carried_public_dependency': True,
+                    }
+                )
+            current_artifacts = [
+                {
+                    'type': 'text',
+                    'path': str(configurator_path),
+                    'name': 'configurator',
+                    'artifact_ref': 'artifact:configurator-current',
+                },
+                {
+                    'type': 'text',
+                    'path': str(styles_path),
+                    'name': 'styles',
+                    'artifact_ref': 'artifact:styles-current',
+                },
+                *[
+                    {
+                        'type': 'image',
+                        'path': str(path),
+                        'name': path.stem,
+                        'artifact_ref': f'artifact:new-{index}',
+                    }
+                    for index, path in enumerate(new_image_paths, start=1)
+                ],
+            ]
+            outputs = [
+                {
+                    'type': item['type'],
+                    'status': 'fulfilled',
+                    'artifact_ref': item['artifact_ref'],
+                }
+                for item in current_artifacts
+            ]
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp-named-follow-up',
+                    'outputs': outputs,
+                    'artifacts': current_artifacts,
+                    'response_frame': {
+                        'request': {
+                            'current_predecessor_context': {
+                                'kind': 'ollmo.current_predecessor_context',
+                                'status': 'authorized',
+                                'authorization': (
+                                    'canonical_same_conversation_predecessor'
+                                ),
+                                'promotion_mode': 'named_text_edit',
+                                'source_response_id': 'resp-predecessor',
+                                'matched_text_artifacts': [
+                                    {'path': str(configurator_path)},
+                                    {'path': str(styles_path)},
+                                ],
+                                'carried_public_dependencies': carried_dependencies,
+                            }
+                        }
+                    },
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-05T06:00:00Z',
+            )
+
+            bundle_dir = Path(payload['bundle_path'])
+            relative_paths = {
+                item['relative_path'] for item in payload['copied_artifacts']
+            }
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertEqual(payload['entrypoint_relative_path'], 'index.html')
+            self.assertIn('index.html', relative_paths)
+            self.assertIn('assets/files/configurator.html', relative_paths)
+            self.assertIn('assets/files/pricing.json', relative_paths)
+            self.assertIn('assets/css/styles.css', relative_paths)
+            self.assertIn('assets/images/old-hero.png', relative_paths)
+            self.assertEqual(
+                len([path for path in relative_paths if path.endswith('styles.css')]),
+                1,
+            )
+            bundled_configurator = (
+                bundle_dir / 'assets' / 'files' / 'configurator.html'
+            ).read_text(encoding='utf-8')
+            self.assertIn('href="../../index.html"', bundled_configurator)
+
+    def test_named_follow_up_bundle_does_not_carry_when_a_revision_target_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            configurator_path = root / 'configurator.html'
+            styles_path = root / 'styles.css'
+            pricing_path = root / 'pricing.json'
+            configurator_path.write_text('<!doctype html><p>Updated</p>', encoding='utf-8')
+            styles_path.write_text('body { color: silver; }', encoding='utf-8')
+            pricing_path.write_text('{}', encoding='utf-8')
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp-partial-named-follow-up',
+                    'outputs': [
+                        {
+                            'type': 'text',
+                            'status': 'fulfilled',
+                            'artifact_ref': 'artifact:configurator-current',
+                        }
+                    ],
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(configurator_path),
+                            'name': 'configurator',
+                            'artifact_ref': 'artifact:configurator-current',
+                        }
+                    ],
+                    'response_frame': {
+                        'request': {
+                            'current_predecessor_context': {
+                                'kind': 'ollmo.current_predecessor_context',
+                                'status': 'authorized',
+                                'authorization': (
+                                    'canonical_same_conversation_predecessor'
+                                ),
+                                'promotion_mode': 'named_text_edit',
+                                'source_response_id': 'resp-predecessor',
+                                'matched_text_artifacts': [
+                                    {'path': str(configurator_path)},
+                                    {'path': str(styles_path)},
+                                ],
+                                'carried_public_dependencies': [
+                                    {
+                                        'type': 'text',
+                                        'kind': 'text',
+                                        'path': str(pricing_path),
+                                        'source_path': str(pricing_path),
+                                        'name': 'pricing',
+                                        'artifact_ref': 'artifact:old-pricing',
+                                        'source_response_id': 'resp-predecessor',
+                                        'origin': (
+                                            'canonical_predecessor_bundle_dependency'
+                                        ),
+                                        'carried_public_dependency': True,
+                                    }
+                                ],
+                            }
+                        }
+                    },
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-08-05T06:05:00Z',
+            )
+
+            self.assertEqual(
+                {item.get('artifact_ref') for item in payload['copied_artifacts']},
+                {'artifact:configurator-current'},
+            )
 
     def test_bundle_does_not_fallback_to_raw_artifacts_when_outputs_are_all_unusable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
