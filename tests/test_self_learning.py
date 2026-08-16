@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import ollmo_services.self_learning as self_learning_module
 from ollmo_g.payload import build_ghost_payload
 from ollmo_g.router import build_route_context
@@ -22,6 +24,7 @@ from ollmo_services.self_learning import (
     promote_policy_improvement_candidate,
     persist_eval_cases,
     persist_accepted_learning_policy_snapshot,
+    persist_self_learning_outputs,
     set_accepted_learning_policy_enabled,
 )
 from ollmo_services.self_learning_retention import (
@@ -3067,3 +3070,781 @@ def test_self_learning_cli_accepts_repeated_frame_ledgers(tmp_path: Path) -> Non
 
     assert summary['frame_count'] == 2
     assert summary['evaluated_response_count'] == 2
+
+
+def _historical_eval_case(
+    case_id: str,
+    *,
+    response_id: str | None = None,
+    case_kind: str = 'graph_rebase_proposal_rejected',
+    severity: str = 'medium',
+) -> dict:
+    resolved_response_id = response_id or f'resp-{case_id}'
+    return {
+        'kind': 'ollmo.self_learning_eval_case',
+        'case_version': 1,
+        'case_id': case_id,
+        'response_id': resolved_response_id,
+        'frame_status': 'completed',
+        'layer': 'graph_rebase',
+        'case_kind': case_kind,
+        'severity': severity,
+        'summary': f'Historical eval evidence for {case_id}.',
+        'evidence': f'historical.eval_case:{case_id}',
+        'target_area': 'graph_rebase_policy',
+        'target_surfaces': ['ollmo_services/graph_rebase.py'],
+        'suggested_action': 'Keep as reviewed offline evidence only.',
+        'metadata': {'historical_fixture': True},
+        'optimization_policy': 'proposal_only_reviewed_patch_required',
+    }
+
+
+def test_merge_existing_preserves_old_only_cases_beyond_new_case_limit(tmp_path: Path) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    existing_path = learning_dir / 'eval_cases.jsonl'
+    _write_jsonl(frames_path, [_problem_frame()])
+    historical_cases = [
+        _historical_eval_case('eval-historical-z'),
+        _historical_eval_case('eval-historical-a'),
+        _historical_eval_case('eval-historical-m'),
+    ]
+    historical_cases[0]['empty_fields_must_survive'] = {
+        'empty_text': '',
+        'empty_list': [],
+        'empty_mapping': {},
+        'null_value': None,
+    }
+    _write_jsonl(existing_path, historical_cases)
+
+    report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        existing_eval_case_ledger_path=existing_path,
+        merge_existing=True,
+        frame_limit=20,
+        max_cases=1,
+    )
+
+    merged_ids = {case['case_id'] for case in report['eval_cases']}
+    historical_ids = {case['case_id'] for case in historical_cases}
+    assert historical_ids <= merged_ids
+    assert report['previous_case_count'] == 3
+    assert report['new_case_count'] == 1
+    assert report['preserved_case_count'] == 3
+    assert report['replaced_case_count'] == 0
+    assert report['removed_case_count'] == 0
+    assert report['case_count'] == 4
+    assert next(
+        case for case in report['eval_cases'] if case['case_id'] == 'eval-historical-z'
+    ) == historical_cases[0]
+    assert report['merge_policy']['mode'] == 'merge_existing'
+    assert report['merge_policy']['max_cases_scope'] == 'newly_generated_cases_only'
+
+
+def test_merge_existing_prefers_fresh_case_for_duplicate_case_id(tmp_path: Path) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    existing_path = learning_dir / 'eval_cases.jsonl'
+    _write_jsonl(frames_path, [_problem_frame()])
+    fresh_report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        frame_limit=20,
+        max_cases=20,
+    )
+    fresh_case = fresh_report['eval_cases'][0]
+    stale_case = {
+        **fresh_case,
+        'summary': 'Stale historical content that must be replaced.',
+        'historical_only_marker': True,
+    }
+    _write_jsonl(existing_path, [stale_case])
+
+    merged_report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        existing_eval_case_ledger_path=existing_path,
+        merge_existing=True,
+        frame_limit=20,
+        max_cases=20,
+    )
+
+    matching_cases = [
+        case
+        for case in merged_report['eval_cases']
+        if case['case_id'] == fresh_case['case_id']
+    ]
+    assert matching_cases == [fresh_case]
+    assert 'historical_only_marker' not in matching_cases[0]
+    assert merged_report['previous_case_count'] == 1
+    assert merged_report['new_case_count'] == fresh_report['case_count']
+    assert merged_report['preserved_case_count'] == 0
+    assert merged_report['replaced_case_count'] == 1
+    assert merged_report['removed_case_count'] == 0
+
+
+def test_merge_existing_preserves_historical_graph_rebase_case_without_current_truth(
+    tmp_path: Path,
+) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    existing_path = learning_dir / 'eval_cases.jsonl'
+    frames_path.parent.mkdir(parents=True, exist_ok=True)
+    frames_path.write_text('', encoding='utf-8')
+    historical_case = _historical_eval_case(
+        'eval-historical-graph-rebase-successor',
+        response_id='resp-synthetic-frame-no-longer-present',
+        case_kind='graph_rebase_partial_successor_execution_solved',
+    )
+    _write_jsonl(existing_path, [historical_case])
+
+    report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        existing_eval_case_ledger_path=existing_path,
+        merge_existing=True,
+        frame_limit=1,
+        max_cases=1,
+    )
+
+    assert report['status'] == 'no_frames'
+    assert report['frame_count'] == 0
+    assert report['recent_evaluated_response_count'] == 0
+    assert report['evaluated_response_count'] == 0
+    assert report['new_case_count'] == 0
+    assert report['previous_case_count'] == 1
+    assert report['preserved_case_count'] == 1
+    assert report['case_count'] == 1
+    assert report['eval_cases'] == [historical_case]
+    assert report['graph_rebase_corpus']['status'] == 'not_configured'
+    assert report['counts_by_kind'] == {
+        'graph_rebase_partial_successor_execution_solved': 1,
+    }
+    assert report['improvement_candidate_count'] == 1
+    assert report['improvement_candidates'][0]['evidence_case_ids'] == [historical_case['case_id']]
+    assert report['shadow_hint_count'] == 1
+    assert 'historical' in report['merge_policy']['preserved_case_truth_role']
+
+
+def test_merge_existing_orders_union_canonically_by_case_id(tmp_path: Path) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    existing_path = learning_dir / 'eval_cases.jsonl'
+    _write_jsonl(frames_path, [_positive_frame()])
+    _write_jsonl(
+        existing_path,
+        [
+            _historical_eval_case('eval-z-last'),
+            _historical_eval_case('eval-a-first'),
+            _historical_eval_case('eval-m-middle'),
+        ],
+    )
+
+    first_report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        existing_eval_case_ledger_path=existing_path,
+        merge_existing=True,
+        frame_limit=20,
+        max_cases=20,
+    )
+    second_report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        existing_eval_case_ledger_path=existing_path,
+        merge_existing=True,
+        frame_limit=20,
+        max_cases=20,
+    )
+
+    first_ids = [case['case_id'] for case in first_report['eval_cases']]
+    second_ids = [case['case_id'] for case in second_report['eval_cases']]
+    assert first_ids == sorted(first_ids)
+    assert second_ids == first_ids
+    assert second_report['eval_cases'] == first_report['eval_cases']
+
+
+def test_self_learning_report_keeps_default_replacement_order_and_content(tmp_path: Path) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    existing_path = learning_dir / 'eval_cases.jsonl'
+    _write_jsonl(frames_path, [_problem_frame()])
+    expected_report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        frame_limit=20,
+        max_cases=2,
+    )
+    historical_case = _historical_eval_case('eval-must-not-survive-default-replacement')
+    _write_jsonl(existing_path, [historical_case])
+
+    replacement_report = build_self_learning_report(
+        response_frame_ledger_path=frames_path,
+        self_learning_dir=learning_dir,
+        existing_eval_case_ledger_path=existing_path,
+        frame_limit=20,
+        max_cases=2,
+    )
+
+    assert replacement_report['eval_cases'] == expected_report['eval_cases']
+    assert historical_case['case_id'] not in {
+        case['case_id'] for case in replacement_report['eval_cases']
+    }
+    assert replacement_report['merge_policy']['mode'] == 'replace_existing'
+
+
+@pytest.mark.parametrize(
+    'existing_payload',
+    [
+        '{not-json\n',
+        json.dumps(['not', 'an', 'eval', 'case']) + '\n',
+        json.dumps({'kind': 'ollmo.self_learning_eval_case', 'summary': 'missing case id'}) + '\n',
+        (
+            json.dumps(_historical_eval_case('eval-duplicate'))
+            + '\n'
+            + json.dumps(_historical_eval_case('eval-duplicate'))
+            + '\n'
+        ),
+    ],
+    ids=['malformed-json', 'non-object', 'missing-case-id', 'duplicate-case-id'],
+)
+def test_merge_existing_rejects_invalid_old_ledger_without_rewriting_it(
+    tmp_path: Path,
+    existing_payload: str,
+) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    existing_path = learning_dir / 'eval_cases.jsonl'
+    _write_jsonl(frames_path, [_positive_frame()])
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_path.write_text(existing_payload, encoding='utf-8')
+    original_bytes = existing_path.read_bytes()
+
+    with pytest.raises(ValueError):
+        build_self_learning_report(
+            response_frame_ledger_path=frames_path,
+            self_learning_dir=learning_dir,
+            existing_eval_case_ledger_path=existing_path,
+            merge_existing=True,
+            frame_limit=20,
+            max_cases=20,
+        )
+
+    assert existing_path.read_bytes() == original_bytes
+
+
+def test_self_learning_cli_merge_preview_reports_counts_without_writing(tmp_path: Path) -> None:
+    frames_path = tmp_path / 'state' / 'response_frames' / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    eval_path = learning_dir / 'eval_cases.jsonl'
+    report_path = learning_dir / 'report.json'
+    accepted_path = learning_dir / 'accepted_policy_snapshot.json'
+    _write_jsonl(frames_path, [_positive_frame()])
+    _write_jsonl(eval_path, [_historical_eval_case('eval-preview-historical')])
+    report_path.write_bytes(b'{"sentinel":"old-report"}\n')
+    accepted_path.write_bytes(b'{"enabled":true,"sentinel":"accepted-policy"}\n')
+    original_eval = eval_path.read_bytes()
+    original_report = report_path.read_bytes()
+    original_accepted = accepted_path.read_bytes()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            'scripts/build_self_learning_eval_cases.py',
+            '--frames',
+            str(frames_path),
+            '--output',
+            str(eval_path),
+            '--report',
+            str(report_path),
+            '--accepted-policy',
+            str(accepted_path),
+            '--graph-rebase-corpus-dir',
+            str(tmp_path / 'state' / 'missing-corpus'),
+            '--self-learning-dir',
+            str(learning_dir),
+            '--frame-limit',
+            '20',
+            '--max-cases',
+            '1',
+            '--merge-existing',
+            '--no-persist',
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    summary = json.loads(result.stdout)
+
+    assert summary['merge_preview'] is True
+    assert summary['previous_case_count'] == 1
+    assert summary['new_case_count'] == 1
+    assert summary['preserved_case_count'] == 1
+    assert summary['replaced_case_count'] == 0
+    assert summary['removed_case_count'] == 0
+    assert summary['case_count'] == 2
+    assert summary['merge_policy']['mode'] == 'merge_existing'
+    assert summary['merge_policy']['max_cases_scope'] == 'newly_generated_cases_only'
+    assert summary['eval_case_output'] is None
+    assert summary['report_output'] is None
+    assert eval_path.read_bytes() == original_eval
+    assert report_path.read_bytes() == original_report
+    assert accepted_path.read_bytes() == original_accepted
+
+
+def test_self_learning_cli_merge_persists_union_without_mutating_protected_state(
+    tmp_path: Path,
+) -> None:
+    frames_dir = tmp_path / 'state' / 'response_frames'
+    frames_path = frames_dir / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    eval_path = learning_dir / 'eval_cases.jsonl'
+    report_path = learning_dir / 'report.json'
+    accepted_path = learning_dir / 'accepted_policy_snapshot.json'
+    retained_path = learning_dir / 'retained_sidecars' / 'keep.json'
+    cas_path = frames_dir / 'snapshots' / 'content' / 'keep.json'
+    _write_jsonl(frames_path, [_positive_frame()])
+    _write_jsonl(eval_path, [_historical_eval_case('eval-persist-historical')])
+    accepted_path.write_bytes(b'{"enabled":true,"sentinel":"accepted-policy"}\n')
+    retained_path.parent.mkdir(parents=True, exist_ok=True)
+    retained_path.write_bytes(b'{"sentinel":"retained-sidecar"}\n')
+    cas_path.parent.mkdir(parents=True, exist_ok=True)
+    cas_path.write_bytes(b'{"sentinel":"response-cas"}\n')
+    original_frames = frames_path.read_bytes()
+    original_accepted = accepted_path.read_bytes()
+    original_retained = retained_path.read_bytes()
+    original_cas = cas_path.read_bytes()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            'scripts/build_self_learning_eval_cases.py',
+            '--frames',
+            str(frames_path),
+            '--output',
+            str(eval_path),
+            '--report',
+            str(report_path),
+            '--accepted-policy',
+            str(accepted_path),
+            '--graph-rebase-corpus-dir',
+            str(tmp_path / 'state' / 'missing-corpus'),
+            '--self-learning-dir',
+            str(learning_dir),
+            '--frame-limit',
+            '20',
+            '--max-cases',
+            '1',
+            '--merge-existing',
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    summary = json.loads(result.stdout)
+    rows = [json.loads(line) for line in eval_path.read_text(encoding='utf-8').splitlines()]
+    persisted_report = json.loads(report_path.read_text(encoding='utf-8'))
+
+    assert summary['merge_preview'] is False
+    assert summary['previous_case_count'] == 1
+    assert summary['new_case_count'] == 1
+    assert summary['preserved_case_count'] == 1
+    assert summary['replaced_case_count'] == 0
+    assert summary['removed_case_count'] == 0
+    assert [case['case_id'] for case in rows] == sorted(case['case_id'] for case in rows)
+    assert persisted_report['eval_cases'] == rows
+    assert persisted_report['case_count'] == len(rows) == 2
+    assert persisted_report['merge_policy']['mode'] == 'merge_existing'
+    assert frames_path.read_bytes() == original_frames
+    assert accepted_path.read_bytes() == original_accepted
+    assert retained_path.read_bytes() == original_retained
+    assert cas_path.read_bytes() == original_cas
+
+
+def test_persist_self_learning_outputs_preserves_complete_case_payloads(tmp_path: Path) -> None:
+    eval_path = tmp_path / 'state' / 'self_learning' / 'eval_cases.jsonl'
+    report_path = tmp_path / 'state' / 'self_learning' / 'report.json'
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path.write_text('{"case_id":"old"}\n', encoding='utf-8')
+    report_path.write_text('{"case_count":1}\n', encoding='utf-8')
+    eval_path.chmod(0o640)
+    report_path.chmod(0o600)
+    historical_case = {
+        **_historical_eval_case('eval-complete-payload'),
+        'empty_text': '',
+        'empty_list': [],
+        'empty_mapping': {},
+        'null_value': None,
+    }
+    report = {
+        'kind': 'ollmo.self_learning_report',
+        'case_count': 1,
+        'eval_cases': [historical_case],
+    }
+
+    written_eval, written_report = persist_self_learning_outputs(
+        [historical_case],
+        report,
+        eval_case_output_path=eval_path,
+        report_output_path=report_path,
+    )
+
+    eval_rows = [json.loads(line) for line in written_eval.read_text(encoding='utf-8').splitlines()]
+    persisted_report = json.loads(written_report.read_text(encoding='utf-8'))
+    assert eval_rows == [historical_case]
+    assert persisted_report['eval_cases'] == [historical_case]
+    assert int(written_eval.stat().st_mode) & 0o777 == 0o640
+    assert int(written_report.stat().st_mode) & 0o777 == 0o600
+
+
+def test_persist_self_learning_outputs_uses_normal_creation_mode_for_new_files(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / 'state' / 'self_learning'
+    output_dir.mkdir(parents=True)
+    mode_control = output_dir / 'ordinary-write.json'
+    mode_control.write_bytes(b'{}\n')
+    expected_mode = int(mode_control.stat().st_mode) & 0o777
+    eval_path = output_dir / 'eval_cases.jsonl'
+    report_path = output_dir / 'report.json'
+
+    persist_self_learning_outputs(
+        [_historical_eval_case('eval-new-file-mode')],
+        {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+        eval_case_output_path=eval_path,
+        report_output_path=report_path,
+    )
+
+    assert int(eval_path.stat().st_mode) & 0o777 == expected_mode
+    assert int(report_path.stat().st_mode) & 0o777 == expected_mode
+
+
+@pytest.mark.parametrize(
+    'protected_kind',
+    ['accepted-policy', 'response-frame', 'response-index', 'response-cas', 'retained-sidecar'],
+)
+def test_self_learning_cli_merge_rejects_protected_output_collisions(
+    tmp_path: Path,
+    protected_kind: str,
+) -> None:
+    frames_dir = tmp_path / 'state' / 'response_frames'
+    frames_path = frames_dir / 'responses.jsonl'
+    learning_dir = tmp_path / 'state' / 'self_learning'
+    eval_path = learning_dir / 'eval_cases.jsonl'
+    accepted_path = learning_dir / 'accepted_policy_snapshot.json'
+    response_index_path = frames_dir / 'current_index.json'
+    cas_path = frames_dir / 'snapshots' / 'content' / 'keep.json'
+    retained_path = learning_dir / 'retained_sidecars' / 'keep.json'
+    _write_jsonl(frames_path, [_positive_frame()])
+    _write_jsonl(eval_path, [_historical_eval_case('eval-protected-path')])
+    accepted_path.write_bytes(b'{"sentinel":"accepted"}\n')
+    response_index_path.write_bytes(b'{"sentinel":"response-index"}\n')
+    cas_path.parent.mkdir(parents=True, exist_ok=True)
+    cas_path.write_bytes(b'{"sentinel":"cas"}\n')
+    retained_path.parent.mkdir(parents=True, exist_ok=True)
+    retained_path.write_bytes(b'{"sentinel":"retained"}\n')
+    protected_paths = {
+        'accepted-policy': accepted_path,
+        'response-frame': frames_path,
+        'response-index': response_index_path,
+        'response-cas': cas_path,
+        'retained-sidecar': retained_path,
+    }
+    original_bytes = {path: path.read_bytes() for path in protected_paths.values()}
+    original_eval = eval_path.read_bytes()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            'scripts/build_self_learning_eval_cases.py',
+            '--frames',
+            str(frames_path),
+            '--output',
+            str(eval_path),
+            '--report',
+            str(protected_paths[protected_kind]),
+            '--accepted-policy',
+            str(accepted_path),
+            '--graph-rebase-corpus-dir',
+            str(tmp_path / 'state' / 'graph_rebase_shadow_corpus'),
+            '--self-learning-dir',
+            str(learning_dir),
+            '--merge-existing',
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert 'protected' in result.stderr
+    assert eval_path.read_bytes() == original_eval
+    for path, payload in original_bytes.items():
+        assert path.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    'protected_report_path',
+    [
+        Path('state/response_frames/responses.jsonl'),
+        Path('state/response_frames/current_index.json'),
+        Path('state/response_frames/snapshots/content_sha256/keep.json'),
+        Path('state/self_learning/retained_sidecars/keep.json'),
+        Path('state/self_learning/accepted_policy_snapshot.json'),
+    ],
+)
+def test_self_learning_service_persistence_rejects_default_protected_targets(
+    tmp_path: Path,
+    monkeypatch,
+    protected_report_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    protected_report_path.parent.mkdir(parents=True, exist_ok=True)
+    protected_report_path.write_bytes(b'{"sentinel":"protected-service-state"}\n')
+    original_payload = protected_report_path.read_bytes()
+
+    with pytest.raises(ValueError, match='protected state'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-service-protected-target')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=Path('state/self_learning/eval_cases.jsonl'),
+            report_output_path=protected_report_path,
+        )
+
+    assert protected_report_path.read_bytes() == original_payload
+    assert not Path('state/self_learning/eval_cases.jsonl').exists()
+
+
+def test_self_learning_service_protects_repository_state_outside_repository_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_repo_root = tmp_path / 'repository'
+    protected_report_path = fake_repo_root / 'state' / 'response_frames' / 'responses.jsonl'
+    protected_report_path.parent.mkdir(parents=True)
+    protected_report_path.write_bytes(b'{"sentinel":"repository-frame-ledger"}\n')
+    original_payload = protected_report_path.read_bytes()
+    outside_cwd = tmp_path / 'outside-cwd'
+    outside_cwd.mkdir()
+    from scripts import build_self_learning_eval_cases as self_learning_cli_module
+
+    monkeypatch.setattr(self_learning_cli_module, 'REPO_ROOT', fake_repo_root)
+    monkeypatch.setattr(self_learning_module, '_REPOSITORY_ROOT', fake_repo_root)
+    monkeypatch.chdir(outside_cwd)
+
+    with pytest.raises(ValueError, match='protected'):
+        self_learning_cli_module._validate_merge_output_paths(
+            output_path=outside_cwd / 'eval_cases.jsonl',
+            report_path=protected_report_path,
+            accepted_policy_path=outside_cwd / 'accepted_policy_snapshot.json',
+            self_learning_dir=outside_cwd / 'self_learning',
+            frame_paths=[outside_cwd / 'response_frames' / 'responses.jsonl'],
+            monitor_report_path=outside_cwd / 'monitor' / 'reports.jsonl',
+            graph_rebase_corpus_dir=outside_cwd / 'graph_rebase_shadow_corpus',
+        )
+
+    with pytest.raises(ValueError, match='protected state'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-outside-cwd-protection')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=outside_cwd / 'eval_cases.jsonl',
+            report_output_path=protected_report_path,
+        )
+
+    assert protected_report_path.read_bytes() == original_payload
+    assert not (outside_cwd / 'eval_cases.jsonl').exists()
+
+
+@pytest.mark.parametrize('link_kind', ['live-target', 'dangling-target', 'parent-component'])
+def test_self_learning_persistence_rejects_symlink_output_paths_without_mutation(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    output_dir = tmp_path / 'outputs'
+    output_dir.mkdir()
+    report_path = output_dir / 'report.json'
+    report_path.write_bytes(b'{"sentinel":"old-report"}\n')
+    original_report = report_path.read_bytes()
+
+    if link_kind == 'parent-component':
+        real_dir = tmp_path / 'real-output-dir'
+        real_dir.mkdir()
+        linked_dir = tmp_path / 'linked-output-dir'
+        linked_dir.symlink_to(real_dir, target_is_directory=True)
+        eval_path = linked_dir / 'eval_cases.jsonl'
+        protected_path = linked_dir
+    else:
+        eval_path = output_dir / 'eval_cases.jsonl'
+        target = output_dir / 'existing-ledger.jsonl'
+        if link_kind == 'live-target':
+            target.write_bytes(b'{"case_id":"symlink-referent"}\n')
+        eval_path.symlink_to(target.name)
+        protected_path = eval_path
+    original_link = protected_path.readlink()
+
+    with pytest.raises(ValueError, match='cannot contain symlinks'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-symlink-rejection')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=eval_path,
+            report_output_path=report_path,
+        )
+
+    assert protected_path.is_symlink()
+    assert protected_path.readlink() == original_link
+    assert report_path.read_bytes() == original_report
+
+
+def test_atomic_self_learning_pair_rolls_back_when_report_install_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    eval_path = tmp_path / 'state' / 'self_learning' / 'eval_cases.jsonl'
+    report_path = tmp_path / 'state' / 'self_learning' / 'report.json'
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path.write_bytes(b'{"case_id":"old-case"}\n')
+    report_path.write_bytes(b'{"case_count":1,"sentinel":"old-report"}\n')
+    original_eval = eval_path.read_bytes()
+    original_report = report_path.read_bytes()
+    real_replace = self_learning_module.os.replace
+    replace_count = 0
+
+    def fail_second_replace(source, target):
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise OSError('injected report install failure')
+        return real_replace(source, target)
+
+    monkeypatch.setattr(self_learning_module.os, 'replace', fail_second_replace)
+
+    with pytest.raises(OSError, match='injected report install failure'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-new-case')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=eval_path,
+            report_output_path=report_path,
+        )
+
+    assert replace_count == 3
+    assert eval_path.read_bytes() == original_eval
+    assert report_path.read_bytes() == original_report
+    assert json.loads(eval_path.read_text(encoding='utf-8'))['case_id'] == 'old-case'
+    assert json.loads(report_path.read_text(encoding='utf-8'))['sentinel'] == 'old-report'
+    assert list(eval_path.parent.glob('.*.tmp')) == []
+    assert list(eval_path.parent.glob('.*.rollback')) == []
+
+
+def test_atomic_self_learning_pair_staging_failure_leaves_prior_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    eval_path = tmp_path / 'state' / 'self_learning' / 'eval_cases.jsonl'
+    report_path = tmp_path / 'state' / 'self_learning' / 'report.json'
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path.write_bytes(b'{"case_id":"old-stage-case"}\n')
+    report_path.write_bytes(b'{"case_count":1,"sentinel":"old-stage-report"}\n')
+    original_eval = eval_path.read_bytes()
+    original_report = report_path.read_bytes()
+    real_stage = self_learning_module._stage_atomic_file_bytes
+    stage_count = 0
+
+    def fail_second_stage(target, payload):
+        nonlocal stage_count
+        stage_count += 1
+        if stage_count == 2:
+            raise OSError('injected report staging failure')
+        return real_stage(target, payload)
+
+    monkeypatch.setattr(self_learning_module, '_stage_atomic_file_bytes', fail_second_stage)
+
+    with pytest.raises(OSError, match='injected report staging failure'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-stage-new-case')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=eval_path,
+            report_output_path=report_path,
+        )
+
+    assert stage_count == 2
+    assert eval_path.read_bytes() == original_eval
+    assert report_path.read_bytes() == original_report
+    assert list(eval_path.parent.glob('.*.tmp')) == []
+    assert list(eval_path.parent.glob('.*.rollback')) == []
+
+
+def test_atomic_self_learning_pair_first_install_failure_leaves_prior_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    eval_path = tmp_path / 'state' / 'self_learning' / 'eval_cases.jsonl'
+    report_path = tmp_path / 'state' / 'self_learning' / 'report.json'
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path.write_bytes(b'{"case_id":"old-install-case"}\n')
+    report_path.write_bytes(b'{"case_count":1,"sentinel":"old-install-report"}\n')
+    original_eval = eval_path.read_bytes()
+    original_report = report_path.read_bytes()
+    replace_count = 0
+
+    def fail_first_replace(_source, _target):
+        nonlocal replace_count
+        replace_count += 1
+        raise OSError('injected eval install failure')
+
+    monkeypatch.setattr(self_learning_module.os, 'replace', fail_first_replace)
+
+    with pytest.raises(OSError, match='injected eval install failure'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-install-new-case')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=eval_path,
+            report_output_path=report_path,
+        )
+
+    assert replace_count == 1
+    assert eval_path.read_bytes() == original_eval
+    assert report_path.read_bytes() == original_report
+    assert list(eval_path.parent.glob('.*.tmp')) == []
+    assert list(eval_path.parent.glob('.*.rollback')) == []
+
+
+def test_atomic_self_learning_pair_retains_recovery_files_when_rollback_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    eval_path = tmp_path / 'state' / 'self_learning' / 'eval_cases.jsonl'
+    report_path = tmp_path / 'state' / 'self_learning' / 'report.json'
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_path.write_bytes(b'{"case_id":"old-recovery-case"}\n')
+    report_path.write_bytes(b'{"case_count":1,"sentinel":"old-recovery-report"}\n')
+    original_eval = eval_path.read_bytes()
+    real_replace = self_learning_module.os.replace
+    replace_count = 0
+
+    def fail_report_and_rollback(source, target):
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count in {2, 3}:
+            raise OSError(f'injected replace failure {replace_count}')
+        return real_replace(source, target)
+
+    monkeypatch.setattr(self_learning_module.os, 'replace', fail_report_and_rollback)
+
+    with pytest.raises(RuntimeError, match='recovery files retained at'):
+        persist_self_learning_outputs(
+            [_historical_eval_case('eval-recovery-new-case')],
+            {'kind': 'ollmo.self_learning_report', 'case_count': 1},
+            eval_case_output_path=eval_path,
+            report_output_path=report_path,
+        )
+
+    rollback_paths = list(eval_path.parent.glob('.*.rollback'))
+    staged_paths = list(eval_path.parent.glob('.*.tmp'))
+    assert replace_count == 3
+    assert rollback_paths
+    assert staged_paths
+    assert any(path.read_bytes() == original_eval for path in rollback_paths)

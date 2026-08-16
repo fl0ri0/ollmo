@@ -5736,6 +5736,504 @@ class ResponseFrameTests(unittest.TestCase):
         self.assertIn("pending_obligation_ids", working_payload["intent_contract_summary"])
         self.assertNotIn("prompt", working_payload.get("request", {}))
 
+    def test_graph_patch_lifecycle_graph_bodies_use_deduped_cas_before_generic_ref_budget(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frames_dir = Path(tmpdir)
+            response_id = "resp_graph_patch_lifecycle_graph_cas"
+            decision_contract = {
+                "kind": "ollmo.ghost_decision_contract",
+                "decision_contract_version": 11,
+                "status": "available",
+                "graph_repair_proposals": [
+                    {
+                        "proposal_id": f"proposal-{index}",
+                        "evidence": "bounded lifecycle decision evidence " * 180,
+                    }
+                    for index in range(8)
+                ],
+                "semantic_review_lenses": [
+                    {
+                        "semantic_role_id": f"reviewer-{index}",
+                        "focus_questions": [
+                            "Does the durable graph still recover exactly?" * 80,
+                        ],
+                    }
+                    for index in range(4)
+                ],
+            }
+            request_ir = {
+                "kind": "ollmo.request_ir",
+                "ir_version": 7,
+                "graph_mode": "multi_phase",
+                "decision_contract": decision_contract,
+                "output_obligations": [
+                    {
+                        "obligation_id": f"obligation-{index}",
+                        "output_type": "text",
+                        "evidence": "request obligation evidence " * 120,
+                    }
+                    for index in range(12)
+                ],
+                "workload_task_ids": [f"task-{index}" for index in range(12)],
+            }
+
+            def lifecycle_result(index: int) -> dict:
+                lifecycle = {
+                    "kind": "ollmo.graph_patch_lifecycle",
+                    "patch_id": f"patch-{index}",
+                    "proposal_id": f"proposal-lifecycle-{index}",
+                    "review_id": f"review-{index}",
+                    "status": "blocked" if index == 0 else "rejected",
+                    "blocked_reasons": ["review_authority_required"],
+                    "before_graph_digest": f"graph-before-{index}",
+                    "after_graph_digest": f"graph-after-{index}",
+                    "patch_digest": f"patch-digest-{index}",
+                    "idempotency_key": f"idempotency-{index}",
+                    "authority": "runtime_validation",
+                    "placeholder_lineage": {"placeholder_ids": [f"placeholder-{index}"]},
+                    "output_slot_lineage": {"slot_ids": [f"slot-{index}"]},
+                    "work_tree_lineage": {"task_ids": [f"task-{index}"]},
+                    "outcome": {"status": "blocked", "runtime_effect": "none"},
+                }
+                graph = {
+                    "kind": "ollmo.request_phase_graph",
+                    "graph_version": 9,
+                    "response_id": response_id,
+                    "frame_id": f"source-frame-{index}",
+                    "parent_graph_id": "graph-parent-1",
+                    "request_ir": request_ir,
+                    "decision_contract": decision_contract,
+                    "graph_patch_lifecycle": [lifecycle],
+                    "output_obligations": request_ir["output_obligations"],
+                    "phases": [{"phase_id": f"phase-{index}", "status": "blocked"}],
+                }
+                return {**lifecycle, "graph": graph}
+
+            lifecycle_results = [lifecycle_result(0), lifecycle_result(1)]
+            diagnostics = {
+                # Consume the generic recursive splitter's complete 64-ref
+                # budget before it reaches graph_patch_lifecycle_results.
+                **{
+                    f"noise_{index:02d}_graph": {
+                        "kind": "ollmo.synthetic_diagnostic_graph",
+                        "payload": "unrelated generic split candidate " * 1_500,
+                    }
+                    for index in range(70)
+                },
+                "graph_patch_lifecycle_results": lifecycle_results,
+            }
+            closure_review = {
+                "kind": "ollmo.graph_closure_review",
+                "status": "blocked",
+                "authority": "runtime_closure",
+            }
+            frame = {
+                "frame_version": 9,
+                "kind": "ollmo.response_frame",
+                "response_id": response_id,
+                "status": "repair_needed",
+                "request": {"prompt": "Keep graph repair truth durable."},
+                "runtime": {
+                    "developer_diagnostics": diagnostics,
+                    "graph_closure_review": closure_review,
+                },
+                "current_state": {
+                    "id": response_id,
+                    "status": "repair_needed",
+                    "lifecycle_state": "repair_needed",
+                },
+            }
+
+            target = persist_response_frame(frame, frames_dir=frames_dir)
+            ledger_frame = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+
+            def raw_snapshot(ref: dict[str, object]) -> object:
+                return json.loads((frames_dir / str(ref["path"])).read_text(encoding="utf-8"))
+
+            raw_runtime = raw_snapshot(ledger_frame["runtime_snapshot_ref"])
+            diagnostics_ref = ledger_frame["external_snapshots"]["items"][
+                "runtime.developer_diagnostics"
+            ]
+            self.assertEqual(
+                diagnostics_ref["sha256"],
+                raw_runtime["developer_diagnostics_snapshot_ref"]["sha256"],
+            )
+            raw_diagnostics = raw_snapshot(diagnostics_ref)
+            raw_results = raw_diagnostics["graph_patch_lifecycle_results"]
+            uncompacted_result_bytes = len(
+                json.dumps(
+                    lifecycle_results,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            compacted_result_bytes = len(
+                json.dumps(
+                    raw_results,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            raw_request_irs = [
+                raw_snapshot(result["graph"]["request_ir_snapshot_ref"])
+                for result in raw_results
+            ]
+            recovered = load_latest_response_state(response_id, frames_dir=frames_dir)
+
+        self.assertGreaterEqual(
+            diagnostics_ref["sidecar_manifest"]["child_ref_count"],
+            64,
+        )
+        self.assertEqual(len(raw_results), 2)
+        self.assertLess(compacted_result_bytes, uncompacted_result_bytes // 2)
+        request_refs = []
+        contract_refs = []
+        for index, raw_result in enumerate(raw_results):
+            self.assertEqual(
+                {key: value for key, value in raw_result.items() if key != "graph"},
+                {key: value for key, value in lifecycle_results[index].items() if key != "graph"},
+            )
+            raw_graph = raw_result["graph"]
+            self.assertNotIn("request_ir", raw_graph)
+            self.assertNotIn("decision_contract", raw_graph)
+            request_ref = raw_graph["request_ir_snapshot_ref"]
+            contract_ref = raw_graph["decision_contract_snapshot_ref"]
+            request_refs.append(request_ref)
+            contract_refs.append(contract_ref)
+            for ref, body_key in (
+                (request_ref, "request_ir"),
+                (contract_ref, "decision_contract"),
+            ):
+                self.assertEqual(ref["kind"], "ollmo.response_frame_snapshot_ref")
+                self.assertTrue(ref["content_addressed"])
+                self.assertEqual(
+                    ref["projection_role"],
+                    "graph_patch_lifecycle_graph_body_exact",
+                )
+                self.assertEqual(
+                    ref["truth_preservation"],
+                    "exact_content_addressed_sidecar",
+                )
+                audit = ref["audit_summary"]
+                self.assertEqual(
+                    audit["kind"],
+                    "ollmo.graph_patch_lifecycle_graph_body_audit_summary",
+                )
+                self.assertEqual(audit["body_key"], body_key)
+                self.assertEqual(audit["runtime_effect"], "none")
+                self.assertEqual(audit["authority"], "durability_projection_only")
+                self.assertEqual(
+                    audit["truth_preservation"],
+                    "exact_content_addressed_hydration",
+                )
+                self.assertEqual(len(audit["logical_sha256"]), 64)
+                self.assertGreater(audit["logical_size_bytes"], 0)
+                self.assertLess(
+                    len(
+                        json.dumps(
+                            audit,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ),
+                    1_024,
+                )
+
+            raw_request_ir = raw_request_irs[index]
+            self.assertNotIn("decision_contract", raw_request_ir)
+            nested_contract_ref = raw_request_ir["decision_contract_snapshot_ref"]
+            self.assertEqual(
+                nested_contract_ref["sha256"],
+                contract_ref["sha256"],
+            )
+            self.assertEqual(
+                nested_contract_ref["path"],
+                contract_ref["path"],
+            )
+            self.assertEqual(
+                nested_contract_ref["audit_summary"]["body_key"],
+                "decision_contract",
+            )
+
+        self.assertEqual(request_refs[0]["sha256"], request_refs[1]["sha256"])
+        self.assertEqual(request_refs[0]["path"], request_refs[1]["path"])
+        self.assertEqual(contract_refs[0]["sha256"], contract_refs[1]["sha256"])
+        self.assertEqual(contract_refs[0]["path"], contract_refs[1]["path"])
+        self.assertTrue(recovered["ok"])
+        recovered_runtime = recovered["response_payload"]["runtime"]
+        self.assertEqual(recovered_runtime["graph_closure_review"], closure_review)
+        recovered_results = recovered_runtime["developer_diagnostics"][
+            "graph_patch_lifecycle_results"
+        ]
+        self.assertEqual(len(recovered_results), len(lifecycle_results))
+        for index, result in enumerate(recovered_results):
+            self.assertEqual(result, lifecycle_results[index])
+            self.assertNotIn("request_ir_snapshot_ref", result["graph"])
+            self.assertNotIn("decision_contract_snapshot_ref", result["graph"])
+
+    def test_graph_patch_lifecycle_graph_body_sidecars_fail_closed_when_missing_or_corrupt(self):
+        for failure_mode in ("missing", "corrupt"):
+            with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory() as tmpdir:
+                frames_dir = Path(tmpdir)
+                response_id = f"resp_graph_patch_body_{failure_mode}"
+                decision_contract = {
+                    "kind": "ollmo.ghost_decision_contract",
+                    "decision_contract_version": 11,
+                    "evidence": "authoritative contract evidence " * 500,
+                }
+                request_ir = {
+                    "kind": "ollmo.request_ir",
+                    "ir_version": 7,
+                    "decision_contract": decision_contract,
+                    "output_obligations": [{"obligation_id": "obligation-1"}],
+                }
+                graph = {
+                    "kind": "ollmo.request_phase_graph",
+                    "request_ir": request_ir,
+                    "decision_contract": decision_contract,
+                }
+                target = persist_response_frame(
+                    {
+                        "frame_version": 9,
+                        "kind": "ollmo.response_frame",
+                        "response_id": response_id,
+                        "status": "repair_needed",
+                        "runtime": {
+                            "developer_diagnostics": {
+                                "graph_patch_lifecycle_results": [
+                                    {
+                                        "kind": "ollmo.graph_patch_lifecycle",
+                                        "status": "blocked",
+                                        "patch_id": "patch-1",
+                                        "proposal_id": "proposal-1",
+                                        "blocked_reasons": ["review_required"],
+                                        "graph": graph,
+                                    }
+                                ]
+                            },
+                            "graph_closure_review": {
+                                "status": "blocked",
+                                "authority": "runtime_closure",
+                            },
+                        },
+                        "current_state": {
+                            "id": response_id,
+                            "status": "repair_needed",
+                            "lifecycle_state": "repair_needed",
+                        },
+                    },
+                    frames_dir=frames_dir,
+                )
+                ledger_frame = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+                target_path = (
+                    "runtime.developer_diagnostics.graph_patch_lifecycle_results[0]"
+                    ".graph.request_ir"
+                )
+                request_ref = ledger_frame["external_snapshots"]["items"][target_path]
+                request_path = frames_dir / request_ref["path"]
+                if failure_mode == "missing":
+                    request_path.unlink()
+                else:
+                    request_path.write_bytes(b'{"corrupt":true}\n')
+
+                recovered = load_latest_response_state(response_id, frames_dir=frames_dir)
+                self.assertFalse(recovered["ok"])
+                self.assertEqual(recovered["status_code"], 409)
+                self.assertEqual(
+                    recovered["error"]["code"],
+                    "response_frame_snapshot_unavailable",
+                )
+                self.assertEqual(recovered["error"]["json_path"], target_path)
+                self.assertEqual(
+                    recovered["error"]["expected_sha256"],
+                    request_ref["sha256"],
+                )
+
+    def test_graph_patch_lifecycle_graph_bodies_keep_dual_runtime_roots_independent(self):
+        def runtime_payload(label: str) -> dict:
+            decision_contract = {
+                "kind": "ollmo.ghost_decision_contract",
+                "decision_contract_version": 11,
+                "label": label,
+                "evidence": f"{label} decision evidence " * 400,
+            }
+            request_ir = {
+                "kind": "ollmo.request_ir",
+                "ir_version": 7,
+                "label": label,
+                "decision_contract": decision_contract,
+                "output_obligations": [
+                    {
+                        "obligation_id": f"{label}-obligation",
+                        "evidence": f"{label} request evidence " * 400,
+                    }
+                ],
+            }
+            return {
+                "developer_diagnostics": {
+                    "graph_patch_lifecycle_results": [
+                        {
+                            "kind": "ollmo.graph_patch_lifecycle",
+                            "status": "blocked",
+                            "patch_id": f"{label}-patch",
+                            "proposal_id": f"{label}-proposal",
+                            "blocked_reasons": ["review_required"],
+                            "graph": {
+                                "kind": "ollmo.request_phase_graph",
+                                "label": label,
+                                "request_ir": request_ir,
+                                "decision_contract": decision_contract,
+                            },
+                        }
+                    ]
+                },
+                "graph_closure_review": {
+                    "kind": "ollmo.graph_closure_review",
+                    "status": "blocked",
+                    "label": label,
+                },
+            }
+
+        for case_name, primary_label, current_label in (
+            ("identical", "shared", "shared"),
+            ("divergent", "primary", "current"),
+        ):
+            with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as tmpdir:
+                frames_dir = Path(tmpdir)
+                response_id = f"resp_dual_runtime_{case_name}"
+                primary_runtime = runtime_payload(primary_label)
+                current_runtime = runtime_payload(current_label)
+                target = persist_response_frame(
+                    {
+                        "frame_version": 9,
+                        "kind": "ollmo.response_frame",
+                        "response_id": response_id,
+                        "status": "repair_needed",
+                        "runtime": primary_runtime,
+                        "current_state": {
+                            "id": response_id,
+                            "status": "repair_needed",
+                            "runtime": current_runtime,
+                        },
+                    },
+                    frames_dir=frames_dir,
+                )
+                ledger_frame = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+                manifest = ledger_frame["external_snapshots"]["items"]
+                primary_path = (
+                    "runtime.developer_diagnostics.graph_patch_lifecycle_results[0]"
+                    ".graph.request_ir"
+                )
+                current_path = (
+                    "current_state.runtime.developer_diagnostics"
+                    ".graph_patch_lifecycle_results[0].graph.request_ir"
+                )
+                primary_contract_path = primary_path.rsplit(".request_ir", 1)[0] + ".decision_contract"
+                current_contract_path = current_path.rsplit(".request_ir", 1)[0] + ".decision_contract"
+                restored_primary = response_frames_module._read_manifest_authorized_snapshot_payload(
+                    ledger_frame["runtime_snapshot_ref"],
+                    frames_dir=frames_dir,
+                    trusted_manifest=manifest,
+                    response_id=response_id,
+                    expected_json_path="runtime",
+                    content_json_path="runtime",
+                )
+                restored_current = response_frames_module._read_manifest_authorized_snapshot_payload(
+                    ledger_frame["current_state"]["runtime_snapshot_ref"],
+                    frames_dir=frames_dir,
+                    trusted_manifest=manifest,
+                    response_id=response_id,
+                    expected_json_path="current_state.runtime",
+                    content_json_path="current_state.runtime",
+                )
+
+            self.assertEqual(restored_primary, primary_runtime)
+            self.assertEqual(restored_current, current_runtime)
+            for path in (
+                primary_path,
+                current_path,
+                primary_contract_path,
+                current_contract_path,
+            ):
+                self.assertIn(path, manifest)
+            if case_name == "identical":
+                self.assertEqual(manifest[primary_path]["sha256"], manifest[current_path]["sha256"])
+                self.assertEqual(manifest[primary_path]["path"], manifest[current_path]["path"])
+                self.assertEqual(
+                    manifest[primary_contract_path]["sha256"],
+                    manifest[current_contract_path]["sha256"],
+                )
+            else:
+                self.assertNotEqual(manifest[primary_path]["sha256"], manifest[current_path]["sha256"])
+                self.assertNotEqual(
+                    manifest[primary_contract_path]["sha256"],
+                    manifest[current_contract_path]["sha256"],
+                )
+
+    def test_legacy_inline_graph_patch_lifecycle_graph_recovers_unchanged(self):
+        response_id = "resp_legacy_inline_graph_patch_lifecycle"
+        legacy_graph = {
+            "kind": "ollmo.request_phase_graph",
+            "request_ir": {
+                "kind": "ollmo.request_ir",
+                "ir_version": 6,
+                "decision_contract": {
+                    "kind": "ollmo.ghost_decision_contract",
+                    "decision_contract_version": 10,
+                },
+            },
+            "decision_contract": {
+                "kind": "ollmo.ghost_decision_contract",
+                "decision_contract_version": 10,
+            },
+        }
+        legacy_result = {
+            "kind": "ollmo.graph_patch_lifecycle",
+            "status": "blocked",
+            "patch_id": "legacy-patch",
+            "proposal_id": "legacy-proposal",
+            "blocked_reasons": ["legacy_review_required"],
+            "graph": legacy_graph,
+        }
+        legacy_frame = {
+            "frame_version": 8,
+            "kind": "ollmo.response_frame",
+            "response_id": response_id,
+            "frame_id": "legacy-frame-1",
+            "frame_sequence": 1,
+            "status": "repair_needed",
+            "runtime": {
+                "developer_diagnostics": {
+                    "graph_patch_lifecycle_results": [legacy_result],
+                }
+            },
+            "current_state": {
+                "id": response_id,
+                "status": "repair_needed",
+                "lifecycle_state": "repair_needed",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frames_dir = Path(tmpdir)
+            ledger = frames_dir / "responses.jsonl"
+            ledger.write_text(
+                json.dumps(legacy_frame, ensure_ascii=False, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            recovered = load_latest_response_state(response_id, frames_dir=frames_dir)
+
+        self.assertTrue(recovered["ok"])
+        self.assertEqual(
+            recovered["response_payload"]["runtime"]["developer_diagnostics"][
+                "graph_patch_lifecycle_results"
+            ][0],
+            legacy_result,
+        )
+
     def test_sidecar_snapshots_split_large_worthwhile_children_and_expand_for_replay(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             frames_dir = Path(tmpdir)

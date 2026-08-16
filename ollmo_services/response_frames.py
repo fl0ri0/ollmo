@@ -306,6 +306,16 @@ _SNAPSHOT_REF_VOLATILE_KEYS = {
     'source_frame_id',
     'source_response_id',
 }
+_GRAPH_PATCH_LIFECYCLE_RESULT_GRAPH_PATH_PREFIXES = (
+    'runtime.developer_diagnostics.graph_patch_lifecycle_results[',
+    'current_state.runtime.developer_diagnostics.graph_patch_lifecycle_results[',
+)
+_GRAPH_PATCH_LIFECYCLE_GRAPH_BODY_AUDIT_KIND = (
+    'ollmo.graph_patch_lifecycle_graph_body_audit_summary'
+)
+_GRAPH_PATCH_LIFECYCLE_GRAPH_BODY_PROJECTION_ROLE = (
+    'graph_patch_lifecycle_graph_body_exact'
+)
 _TIMESTAMP_NORMALIZED_SNAPSHOT_PATH_TOKENS = {
     'candidate_graph',
     'context_candidates',
@@ -1651,6 +1661,77 @@ def _json_size_bytes(value: Any) -> int:
     return len(json.dumps(_json_safe(value), ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
 
 
+def _graph_patch_lifecycle_graph_body_key(json_path: str) -> str | None:
+    """Return the exact heavy graph-body key owned by lifecycle diagnostics."""
+
+    normalized = str(json_path or '').strip()
+    if not normalized.startswith(_GRAPH_PATCH_LIFECYCLE_RESULT_GRAPH_PATH_PREFIXES):
+        return None
+    if '].graph.' not in normalized:
+        return None
+    if normalized.endswith('].graph.request_ir'):
+        return 'request_ir'
+    if normalized.endswith('].graph.decision_contract') or normalized.endswith(
+        '].graph.request_ir.decision_contract'
+    ):
+        return 'decision_contract'
+    return None
+
+
+def _graph_patch_lifecycle_graph_body_audit_summary(
+    value: Mapping[str, Any],
+    *,
+    body_key: str,
+) -> dict[str, Any]:
+    """Return bounded durability metadata without contributing authority."""
+
+    safe_value = _json_safe(value)
+    if not isinstance(safe_value, Mapping):
+        safe_value = {}
+    encoded = json.dumps(
+        safe_value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    body_kind = str(safe_value.get('kind') or '').strip()[:128]
+    schema_version = safe_value.get(
+        'ir_version' if body_key == 'request_ir' else 'decision_contract_version'
+    )
+    if schema_version in (None, ''):
+        schema_version = safe_value.get('version')
+    if isinstance(schema_version, str):
+        schema_version = schema_version[:64]
+    elif not isinstance(schema_version, (int, float, bool)):
+        schema_version = None
+    top_level_values = list(safe_value.values())
+    top_level_sequences = [item for item in top_level_values if isinstance(item, list)]
+    summary = {
+        'kind': _GRAPH_PATCH_LIFECYCLE_GRAPH_BODY_AUDIT_KIND,
+        'version': 1,
+        'projection_scope': (
+            'runtime.developer_diagnostics.graph_patch_lifecycle_results[*].graph'
+        ),
+        'body_key': body_key,
+        'body_kind': body_kind or None,
+        'body_schema_version': schema_version,
+        'top_level_field_count': len(safe_value),
+        'top_level_mapping_count': sum(
+            1 for item in top_level_values if isinstance(item, Mapping)
+        ),
+        'top_level_sequence_count': len(top_level_sequences),
+        'top_level_sequence_item_count': sum(
+            len(item) for item in top_level_sequences
+        ),
+        'logical_sha256': hashlib.sha256(encoded).hexdigest(),
+        'logical_size_bytes': len(encoded),
+        'runtime_effect': 'none',
+        'authority': 'durability_projection_only',
+        'truth_preservation': 'exact_content_addressed_hydration',
+    }
+    return _json_safe(summary)
+
+
 def _snapshot_path_allows_timestamp_normalization(json_path: str) -> bool:
     normalized = str(json_path or '').strip().lower()
     if normalized.endswith('.__volatile_timestamps__'):
@@ -2035,6 +2116,11 @@ def _sidecar_split_key_is_worthwhile(key: str, *, json_path: str = '') -> bool:
 
 def _sidecar_split_limit_for_key(key: str, *, json_path: str = '') -> int:
     normalized = str(key or '').strip().lower()
+    if (
+        normalized == 'decision_contract'
+        and _graph_patch_lifecycle_graph_body_key(json_path) == 'decision_contract'
+    ):
+        return 1
     if normalized in _ADVISORY_SIDECAR_SPLIT_KEYS or _sidecar_key_matches_advisory_context(normalized, json_path):
         return _ADVISORY_SIDECAR_SPLIT_LIMIT_BYTES
     return _SIDECAR_SPLIT_LIMIT_BYTES
@@ -2561,6 +2647,14 @@ def _write_snapshot_ref(
         }
     if normalization:
         ref['content_normalization'] = _json_safe(normalization)
+    graph_body_key = _graph_patch_lifecycle_graph_body_key(json_path)
+    if graph_body_key and isinstance(value, Mapping):
+        ref['projection_role'] = _GRAPH_PATCH_LIFECYCLE_GRAPH_BODY_PROJECTION_ROLE
+        ref['truth_preservation'] = 'exact_content_addressed_sidecar'
+        ref['audit_summary'] = _graph_patch_lifecycle_graph_body_audit_summary(
+            value,
+            body_key=graph_body_key,
+        )
     return ref
 
 
@@ -3621,10 +3715,62 @@ def _apply_snapshot_manifest_to_frame(
     return effective_manifest
 
 
-def _runtime_snapshot_payload(runtime: Mapping[str, Any], *, snapshot) -> dict[str, Any]:
+def _externalize_graph_patch_lifecycle_result_graph_bodies(
+    developer_diagnostics: dict[str, Any],
+    *,
+    base_json_path: str,
+    snapshot,
+) -> None:
+    """Externalize duplicated lifecycle graph bodies before generic splitting."""
+
+    raw_results = developer_diagnostics.get('graph_patch_lifecycle_results')
+    if not isinstance(raw_results, list):
+        return
+    compact_results: list[Any] = []
+    changed = False
+    for index, raw_result in enumerate(raw_results):
+        if not isinstance(raw_result, Mapping):
+            compact_results.append(raw_result)
+            continue
+        result = dict(raw_result)
+        graph = result.get('graph')
+        if not isinstance(graph, Mapping):
+            compact_results.append(result)
+            continue
+        compact_graph: dict[str, Any] = {}
+        graph_changed = False
+        for raw_key, value in graph.items():
+            key = str(raw_key)
+            if key in {'request_ir', 'decision_contract'} and isinstance(value, Mapping):
+                json_path = (
+                    f'{base_json_path}.graph_patch_lifecycle_results'
+                    f'[{index}].graph.{key}'
+                )
+                compact_graph[f'{key}_snapshot_ref'] = _json_safe(
+                    snapshot(value, json_path)
+                )
+                graph_changed = True
+                continue
+            compact_graph[key] = value
+        if graph_changed:
+            result['graph'] = compact_graph
+            changed = True
+        compact_results.append(result)
+    if changed:
+        developer_diagnostics['graph_patch_lifecycle_results'] = compact_results
+
+
+def _runtime_snapshot_payload(
+    runtime: Mapping[str, Any],
+    *,
+    base_json_path: str,
+    snapshot,
+) -> dict[str, Any]:
     payload = _json_safe(runtime)
     if not isinstance(payload, dict):
         return {}
+    runtime_json_path = str(base_json_path or '').strip().rstrip('.') or 'runtime'
+    developer_diagnostics_json_path = f'{runtime_json_path}.developer_diagnostics'
 
     developer_diagnostics = (
         payload.get('developer_diagnostics')
@@ -3632,9 +3778,14 @@ def _runtime_snapshot_payload(runtime: Mapping[str, Any], *, snapshot) -> dict[s
         else None
     )
     if developer_diagnostics:
+        _externalize_graph_patch_lifecycle_result_graph_bodies(
+            developer_diagnostics,
+            base_json_path=developer_diagnostics_json_path,
+            snapshot=snapshot,
+        )
         _externalize_large_children(
             developer_diagnostics,
-            base_json_path='runtime.developer_diagnostics',
+            base_json_path=developer_diagnostics_json_path,
             snapshot=snapshot,
             keys={
                 'closure_repair_graph_patch',
@@ -3651,7 +3802,7 @@ def _runtime_snapshot_payload(runtime: Mapping[str, Any], *, snapshot) -> dict[s
     if execution_planner:
         _externalize_large_children(
             execution_planner,
-            base_json_path='runtime.execution_planner',
+            base_json_path=f'{runtime_json_path}.execution_planner',
             snapshot=snapshot,
             keys={'deferred_branches', 'graph', 'phase_graph', 'request_phase_graph'},
         )
@@ -3664,7 +3815,7 @@ def _runtime_snapshot_payload(runtime: Mapping[str, Any], *, snapshot) -> dict[s
     if context_strategy:
         _externalize_large_children(
             context_strategy,
-            base_json_path='runtime.context_strategy',
+            base_json_path=f'{runtime_json_path}.context_strategy',
             snapshot=snapshot,
             keys={'context_candidates', 'context_gate_review'},
             min_size_bytes=1,
@@ -3672,7 +3823,7 @@ def _runtime_snapshot_payload(runtime: Mapping[str, Any], *, snapshot) -> dict[s
 
     _externalize_large_children(
         payload,
-        base_json_path='runtime',
+        base_json_path=runtime_json_path,
         snapshot=snapshot,
         keys={
             'context_strategy',
@@ -4776,7 +4927,14 @@ def compact_response_frame_for_ledger(
 
     runtime = frame.get('runtime') if isinstance(frame.get('runtime'), Mapping) else None
     if runtime:
-        frame['runtime_snapshot_ref'] = snapshot(_runtime_snapshot_payload(runtime, snapshot=snapshot), 'runtime')
+        frame['runtime_snapshot_ref'] = snapshot(
+            _runtime_snapshot_payload(
+                runtime,
+                base_json_path='runtime',
+                snapshot=snapshot,
+            ),
+            'runtime',
+        )
         compact_runtime = _compact_runtime_for_ledger(runtime, snapshot=snapshot)
         if compact_runtime:
             frame['runtime'] = compact_runtime
@@ -4788,7 +4946,11 @@ def compact_response_frame_for_ledger(
         current_runtime = current_state.get('runtime') if isinstance(current_state.get('runtime'), Mapping) else None
         if current_runtime:
             current_state['runtime_snapshot_ref'] = snapshot(
-                _runtime_snapshot_payload(current_runtime, snapshot=snapshot),
+                _runtime_snapshot_payload(
+                    current_runtime,
+                    base_json_path='current_state.runtime',
+                    snapshot=snapshot,
+                ),
                 'current_state.runtime',
             )
             current_state.pop('runtime', None)
@@ -6638,7 +6800,7 @@ def response_payload_from_frame(
             (
                 current_state.get('runtime_snapshot_ref'),
                 'current_state.runtime',
-                'runtime',
+                'current_state.runtime',
             ),
             (response_frame.get('runtime_snapshot_ref'), 'runtime', 'runtime'),
         ):

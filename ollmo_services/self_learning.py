@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import errno
+import fcntl
 import hashlib
 import json
-import datetime as dt
+import os
 import re
+import secrets
+import shutil
+import tempfile
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,6 +32,7 @@ DEFAULT_SELF_LEARNING_DIR = Path('state/self_learning')
 DEFAULT_EVAL_CASE_LEDGER = 'eval_cases.jsonl'
 DEFAULT_SELF_LEARNING_REPORT = 'report.json'
 DEFAULT_ACCEPTED_POLICY_SNAPSHOT = 'accepted_policy_snapshot.json'
+_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 GRAPH_REBASE_CORPUS_MANIFEST_KIND = 'ollmo.graph_rebase_shadow_corpus_manifest'
 GRAPH_REBASE_CORPUS_SCHEMA_VERSION = 1
 _GRAPH_REBASE_CORPUS_MAX_MANIFESTS = 256
@@ -60,6 +68,8 @@ ACCEPTED_LEARNING_AUTHORITY_LEVELS = {
     'enforced',
 }
 DEFAULT_ACCEPTED_LEARNING_AUTHORITY = 'soft_hint'
+REPLACE_EXISTING_EVAL_CASE_POLICY = 'replace_existing'
+MERGE_EXISTING_EVAL_CASE_POLICY = 'union_by_case_id_new_wins_preserve_existing'
 
 
 def _now_iso_utc() -> str:
@@ -156,6 +166,20 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _json_safe_preserving_empty(value: Any) -> Any:
+    """Convert values to JSON-safe shapes without changing stored case content."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_preserving_empty(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_preserving_empty(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def _digest(value: Any) -> str:
     text = json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]
@@ -234,6 +258,133 @@ def _read_jsonl(path: Path, *, limit: int) -> list[dict[str, Any]]:
     """Compatibility list wrapper for bounded JSONL consumers."""
 
     return list(_iter_jsonl(path, limit=limit))
+
+
+def load_eval_cases(
+    input_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Load a complete eval-case ledger without dropping historical rows.
+
+    Merge mode promises to preserve every existing case. Invalid or ambiguous
+    row identity therefore fails closed instead of being skipped like bounded
+    diagnostic JSONL inputs.
+    """
+
+    target = Path(input_path) if input_path else DEFAULT_SELF_LEARNING_DIR / DEFAULT_EVAL_CASE_LEDGER
+    if not target.exists():
+        return []
+
+    cases: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
+    try:
+        handle = target.open('r', encoding='utf-8')
+    except OSError as exc:
+        raise ValueError(f'could not read existing eval-case ledger {target}: {exc}') from exc
+
+    with handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f'existing eval-case ledger {target} has malformed JSON on line {line_number}'
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise ValueError(
+                    f'existing eval-case ledger {target} line {line_number} must be a JSON object'
+                )
+            case = dict(payload)
+            case_id = _clean_text(case.get('case_id'))
+            if not case_id:
+                raise ValueError(
+                    f'existing eval-case ledger {target} line {line_number} is missing case_id'
+                )
+            if case_id in seen_case_ids:
+                raise ValueError(
+                    f'existing eval-case ledger {target} contains duplicate case_id {case_id!r}'
+                )
+            seen_case_ids.add(case_id)
+            cases.append(case)
+    return cases
+
+
+def _eval_cases_by_case_id(
+    cases: Iterable[Mapping[str, Any]],
+    *,
+    source: str,
+) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for ordinal, case in enumerate(cases):
+        if not isinstance(case, Mapping):
+            raise ValueError(f'{source} eval case {ordinal} must be a mapping')
+        case_id = _clean_text(case.get('case_id'))
+        if not case_id:
+            raise ValueError(f'{source} eval case {ordinal} is missing case_id')
+        if case_id in indexed:
+            raise ValueError(f'{source} eval cases contain duplicate case_id {case_id!r}')
+        indexed[case_id] = dict(case)
+    return indexed
+
+
+def merge_eval_cases_by_case_id(
+    existing_cases: Iterable[Mapping[str, Any]],
+    new_cases: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Return a deterministic non-destructive union in which fresh cases win."""
+
+    previous_by_id = _eval_cases_by_case_id(existing_cases, source='existing')
+    new_by_id = _eval_cases_by_case_id(new_cases, source='new')
+    previous_ids = set(previous_by_id)
+    new_ids = set(new_by_id)
+    replaced_ids = previous_ids & new_ids
+    preserved_ids = previous_ids - new_ids
+
+    merged_by_id = dict(previous_by_id)
+    merged_by_id.update(new_by_id)
+    merged_cases = [merged_by_id[case_id] for case_id in sorted(merged_by_id)]
+    counts = {
+        'previous_case_count': len(previous_by_id),
+        'new_case_count': len(new_by_id),
+        'preserved_case_count': len(preserved_ids),
+        'replaced_case_count': len(replaced_ids),
+        'removed_case_count': 0,
+    }
+    return merged_cases, counts
+
+
+def _eval_case_merge_policy(*, merge_existing: bool) -> dict[str, Any]:
+    if merge_existing:
+        return {
+            'name': MERGE_EXISTING_EVAL_CASE_POLICY,
+            'mode': 'merge_existing',
+            'identity_key': 'case_id',
+            'conflict_resolution': 'new_case_wins',
+            'existing_case_disposition': 'preserve_old_only_cases',
+            'ordering': 'case_id_ascending',
+            'max_cases_scope': 'newly_generated_cases_only',
+            'preserved_case_truth_role': 'historical_eval_evidence_only_not_current_runtime_truth',
+            'optimization_policy': 'proposal_only_reviewed_patch_required',
+            'accepted_learning_authority': 'soft_hint_only',
+            'automatic_policy_promotion': False,
+            'automatic_policy_enablement': False,
+            'runtime_effect': 'none',
+        }
+    return {
+        'name': REPLACE_EXISTING_EVAL_CASE_POLICY,
+        'mode': 'replace_existing',
+        'identity_key': 'case_id',
+        'existing_case_disposition': 'not_read_replacement_behavior',
+        'ordering': 'fresh_extraction_order',
+        'max_cases_scope': 'newly_generated_cases',
+        'optimization_policy': 'proposal_only_reviewed_patch_required',
+        'accepted_learning_authority': 'soft_hint_only',
+        'automatic_policy_promotion': False,
+        'automatic_policy_enablement': False,
+        'runtime_effect': 'none',
+    }
 
 
 def _nested_mapping(payload: Mapping[str, Any], *path: str) -> dict[str, Any]:
@@ -4041,6 +4192,8 @@ def build_self_learning_report(
     monitor_report_path: Path | str | None = None,
     graph_rebase_corpus_dir: Path | str | None = None,
     self_learning_dir: Path | str | None = None,
+    existing_eval_case_ledger_path: Path | str | None = None,
+    merge_existing: bool = False,
     retention_manifest_path: Path | str | None = None,
     frame_limit: int = 200,
     max_cases: int = 80,
@@ -4066,6 +4219,11 @@ def build_self_learning_report(
     monitor_path = Path(monitor_report_path) if monitor_report_path else None
     corpus_dir = Path(graph_rebase_corpus_dir) if graph_rebase_corpus_dir else None
     learning_dir = Path(self_learning_dir) if self_learning_dir else DEFAULT_SELF_LEARNING_DIR
+    existing_eval_path = (
+        Path(existing_eval_case_ledger_path)
+        if existing_eval_case_ledger_path is not None
+        else learning_dir / DEFAULT_EVAL_CASE_LEDGER
+    )
     retention_path = Path(retention_manifest_path) if retention_manifest_path else learning_dir / DEFAULT_RETENTION_MANIFEST.name
     retention_manifest = collect_self_learning_retention_roots(
         self_learning_dir=learning_dir,
@@ -4209,11 +4367,11 @@ def build_self_learning_report(
         monitor_reports = _read_jsonl(monitor_path, limit=frame_limit)
         cases = enrich_eval_cases_from_monitor_reports(cases, monitor_reports)
     unique_case_count_before_cap = len(cases)
-    cases = cases[:case_limit]
+    new_cases = cases[:case_limit]
     corpus_selected_case_count = len(
         [
             case
-            for case in cases
+            for case in new_cases
             if isinstance(case.get('metadata'), Mapping)
             and isinstance(case['metadata'].get('graph_rebase_corpus'), Mapping)
         ]
@@ -4226,6 +4384,19 @@ def build_self_learning_report(
         0,
         corpus_unique_case_count - corpus_selected_case_count,
     )
+    merge_counts = {
+        'previous_case_count': 0,
+        'new_case_count': len(new_cases),
+        'preserved_case_count': 0,
+        'replaced_case_count': 0,
+        'removed_case_count': 0,
+    }
+    if merge_existing:
+        previous_cases = load_eval_cases(existing_eval_path)
+        cases, merge_counts = merge_eval_cases_by_case_id(previous_cases, new_cases)
+    else:
+        cases = new_cases
+    merge_policy = _eval_case_merge_policy(merge_existing=merge_existing)
     improvement_candidates = build_policy_improvement_candidates(cases)
     report: dict[str, Any] = {
         'kind': 'ollmo.self_learning_report',
@@ -4239,6 +4410,7 @@ def build_self_learning_report(
             'monitor_report_path': str(monitor_path) if monitor_path is not None else None,
             'graph_rebase_corpus_dir': str(corpus_dir) if corpus_dir is not None else None,
             'self_learning_dir': str(learning_dir),
+            'existing_eval_case_ledger_path': str(existing_eval_path) if merge_existing else None,
             'frame_limit': frame_limit,
             'frame_limit_scope': 'per_response_frame_ledger',
             'max_cases': max_cases,
@@ -4248,6 +4420,11 @@ def build_self_learning_report(
                 else 'first_ledger_wins_latest_frame_per_response_within_recent_windows'
             ),
             'monitor_evidence_policy': 'supporting_only_response_frames_remain_canonical' if monitor_path is not None else None,
+            'existing_eval_case_policy': (
+                'historical_eval_evidence_only_not_current_runtime_truth'
+                if merge_existing
+                else None
+            ),
         },
         'retention': retention_summary(retention_manifest, manifest_path=retention_path),
         'frame_count': frame_count,
@@ -4256,7 +4433,9 @@ def build_self_learning_report(
         'superseded_frame_count': superseded_frame_count,
         'case_count': len(cases),
         'unique_case_count_before_cap': unique_case_count_before_cap,
-        'case_truncated_count': max(0, unique_case_count_before_cap - len(cases)),
+        'case_truncated_count': max(0, unique_case_count_before_cap - len(new_cases)),
+        **merge_counts,
+        'merge_policy': merge_policy,
         'graph_rebase_corpus': corpus_coverage,
         'counts_by_layer': _count_by(cases, 'layer'),
         'counts_by_kind': _count_by(cases, 'case_kind'),
@@ -4275,7 +4454,314 @@ def build_self_learning_report(
         }
     if include_cases:
         report['eval_cases'] = cases
-    return _json_safe(report)
+    if not include_cases:
+        return _json_safe(report)
+    report_without_cases = dict(report)
+    report_without_cases.pop('eval_cases', None)
+    sanitized_report = _json_safe(report_without_cases)
+    sanitized_report['eval_cases'] = [
+        _json_safe_preserving_empty(case)
+        for case in cases
+    ]
+    return sanitized_report
+
+
+def _eval_cases_jsonl_bytes(cases: Iterable[Mapping[str, Any]]) -> bytes:
+    lines: list[str] = []
+    for ordinal, case in enumerate(cases):
+        if not isinstance(case, Mapping):
+            raise ValueError(f'eval case {ordinal} must be a mapping')
+        lines.append(
+            json.dumps(
+                _json_safe_preserving_empty(dict(case)),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + '\n'
+        )
+    return ''.join(lines).encode('utf-8')
+
+
+def _self_learning_report_json_bytes(report: Mapping[str, Any]) -> bytes:
+    if not isinstance(report, Mapping):
+        raise ValueError('self-learning report must be a mapping')
+    return (
+        json.dumps(
+            _json_safe_preserving_empty(dict(report)),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + '\n'
+    ).encode('utf-8')
+
+
+def _stage_atomic_file_bytes(target: Path, payload: bytes) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor: int | None = None
+    temp_path: Path | None = None
+    for _attempt in range(128):
+        candidate = target.parent / f'.{target.name}.{secrets.token_hex(8)}.tmp'
+        try:
+            file_descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o666,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        break
+    if file_descriptor is None or temp_path is None:
+        raise FileExistsError(f'could not allocate atomic staging file for {target}')
+    try:
+        try:
+            existing_mode = int(target.stat().st_mode) & 0o777
+        except OSError:
+            existing_mode = None
+        if existing_mode is not None:
+            os.fchmod(file_descriptor, existing_mode)
+        with os.fdopen(file_descriptor, 'wb') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temp_path
+    except BaseException:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _stage_atomic_rollback_copy(target: Path) -> Path | None:
+    if not target.exists():
+        return None
+    file_descriptor, backup_name = tempfile.mkstemp(
+        prefix=f'.{target.name}.',
+        suffix='.rollback',
+        dir=str(target.parent),
+    )
+    os.close(file_descriptor)
+    backup_path = Path(backup_name)
+    try:
+        backup_path.unlink()
+        try:
+            os.link(target, backup_path)
+        except OSError:
+            shutil.copy2(target, backup_path)
+            with backup_path.open('rb') as handle:
+                os.fsync(handle.fileno())
+        return backup_path
+    except BaseException:
+        try:
+            backup_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        unsupported_errors = {
+            errno.EINVAL,
+            getattr(errno, 'ENOTSUP', errno.EINVAL),
+            getattr(errno, 'EOPNOTSUPP', errno.EINVAL),
+        }
+        if exc.errno not in unsupported_errors:
+            raise
+        # Some filesystems do not support directory fsync. Same-directory
+        # replacement and file fsync still prevent a partial visible body.
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_default_self_learning_output_targets(targets: Iterable[Path]) -> None:
+    """Reject the repository's immutable runtime/learning input locations."""
+
+    protected_files = {
+        (DEFAULT_RESPONSE_FRAMES_DIR / DEFAULT_RESPONSE_FRAME_LEDGER).resolve(strict=False),
+        (DEFAULT_RESPONSE_FRAMES_DIR / 'current_index.json').resolve(strict=False),
+        (DEFAULT_SELF_LEARNING_DIR / DEFAULT_ACCEPTED_POLICY_SNAPSHOT).resolve(strict=False),
+        DEFAULT_RETENTION_MANIFEST.resolve(strict=False),
+        Path('state/ollmo_run_monitor/reports.jsonl').resolve(strict=False),
+        (
+            _REPOSITORY_ROOT / DEFAULT_RESPONSE_FRAMES_DIR / DEFAULT_RESPONSE_FRAME_LEDGER
+        ).resolve(strict=False),
+        (_REPOSITORY_ROOT / DEFAULT_RESPONSE_FRAMES_DIR / 'current_index.json').resolve(
+            strict=False
+        ),
+        (
+            _REPOSITORY_ROOT / DEFAULT_SELF_LEARNING_DIR / DEFAULT_ACCEPTED_POLICY_SNAPSHOT
+        ).resolve(strict=False),
+        (_REPOSITORY_ROOT / DEFAULT_RETENTION_MANIFEST).resolve(strict=False),
+        (_REPOSITORY_ROOT / 'state/ollmo_run_monitor/reports.jsonl').resolve(strict=False),
+    }
+    protected_roots = {
+        (DEFAULT_RESPONSE_FRAMES_DIR / 'snapshots').resolve(strict=False),
+        (DEFAULT_SELF_LEARNING_DIR / 'retained_sidecars').resolve(strict=False),
+        Path('state/graph_rebase_shadow_corpus').resolve(strict=False),
+        (_REPOSITORY_ROOT / DEFAULT_RESPONSE_FRAMES_DIR / 'snapshots').resolve(strict=False),
+        (_REPOSITORY_ROOT / DEFAULT_SELF_LEARNING_DIR / 'retained_sidecars').resolve(
+            strict=False
+        ),
+        (_REPOSITORY_ROOT / 'state/graph_rebase_shadow_corpus').resolve(strict=False),
+    }
+    for target in targets:
+        resolved_target = Path(target).resolve(strict=False)
+        if resolved_target in protected_files:
+            raise ValueError(
+                f'self-learning output target resolves to protected state: {resolved_target}'
+            )
+        for protected_root in protected_roots:
+            if _path_is_within(resolved_target, protected_root):
+                raise ValueError(
+                    'self-learning output target resolves inside protected state: '
+                    f'{resolved_target}'
+                )
+
+
+def _validate_output_path_has_no_symlinks(target: Path) -> None:
+    """Refuse link-mediated output paths that cannot be rollback-safe by pathname."""
+
+    absolute_target = Path(os.path.abspath(os.fspath(target)))
+    current = Path(absolute_target.anchor)
+    for component in absolute_target.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(
+                f'self-learning output paths cannot contain symlinks: {current}'
+            )
+
+
+@contextmanager
+def self_learning_output_update_lock(
+    output_paths: Iterable[Path | str],
+) -> Iterator[None]:
+    """Serialize cooperative builders that may read, merge, and replace outputs."""
+
+    absolute_targets = sorted(
+        {
+            Path(os.path.abspath(os.fspath(Path(path))))
+            for path in output_paths
+        },
+        key=str,
+    )
+    lock_descriptors: list[int] = []
+    try:
+        for target in absolute_targets:
+            _validate_output_path_has_no_symlinks(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = target.parent / f'.{target.name}.self_learning_update.lock'
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            lock_descriptors.append(descriptor)
+        yield
+    finally:
+        for descriptor in reversed(lock_descriptors):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _atomic_replace_file_set(payloads: Iterable[tuple[Path, bytes]]) -> None:
+    """Stage every payload, then install complete files with rollback on errors.
+
+    Each target is a whole-file atomic replacement. The targets do not form a
+    portable cross-file snapshot transaction, so callers must serialize writers;
+    a hard stop between replacements can leave complete files from adjacent runs.
+    """
+
+    entries = [(Path(target), payload) for target, payload in payloads]
+    identities = [str(target.resolve(strict=False)) for target, _payload in entries]
+    if len(identities) != len(set(identities)):
+        raise ValueError('atomic self-learning outputs must use distinct target paths')
+    for target, _payload in entries:
+        _validate_output_path_has_no_symlinks(target)
+
+    staged: list[tuple[Path, Path]] = []
+    backups: dict[Path, Path | None] = {}
+    installed: list[Path] = []
+    preserve_recovery_files = False
+    try:
+        for target, payload in entries:
+            staged.append((target, _stage_atomic_file_bytes(target, payload)))
+        for target, _temp_path in staged:
+            backups[target] = _stage_atomic_rollback_copy(target)
+
+        try:
+            for target, temp_path in staged:
+                _validate_output_path_has_no_symlinks(target)
+                os.replace(temp_path, target)
+                installed.append(target)
+                _fsync_directory(target.parent)
+        except BaseException as install_error:
+            rollback_errors: list[str] = []
+            for target in reversed(installed):
+                backup_path = backups.get(target)
+                try:
+                    if backup_path is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup_path, target)
+                    _fsync_directory(target.parent)
+                except BaseException as rollback_error:
+                    rollback_errors.append(f'{target}: {rollback_error}')
+            if rollback_errors:
+                preserve_recovery_files = True
+                recovery_paths = [
+                    str(path)
+                    for path in [
+                        *(temp_path for _target, temp_path in staged),
+                        *(backup for backup in backups.values() if backup is not None),
+                    ]
+                    if path.exists()
+                ]
+                raise RuntimeError(
+                    'self-learning output installation failed and rollback was incomplete: '
+                    + '; '.join(rollback_errors)
+                    + (
+                        '; recovery files retained at: ' + ', '.join(recovery_paths)
+                        if recovery_paths
+                        else ''
+                    )
+                ) from install_error
+            raise
+    finally:
+        if not preserve_recovery_files:
+            for _target, temp_path in staged:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+            for backup_path in backups.values():
+                if backup_path is None:
+                    continue
+                try:
+                    backup_path.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 def persist_eval_cases(
@@ -4283,14 +4769,11 @@ def persist_eval_cases(
     *,
     output_path: Path | str | None = None,
 ) -> Path:
-    """Persist eval cases as JSONL and return the written path."""
+    """Atomically persist eval cases as JSONL and return the written path."""
 
     target = Path(output_path) if output_path else DEFAULT_SELF_LEARNING_DIR / DEFAULT_EVAL_CASE_LEDGER
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open('w', encoding='utf-8') as handle:
-        for case in cases:
-            if isinstance(case, Mapping):
-                handle.write(json.dumps(_json_safe(case), ensure_ascii=False, sort_keys=True) + '\n')
+    _validate_default_self_learning_output_targets([target])
+    _atomic_replace_file_set([(target, _eval_cases_jsonl_bytes(cases))])
     return target
 
 
@@ -4299,12 +4782,40 @@ def persist_self_learning_report(
     *,
     output_path: Path | str | None = None,
 ) -> Path:
-    """Persist a self-learning report as JSON and return the written path."""
+    """Atomically persist a self-learning report and return the written path."""
 
     target = Path(output_path) if output_path else DEFAULT_SELF_LEARNING_DIR / DEFAULT_SELF_LEARNING_REPORT
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(_json_safe(report), ensure_ascii=False, indent=2, sort_keys=True) + '\n',
-        encoding='utf-8',
-    )
+    _validate_default_self_learning_output_targets([target])
+    _atomic_replace_file_set([(target, _self_learning_report_json_bytes(report))])
     return target
+
+
+def persist_self_learning_outputs(
+    cases: Iterable[Mapping[str, Any]],
+    report: Mapping[str, Any],
+    *,
+    eval_case_output_path: Path | str | None = None,
+    report_output_path: Path | str | None = None,
+) -> tuple[Path, Path]:
+    """Stage and atomically install the eval ledger and its derived report."""
+
+    eval_target = (
+        Path(eval_case_output_path)
+        if eval_case_output_path
+        else DEFAULT_SELF_LEARNING_DIR / DEFAULT_EVAL_CASE_LEDGER
+    )
+    report_target = (
+        Path(report_output_path)
+        if report_output_path
+        else DEFAULT_SELF_LEARNING_DIR / DEFAULT_SELF_LEARNING_REPORT
+    )
+    _validate_default_self_learning_output_targets([eval_target, report_target])
+    case_payload = _eval_cases_jsonl_bytes(cases)
+    report_payload = _self_learning_report_json_bytes(report)
+    _atomic_replace_file_set(
+        [
+            (eval_target, case_payload),
+            (report_target, report_payload),
+        ]
+    )
+    return eval_target, report_target
