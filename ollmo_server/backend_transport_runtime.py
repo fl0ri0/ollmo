@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ollmo_services.transports import (
+    apply_mlx_reasoning_controls,
     extract_generate_content,
     extract_generate_seed,
     extract_image_data_url_from_generate_output,
@@ -49,6 +50,7 @@ class BackendTransportRuntimeOwner:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         timeout_override_sec: Optional[int] = None,
     ) -> str:
         chat_timeout_seconds = self._hook('chat_timeout_seconds')
@@ -66,7 +68,7 @@ class BackendTransportRuntimeOwner:
                 'stream': False,
             }
             if backend == 'mlx':
-                openai_payload['enable_thinking'] = False
+                apply_mlx_reasoning_controls(openai_payload, reasoning_effort)
             if temperature is not None:
                 openai_payload['temperature'] = temperature
             if top_p is not None:
@@ -86,10 +88,7 @@ class BackendTransportRuntimeOwner:
             if not choices:
                 raise ValueError(f"{backend} response missing 'choices'.")
             openai_message = choices[0].get('message', {}) if isinstance(choices[0], dict) else {}
-            assistant_message = extract_text_payload(openai_message.get('content'))
-            if not assistant_message:
-                assistant_message = extract_text_payload(openai_message.get('reasoning'))
-            return assistant_message
+            return extract_text_payload(openai_message.get('content'))
 
         ollama_url = f'http://localhost:{target_port}/api/chat'
         ollama_payload = {'model': model_name, 'messages': prepared_messages, 'stream': False}
@@ -238,6 +237,7 @@ class BackendTransportRuntimeOwner:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         normalize_chat_messages_for_backend = self._hook('normalize_chat_messages_for_backend')
         requests_post = self._hook('requests_post')
@@ -248,7 +248,7 @@ class BackendTransportRuntimeOwner:
             'stream': True,
         }
         if backend == 'mlx':
-            payload['enable_thinking'] = False
+            apply_mlx_reasoning_controls(payload, reasoning_effort)
         if temperature is not None:
             payload['temperature'] = temperature
         if top_p is not None:
@@ -498,6 +498,7 @@ class BackendTransportRuntimeOwner:
         timeout_sec: int = 600,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> dict:
         requests_module = self._hook('requests_module')
         return mlx_chat_completions(
@@ -508,6 +509,7 @@ class BackendTransportRuntimeOwner:
             timeout_sec=timeout_sec,
             temperature=temperature,
             top_p=top_p,
+            reasoning_effort=reasoning_effort,
         )
 
     def openai_chat_completions(
@@ -519,6 +521,7 @@ class BackendTransportRuntimeOwner:
         timeout_sec: int = 600,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> dict:
         if backend == 'mlx':
             return self.mlx_chat_completions(
@@ -528,6 +531,7 @@ class BackendTransportRuntimeOwner:
                 timeout_sec=timeout_sec,
                 temperature=temperature,
                 top_p=top_p,
+                reasoning_effort=reasoning_effort,
             )
         content = self.execute_chat_backend_request(
             target_port=port,
@@ -538,6 +542,7 @@ class BackendTransportRuntimeOwner:
             request_model_override=model_name,
             temperature=temperature,
             top_p=top_p,
+            reasoning_effort=reasoning_effort,
             timeout_override_sec=timeout_sec,
         )
         return {'content': content, 'result': {'choices': [{'message': {'content': content}}]}}

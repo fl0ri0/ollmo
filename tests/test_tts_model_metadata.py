@@ -156,6 +156,60 @@ class TtsModelMetadataTests(unittest.TestCase):
         self.assertEqual(payload['inputs'], ['text', 'image'])
         self.assertEqual(payload['outputs'], ['text'])
 
+    def test_reads_declared_reasoning_efforts_from_chat_template(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / 'config.json').write_text(
+                json.dumps({'model_type': 'qwen3_5', 'image_token_id': 248056}),
+                encoding='utf-8',
+            )
+            (model_dir / 'chat_template.jinja').write_text(
+                "{% if reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+                "{{ raise_exception('Unsupported reasoning effort') }}{% endif %}",
+                encoding='utf-8',
+            )
+
+            payload = read_snapshot_model_metadata(
+                'mlx-community/Qwen3.8-27B-8bit',
+                str(model_dir),
+            )
+
+        self.assertEqual(payload['reasoning_efforts'], ['xhigh', 'medium', 'low'])
+
+    def test_reads_declared_reasoning_default_only_when_advertised(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / 'chat_template.jinja').write_text(
+                "{{ reasoning_effort | default('xhigh') }}\n"
+                "{% if reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+                "{{ raise_exception('Unsupported reasoning effort') }}{% endif %}",
+                encoding='utf-8',
+            )
+            payload = read_snapshot_model_metadata(
+                'mlx-community/Qwen3.8-27B-8bit',
+                str(model_dir),
+            )
+
+        self.assertEqual(payload['reasoning_efforts'], ['xhigh', 'medium', 'low'])
+        self.assertEqual(payload['reasoning_effort_default'], 'xhigh')
+
+    def test_ignores_undeclared_reasoning_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / 'chat_template.jinja').write_text(
+                "{{ reasoning_effort | default('xhigh') }}\n"
+                "{% if reasoning_effort not in ('medium', 'low') %}"
+                "{{ raise_exception('Unsupported reasoning effort') }}{% endif %}",
+                encoding='utf-8',
+            )
+            payload = read_snapshot_model_metadata(
+                'mlx-community/model',
+                str(model_dir),
+            )
+
+        self.assertEqual(payload['reasoning_efforts'], ['medium', 'low'])
+        self.assertNotIn('reasoning_effort_default', payload)
+
 
 if __name__ == '__main__':
     unittest.main()

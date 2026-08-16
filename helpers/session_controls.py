@@ -12,10 +12,23 @@ from helpers.model_capabilities import (
     CAPABILITY_VISION_ANALYSIS,
     normalize_capability,
 )
-from helpers.ocr_modes import get_ocr_mode_copy, get_ocr_mode_options
+from helpers.ocr_modes import get_ocr_model_family, get_ocr_mode_copy, get_ocr_mode_options
 
 _DEFAULT_STT_LANGUAGES = ['de', 'en', 'fr', 'es', 'it', 'pt', 'ja', 'ko', 'ru', 'zh']
 _DEFAULT_STT_TASKS = ['transcribe', 'translate']
+REASONING_EFFORT_OPTIONS = ('off', 'low', 'medium', 'xhigh')
+
+
+def normalize_reasoning_effort(value: Any) -> str | None:
+    """Normalize an optional reasoning-effort control or reject bad input."""
+
+    token = str(value or '').strip().lower()
+    if not token:
+        return None
+    if token not in REASONING_EFFORT_OPTIONS:
+        allowed = ', '.join(REASONING_EFFORT_OPTIONS)
+        raise ValueError(f"Invalid value for 'reasoning_effort': '{value}'. Allowed: {allowed}.")
+    return token
 
 
 def _field(
@@ -66,37 +79,116 @@ def _normalized_text_list(value: Any) -> list[str]:
     return items
 
 
+def _reasoning_effort_options(instance: dict[str, Any]) -> list[str]:
+    if str(instance.get('backend') or '').strip().lower() != 'mlx':
+        return []
+    metadata = instance.get('backend_metadata')
+    sources = [instance]
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+    declared: list[str] = []
+    for source in sources:
+        for key in ('reasoning_efforts', 'supported_reasoning_efforts', 'reasoning_effort_options'):
+            raw_values = source.get(key)
+            if not isinstance(raw_values, list):
+                continue
+            for raw_value in raw_values:
+                try:
+                    token = normalize_reasoning_effort(raw_value)
+                except ValueError:
+                    continue
+                if token and token not in declared:
+                    declared.append(token)
+    if not declared:
+        return []
+    return ['off', *[token for token in REASONING_EFFORT_OPTIONS if token != 'off' and token in declared]]
+
+
+def _reasoning_effort_default(instance: dict[str, Any], options: list[str]) -> str | None:
+    sources = [instance]
+    metadata = instance.get('backend_metadata')
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+    for source in sources:
+        try:
+            declared_default = normalize_reasoning_effort(source.get('reasoning_effort_default'))
+        except ValueError:
+            declared_default = None
+        if declared_default and declared_default in options:
+            return declared_default
+    non_off_options = [option for option in options if option != 'off']
+    if 'medium' in non_off_options:
+        return 'medium'
+    return non_off_options[0] if non_off_options else None
+
+
+def resolve_reasoning_effort_for_instance(value: Any, instance: dict | None) -> str | None:
+    """Resolve omitted effort from the selected instance's advertised schema."""
+    effort = normalize_reasoning_effort(value)
+    if effort == 'off':
+        return effort
+    target_instance = instance if isinstance(instance, dict) else {}
+    options = _reasoning_effort_options(target_instance)
+    if effort is None:
+        return _reasoning_effort_default(target_instance, options)
+    if effort not in options:
+        model_name = str(target_instance.get('model') or target_instance.get('modelName') or '').strip()
+        target = f" for '{model_name}'" if model_name else ' for the selected model'
+        raise ValueError(
+            f"'reasoning_effort' is not available{target}. Choose a value advertised in Session Controls."
+        )
+    return effort
+
+
+def validate_reasoning_effort_for_instance(value: Any, instance: dict | None) -> str | None:
+    """Validate a normalized effort against the selected instance's live schema."""
+    return resolve_reasoning_effort_for_instance(value, instance)
+
+
+def _add_reasoning_effort_field(fields: dict[str, Any], instance: dict[str, Any]) -> None:
+    options = _reasoning_effort_options(instance)
+    if not options:
+        return
+    fields['reasoning_effort'] = _field(
+        'select',
+        label='Reasoning Effort',
+        description='Optional. Choose how much internal reasoning the active model should use, or turn it off explicitly.',
+        options=options,
+        default_value=_reasoning_effort_default(instance, options),
+    )
+
+
 def build_session_controls(instance: dict | None) -> dict[str, Any]:
     if not isinstance(instance, dict):
         return _empty_schema()
 
     capability = normalize_capability(instance.get('capability'))
     model_name = str(instance.get('model') or instance.get('modelName') or '').strip()
-    model_name_lower = model_name.lower()
-
     if capability == CAPABILITY_CHAT:
+        fields = {
+            'chat_meta': _field(
+                'meta',
+                label='Chat Sampling',
+                description='These controls are applied only to the active chat model.',
+            ),
+            'temperature': _field(
+                'number',
+                label='Temperature',
+                description='Optional. Leave blank for the model default. Lower values stay tighter to the prompt; higher values allow more variation.',
+                default_value=0.7,
+            ),
+            'top_p': _field(
+                'number',
+                label='Top P',
+                description='Optional. Leave blank for the model default. Limit generation to the most likely probability mass before sampling.',
+                default_value=0.9,
+            ),
+        }
+        _add_reasoning_effort_field(fields, instance)
         return {
             'enabled': True,
             'hint': 'Sampling controls for this chat model.',
-            'fields': {
-                'chat_meta': _field(
-                    'meta',
-                    label='Chat Sampling',
-                    description='These controls are applied only to the active chat model.',
-                ),
-                'temperature': _field(
-                    'number',
-                    label='Temperature',
-                    description='Optional. Leave blank for the model default. Lower values stay tighter to the prompt; higher values allow more variation.',
-                    default_value=0.7,
-                ),
-                'top_p': _field(
-                    'number',
-                    label='Top P',
-                    description='Optional. Leave blank for the model default. Limit generation to the most likely probability mass before sampling.',
-                    default_value=0.9,
-                ),
-            },
+            'fields': fields,
         }
 
     if capability == CAPABILITY_SPEECH_TO_TEXT:
@@ -174,58 +266,54 @@ def build_session_controls(instance: dict | None) -> dict[str, Any]:
         }
 
     if capability == CAPABILITY_VISION_ANALYSIS:
-        ocr_copy = get_ocr_mode_copy(model_name)
-        description = ocr_copy['description']
-        hint = ocr_copy['hint']
-        label = ocr_copy['label']
-        if 'deepseek-ocr-2' in model_name_lower:
-            label = 'DeepSeek OCR 2 Mode'
-        elif 'deepseek-ocr' in model_name_lower:
-            description = 'These controls are used for PDF OCR requests with DeepSeek-OCR.'
-            hint = 'PDF OCR controls for this DeepSeek-OCR model.'
-            label = 'DeepSeek OCR Mode'
-        ocr_mode_options = get_ocr_mode_options(model_name)
-        fields = {
-            'ocr_meta': _field(
+        ocr_family = get_ocr_model_family(model_name)
+        fields: dict[str, Any] = {}
+        hint = 'Model-specific controls for this vision-analysis model.'
+        if ocr_family:
+            ocr_copy = get_ocr_mode_copy(model_name)
+            hint = ocr_copy['hint']
+            fields['ocr_meta'] = _field(
                 'meta',
-                label=label,
-                description=description,
-            ),
-        }
-        if ocr_mode_options:
-            fields['ocr_mode'] = _field(
-                'select',
-                label='Document Mode',
-                description=ocr_copy['mode_description'],
-                options=ocr_mode_options,
+                label=ocr_copy['label'],
+                description=ocr_copy['description'],
             )
-        fields.update(
-            {
-                'pdf_max_pages': _field('number'),
-                'pdf_dpi': _field(
-                    'number',
-                    label='PDF DPI',
-                    description='Render each PDF page at this resolution before OCR. Higher DPI may improve accuracy but costs time.',
-                    default_value=300,
-                ),
-                'pdf_page_timeout_sec': _field(
-                    'number',
-                    label='Page Timeout (s)',
-                    description='Maximum OCR time budget per rendered PDF page before Ollmo aborts that page.',
-                    default_value=180,
-                ),
-                'pdf_synthesize': _field(
-                    'boolean',
-                    label='Synthesize',
-                    description='Merge per-page OCR output into one final answer instead of returning page-by-page results.',
-                ),
-            }
-        )
-        fields['pdf_max_pages'] = _field(
-            'number',
-            label='Max Page Budget',
-            description='Optional override. Leave blank to process all PDF pages. Enter a number only when you want to cap how many pages Ollmo renders and OCRs for this request.',
-        )
+            ocr_mode_options = get_ocr_mode_options(model_name)
+            if ocr_mode_options:
+                fields['ocr_mode'] = _field(
+                    'select',
+                    label='Document Mode',
+                    description=ocr_copy['mode_description'],
+                    options=ocr_mode_options,
+                )
+            fields.update(
+                {
+                    'pdf_max_pages': _field(
+                        'number',
+                        label='Max Page Budget',
+                        description='Optional override. Leave blank to process all PDF pages. Enter a number only when you want to cap how many pages Ollmo renders and OCRs for this request.',
+                    ),
+                    'pdf_dpi': _field(
+                        'number',
+                        label='PDF DPI',
+                        description='Render each PDF page at this resolution before OCR. Higher DPI may improve accuracy but costs time.',
+                        default_value=300,
+                    ),
+                    'pdf_page_timeout_sec': _field(
+                        'number',
+                        label='Page Timeout (s)',
+                        description='Maximum OCR time budget per rendered PDF page before Ollmo aborts that page.',
+                        default_value=180,
+                    ),
+                    'pdf_synthesize': _field(
+                        'boolean',
+                        label='Synthesize',
+                        description='Merge per-page OCR output into one final answer instead of returning page-by-page results.',
+                    ),
+                }
+            )
+        _add_reasoning_effort_field(fields, instance)
+        if not fields:
+            return _empty_schema()
         return {
             'enabled': True,
             'hint': hint,

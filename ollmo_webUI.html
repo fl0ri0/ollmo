@@ -216,6 +216,13 @@
                                 <input id="setting-top-p" type="number" min="0" max="1" step="0.05" placeholder="default">
                             </div>
                         </div>
+                        <div class="setting-field" data-settings-mode="chat" data-setting-key="reasoning_effort" hidden>
+                            <span class="setting-label">Reasoning Effort</span>
+                            <span class="setting-meta">Uses the model's declared default on first use. Higher effort spends more tokens on internal reasoning.</span>
+                            <div class="setting-value">
+                                <select id="setting-reasoning-effort" aria-label="Reasoning effort"></select>
+                            </div>
+                        </div>
                         <div class="setting-field full-span" data-settings-mode="chat" data-setting-key="chat_meta">
                             <span class="setting-label">Chat Sampling</span>
                             <span class="setting-meta">Only this chat.</span>
@@ -612,6 +619,8 @@
         const settingsDefaults = {
             temperature: null,
             topP: null,
+            reasoningEffort: 'off',
+            reasoningEffortExplicit: false,
             sttLanguage: '',
             sttTask: 'transcribe',
             imageAspectRatio: 'auto',
@@ -781,6 +790,7 @@
         const SESSION_CONTROL_BINDINGS = {
             temperature: { stateKey: 'temperature', requestKey: 'temperature' },
             top_p: { stateKey: 'topP', requestKey: 'top_p' },
+            reasoning_effort: { stateKey: 'reasoningEffort', requestKey: 'reasoning_effort' },
             stt_language: { stateKey: 'sttLanguage', requestKey: 'language' },
             stt_task: { stateKey: 'sttTask', requestKey: 'task' },
             image_aspect_ratio: { stateKey: 'imageAspectRatio', requestKey: null },
@@ -1497,6 +1507,7 @@ function summarizeStopDetails(details) {
             settingsPanel: document.getElementById('settings-panel'),
             settingTemperature: document.getElementById('setting-temperature'),
             settingTopP: document.getElementById('setting-top-p'),
+            settingReasoningEffort: document.getElementById('setting-reasoning-effort'),
             settingSttLanguage: document.getElementById('setting-stt-language'),
             settingSttTask: document.getElementById('setting-stt-task'),
             settingImageAspectRatio: document.getElementById('setting-image-aspect-ratio'),

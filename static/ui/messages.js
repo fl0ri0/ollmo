@@ -646,6 +646,48 @@ function artifactIsTextLike(artifact = {}, savedArtifactPath = '') {
     return /\.(?:html?|css|js|mjs|json|md|markdown|txt|xml|csv|tsv|yaml|yml|svg)$/.test(path);
 }
 
+function artifactIsHtmlLike(artifact = {}, savedArtifactPath = '') {
+    const mimeType = String(artifact.mime_type || artifact.mimeType || '').trim().toLowerCase();
+    if (mimeType.includes('html')) return true;
+    const path = String(savedArtifactPath || artifact.path || artifact.source_path || '').trim().toLowerCase();
+    return /\.html?$/.test(path);
+}
+
+function resolveArtifactHtmlPreviewPath(artifact = {}, message = {}, savedArtifactPath = '') {
+    const targetPath = String(savedArtifactPath || artifact.path || artifact.source_path || '').trim();
+    if (!targetPath) return '';
+    const artifactRef = String(artifact.artifact_ref || artifact.ref || '').trim();
+    const bundles = getMessageArtifactBundles(message).slice().reverse();
+    for (const bundle of bundles) {
+        const copiedArtifacts = Array.isArray(bundle.copied_artifacts)
+            ? bundle.copied_artifacts
+            : (Array.isArray(bundle.copiedArtifacts) ? bundle.copiedArtifacts : []);
+        const copied = copiedArtifacts.find((item) => {
+            const sourcePath = String(item?.source_path || item?.sourcePath || '').trim();
+            return sourcePath === targetPath;
+        });
+        const bundledPath = String(copied?.path || '').trim();
+        if (bundledPath) return bundledPath;
+    }
+    if (artifactRef) {
+        for (const bundle of bundles) {
+            const copiedArtifacts = Array.isArray(bundle.copied_artifacts)
+                ? bundle.copied_artifacts
+                : (Array.isArray(bundle.copiedArtifacts) ? bundle.copiedArtifacts : []);
+            const copied = copiedArtifacts.find((item) => {
+                const copiedRef = String(item?.artifact_ref || item?.artifactRef || item?.ref || '').trim();
+                return copiedRef === artifactRef;
+            });
+            const bundledPath = String(copied?.path || '').trim();
+            if (bundledPath) return bundledPath;
+        }
+    }
+    if (/[\\/]artifacts[\\/]bundles[\\/]/i.test(targetPath)) {
+        return targetPath;
+    }
+    return '';
+}
+
 async function copySavedArtifactContent(savedArtifactPath = '', triggerButton = null) {
     const targetPath = String(savedArtifactPath || '').trim();
     if (!targetPath) {
@@ -1214,7 +1256,19 @@ function appendRenderableArtifactToBubble(
             const viewArtifactButton = createChatMessageActionButton(
                 '<i class="fas fa-up-right-from-square"></i> View',
                 () => {
-                    window.open(buildSavedArtifactViewUrl(savedArtifactPath), '_blank', 'noopener,noreferrer');
+                    const isHtmlArtifact = artifactIsHtmlLike(artifact, savedArtifactPath);
+                    const htmlPreviewPath = isHtmlArtifact
+                        ? resolveArtifactHtmlPreviewPath(artifact, message, savedArtifactPath)
+                        : '';
+                    const responseId = String(message.responseId || message.response_id || '').trim();
+                    const canUseInteractivePreview = isHtmlArtifact && (htmlPreviewPath || responseId);
+                    const targetUrl = canUseInteractivePreview
+                        ? buildSavedArtifactPreviewUrl(
+                            htmlPreviewPath || savedArtifactPath,
+                            htmlPreviewPath ? '' : responseId
+                        )
+                        : buildSavedArtifactViewUrl(savedArtifactPath);
+                    window.open(targetUrl, '_blank', 'noopener,noreferrer');
                 }
             );
             appendArtifactAction(viewArtifactButton);
@@ -2454,6 +2508,14 @@ function buildSavedArtifactViewUrl(savedPath = '') {
     return buildSavedArtifactUrl(savedPath, 'view_saved_artifact');
 }
 
+function buildSavedArtifactPreviewUrl(savedPath = '', responseId = '') {
+    const previewUrl = buildSavedArtifactUrl(savedPath, 'preview_saved_artifact');
+    const normalizedResponseId = String(responseId || '').trim();
+    if (!previewUrl || !normalizedResponseId) return previewUrl;
+    const separator = previewUrl.includes('?') ? '&' : '?';
+    return `${previewUrl}${separator}response_id=${encodeURIComponent(normalizedResponseId)}`;
+}
+
 function buildSavedArtifactUrl(savedPath = '', endpoint = 'view_saved_artifact') {
     const targetPath = String(savedPath || '').trim();
     if (!targetPath) return '';
@@ -2539,30 +2601,16 @@ async function openSavedArtifactLocation(savedPath, triggerButton = null) {
     }
 }
 
-async function openSavedArtifactEntry(savedPath, triggerButton = null) {
+function openSavedArtifactEntry(savedPath, triggerButton = null) {
     const targetPath = String(savedPath || '').trim();
     if (!targetPath) {
         updateGlobalModelStatus('Bundle entry path unavailable for local open.');
         return;
     }
-    if (triggerButton) {
-        triggerButton.disabled = true;
-    }
-    try {
-        await axios.post(`${state.flaskServerUrl}/api/open_saved_artifact`, {
-            path: targetPath,
-            open_file: true,
-        });
-        updateGlobalModelStatus('Opened bundle entry.');
-        setTimeout(() => updateGlobalModelStatus(''), 1800);
-    } catch (error) {
-        const message = error.response?.data?.error || error.message || 'Unknown error';
-        updateGlobalModelStatus(`Could not open bundle entry: ${message}`);
-    } finally {
-        if (triggerButton) {
-            triggerButton.disabled = false;
-        }
-    }
+    const previewUrl = buildSavedArtifactPreviewUrl(targetPath);
+    window.open(previewUrl, '_blank', 'noopener,noreferrer');
+    updateGlobalModelStatus('Opened bundle preview.');
+    setTimeout(() => updateGlobalModelStatus(''), 1800);
 }
 
 function removeDeletedArtifactFromConversation(conversationId, savedPath, artifactType = 'artifact') {

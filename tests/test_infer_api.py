@@ -1032,6 +1032,7 @@ class InferApiTests(unittest.TestCase):
             "request_model": "/tmp/qwen-vl",
             "backend": "mlx",
             "capability": "vision_analysis",
+            "reasoning_efforts": ["low", "medium", "xhigh"],
         }
         mock_mlx_chat.return_value = {"content": "A dark biomechanical structure."}
         mock_activity.return_value = ({}, {"readiness": "ready"})
@@ -1042,6 +1043,7 @@ class InferApiTests(unittest.TestCase):
             data={
                 "instance_id": "vlm-1",
                 "prompt": "Describe this image",
+                "reasoningEffort": "xhigh",
                 "file": (io.BytesIO(b"fakepng"), "sample.png"),
             },
             content_type="multipart/form-data",
@@ -1060,8 +1062,55 @@ class InferApiTests(unittest.TestCase):
         self.assertEqual(called_args[0], 11520)
         self.assertEqual(called_args[1], "/tmp/qwen-vl")
         self.assertTrue(isinstance(called_args[2], list))
+        self.assertEqual(mock_mlx_chat.call_args.kwargs["reasoning_effort"], "xhigh")
         mock_activity.assert_called_once()
         mock_success.assert_called_once()
+
+    @patch("ollmo_webserver._lookup_instance")
+    def test_infer_rejects_invalid_reasoning_effort(self, mock_lookup):
+        mock_lookup.return_value = {
+            "instance_id": "vlm-1",
+            "port": 11520,
+            "model": "mlx-community/Qwen3.8-27B-8bit",
+            "request_model": "/tmp/qwen38",
+            "backend": "mlx",
+            "capability": "vision_analysis",
+        }
+
+        response = self.client.post(
+            "/api/infer",
+            json={
+                "instance_id": "vlm-1",
+                "prompt": "Describe this image",
+                "reasoning_effort": "extreme",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort", response.get_json()["error"])
+
+    @patch("ollmo_webserver._lookup_instance")
+    def test_infer_rejects_reasoning_effort_not_advertised_by_model(self, mock_lookup):
+        mock_lookup.return_value = {
+            "instance_id": "vlm-1",
+            "port": 11520,
+            "model": "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+            "request_model": "/tmp/qwen-vl",
+            "backend": "mlx",
+            "capability": "vision_analysis",
+        }
+
+        response = self.client.post(
+            "/api/infer",
+            json={
+                "instance_id": "vlm-1",
+                "prompt": "Describe this image",
+                "reasoning_effort": "low",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not available", response.get_json()["error"])
 
     @patch("ollmo_webserver._lookup_instance")
     def test_speech_to_text_rejects_non_audio_upload(self, mock_lookup):

@@ -2350,6 +2350,7 @@ class InferContext:
     image_seed: Optional[int] = None
     text_artifact_requests: list[dict[str, str]] = field(default_factory=list)
     prompt_is_semantic_materializer_payload: bool = False
+    reasoning_effort: Optional[str] = None
 
 
 @dataclass
@@ -2425,6 +2426,7 @@ def _run_backend_chat_completion(
             ctx.model_name,
             messages,
             timeout_sec=timeout_sec,
+            reasoning_effort=ctx.reasoning_effort,
         )
     return ops['openai_chat_completions'](
         ctx.port,
@@ -3947,6 +3949,7 @@ def _run_pdf_vision_analysis(
                     )
                 ],
                 timeout_sec=ctx.pdf_page_timeout_sec,
+                reasoning_effort=ctx.reasoning_effort,
             )
             content = str(mlx_out.get('content') or '').strip()
             if content:

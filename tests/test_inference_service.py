@@ -3147,17 +3147,22 @@ class InferenceServiceTests(unittest.TestCase):
             pdf_page_timeout_sec=240,
             pdf_max_image_side=2400,
             pdf_synthesize=False,
+            reasoning_effort='medium',
         )
         artifacts = InferArtifacts(image_b64='ZmFrZQ==', file_kind='image')
+
+        def mlx_chat_completions(_port, _model_name, _messages, **kwargs):
+            self.assertEqual(kwargs['reasoning_effort'], 'medium')
+            return {
+                'content': 'An alien biomechanical tower.',
+                'result': {'choices': []},
+            }
 
         payload, status = dispatch_infer_request(
             ctx,
             artifacts,
             {
-                'mlx_chat_completions': lambda *_args, **_kwargs: {
-                    'content': 'An alien biomechanical tower.',
-                    'result': {'choices': []},
-                },
+                'mlx_chat_completions': mlx_chat_completions,
             },
         )
 

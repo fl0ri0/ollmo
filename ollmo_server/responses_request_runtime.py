@@ -14,7 +14,12 @@ from typing import Any, Optional
 from flask import Response, jsonify, request, stream_with_context
 
 from helpers.model_capabilities import CAPABILITY_TEXT_TO_SPEECH
+from helpers.session_controls import (
+    normalize_reasoning_effort,
+    validate_reasoning_effort_for_instance,
+)
 from ollmo_g.request_phase_graph import build_request_phase_graph
+from ollmo_g.execution_planner import resolve_internal_reasoning_effort
 from ollmo_server.repair_gate_runtime import classify_repair_execution_policy
 from ollmo_server.response_semantics_runtime import (
     attach_phase_output_acceptance,
@@ -1669,6 +1674,16 @@ class ResponsesRequestRuntimeOwner:
         )
         prepared_messages = apply_context_strategy(messages, context_strategy)
         try:
+            translator_reasoning_effort = resolve_internal_reasoning_effort(
+                chat_instance,
+                request_payload.get('reasoning_effort')
+                if request_payload.get('reasoning_effort') not in (None, '')
+                else (
+                    request_payload.get('reasoningEffort')
+                    if request_payload.get('reasoningEffort') not in (None, '')
+                    else None
+                ),
+            )
             translated_output = execute_chat_backend_request(
                 target_port=target_port,
                 model_name=str(chat_instance.get('model') or '').strip(),
@@ -1679,6 +1694,7 @@ class ResponsesRequestRuntimeOwner:
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=translator_max_tokens,
+                reasoning_effort=translator_reasoning_effort,
             )
         except Exception as exc:  # noqa: BLE001
             return transcript, {
@@ -6930,7 +6946,7 @@ class ResponsesRequestRuntimeOwner:
                 upload_override=upload,
             )
 
-        normalized_payload = data if isinstance(data, dict) else dict(data)
+        normalized_payload = dict(data) if isinstance(data, dict) else dict(data)
         batch_items = extract_responses_batch_items(normalized_payload)
         batch_prompts = [str(item.get('prompt') or '').strip() for item in batch_items if str(item.get('prompt') or '').strip()]
         if batch_prompts and capability != self.capability_image_generation:
@@ -6942,6 +6958,11 @@ class ResponsesRequestRuntimeOwner:
         temperature = None
         top_p = None
         max_tokens = None
+        reasoning_effort = None
+        reasoning_effort_explicit = bool(
+            data.get('reasoning_effort') not in (None, '')
+            or data.get('reasoningEffort') not in (None, '')
+        )
         try:
             if data.get('temperature') not in (None, ''):
                 temperature = parse_float_with_bounds(data.get('temperature'), default=0.7, minimum=0.0, maximum=2.0)
@@ -6954,8 +6975,35 @@ class ResponsesRequestRuntimeOwner:
                     minimum=1,
                     maximum=1_000_000,
                 )
+            reasoning_effort = normalize_reasoning_effort(
+                data.get('reasoning_effort')
+                if data.get('reasoning_effort') not in (None, '')
+                else data.get('reasoningEffort')
+            )
+            reasoning_effort = validate_reasoning_effort_for_instance(
+                reasoning_effort,
+                instance,
+            )
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 400
+        if reasoning_effort is not None:
+            # Keep the caller payload unchanged for retries that may select a
+            # different model, but record the effective per-target value in
+            # response truth and any same-target continuation metadata.
+            normalized_payload.pop('reasoningEffort', None)
+            normalized_payload['reasoning_effort'] = reasoning_effort
+            request_meta = (
+                dict(normalized_payload.get('request_meta') or {})
+                if isinstance(normalized_payload.get('request_meta'), dict)
+                else {}
+            )
+            request_meta['reasoning_effort_control'] = {
+                'value': reasoning_effort,
+                'explicit': reasoning_effort_explicit,
+                'scope': 'model_instance',
+                'source_instance_id': instance_id,
+            }
+            normalized_payload['request_meta'] = request_meta
 
         selected_reference_artifacts = extract_selected_reference_artifacts(data)
         matched_selected_reference = select_matching_selected_reference_artifact(
@@ -7450,6 +7498,7 @@ class ResponsesRequestRuntimeOwner:
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                     route_payload=route_info,
                     response_id=requested_response_id,
                     request_payload=normalized_payload,
@@ -7467,6 +7516,7 @@ class ResponsesRequestRuntimeOwner:
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                 )
             except self.request_timeout_error:
                 error_message = f'Timeout Port {target_port}'
@@ -7529,6 +7579,7 @@ class ResponsesRequestRuntimeOwner:
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                 ),
             )
             phase_output_repair_required = bool(

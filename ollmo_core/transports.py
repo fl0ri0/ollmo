@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 from helpers.model_capabilities import CAPABILITY_IMAGE_GENERATION
+from helpers.session_controls import REASONING_EFFORT_OPTIONS
 
 ARTIFACTS_ROOT = Path('artifacts')
 ARTIFACT_OUTPUTS_ROOT = ARTIFACTS_ROOT
@@ -55,6 +56,23 @@ TEXT_ARTIFACT_EXTENSIONS = {
     'sh',
     'sql',
 }
+
+_MLX_REASONING_EFFORTS = frozenset(
+    effort for effort in REASONING_EFFORT_OPTIONS if effort != 'off'
+)
+
+
+def apply_mlx_reasoning_controls(payload: dict[str, Any], reasoning_effort: Any = None) -> None:
+    """Apply Ollmo's narrow, safe reasoning contract to an MLX payload."""
+    effort = str(reasoning_effort or '').strip().lower()
+    if effort not in _MLX_REASONING_EFFORTS:
+        payload['enable_thinking'] = False
+        payload.pop('reasoning_effort', None)
+        return
+    payload['enable_thinking'] = True
+    payload['reasoning_effort'] = effort
+
+
 _TEXT_ARTIFACT_OUTER_FENCE_RE = re.compile(
     r'\A\s*```(?P<info>[^\r\n`]*)\r?\n(?P<body>[\s\S]*?)\r?\n?```\s*\Z'
 )
@@ -949,13 +967,14 @@ def mlx_chat_completions(
     timeout_sec: int = 600,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> dict:
     payload = {
         'model': model_name,
         'messages': messages,
         'stream': False,
-        'enable_thinking': False,
     }
+    apply_mlx_reasoning_controls(payload, reasoning_effort)
     if temperature is not None:
         payload['temperature'] = temperature
     if top_p is not None:
@@ -974,6 +993,4 @@ def mlx_chat_completions(
         return {'content': ''}
     message = choices[0].get('message') if isinstance(choices[0], dict) else None
     content = extract_text_payload(message.get('content') if isinstance(message, dict) else None)
-    if not content and isinstance(message, dict):
-        content = extract_text_payload(message.get('reasoning'))
     return {'content': content, 'result': data}

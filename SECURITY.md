@@ -14,6 +14,30 @@ Runtime state, prompts, history, logs, and generated artifacts can contain
 sensitive information. Keep the Ollmo directory private and review files
 before sharing them.
 
+## Generated HTML Preview
+
+Generated HTML is untrusted content. The ordinary saved-artifact view remains
+non-interactive. The explicit HTML Preview uses a trusted wrapper around a CSP-
+sandboxed iframe with an opaque origin: scripts may run, but they do not receive
+Ollmo's origin, forms, popups, ordinary top-navigation, workers, or external network access. Local
+styles, scripts, images, media, and static `fetch()` dependencies are served
+through a process-local signed read-only capability scoped to one portable
+bundle (or one nested source-project directory). If a canonical response has
+only flat artifacts, Ollmo derives the exact response-owned dependency set into
+a private temporary preview package; it does not register that package as an
+artifact or persistent bundle. Temporary packages have an absolute lifetime and
+bounded process-local storage, and restarting Ollmo removes them and invalidates
+their capabilities. Flat artifact buckets themselves are never interactive-
+preview boundaries.
+
+The sandbox permits browser-handled non-fetch protocols so a normal `mailto:`
+link can reach the local mail handler. This capability covers the browser's
+custom-protocol class, not only `mailto:`; popup targets remain blocked. It does
+not grant generated code HTTP(S) top-navigation or broader network access.
+
+Do not weaken this boundary by adding `allow-same-origin`, `unsafe-eval`, broad
+`connect-src`, or cross-origin access to the ordinary saved-artifact route.
+
 ## ChatGPT Through Codex and Cloud Processing
 
 Ollmo stays local by default. The optional ChatGPT route is disabled until the

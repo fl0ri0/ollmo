@@ -4,6 +4,7 @@ from unittest.mock import Mock
 from ollmo_g.execution_planner import (
     _extract_latest_assistant_content,
     plan_compound_execution,
+    resolve_internal_reasoning_effort,
     split_visible_image_payload,
 )
 from ollmo_g.control_hints import infer_tts_instruct_from_prompt
@@ -17,6 +18,78 @@ from ollmo_g.router import _sanitize_workload_task_proposals
 
 
 class GhostExecutionPlannerTests(unittest.TestCase):
+    def test_internal_reasoning_uses_advertised_mlx_default(self):
+        instance = {
+            'backend': 'mlx',
+            'capability': 'chat',
+            'session_controls': {
+                'fields': {
+                    'reasoning_effort': {
+                        'options': ['off', 'low', 'medium', 'xhigh'],
+                        'default_value': 'xhigh',
+                    },
+                },
+            },
+        }
+
+        self.assertEqual(resolve_internal_reasoning_effort(instance), 'xhigh')
+
+    def test_internal_reasoning_omits_unsupported_and_non_mlx_values(self):
+        instance = {
+            'backend': 'mlx',
+            'capability': 'chat',
+            'reasoning_efforts': ['low', 'medium'],
+        }
+
+        self.assertIsNone(resolve_internal_reasoning_effort(instance, 'xhigh'))
+        self.assertIsNone(
+            resolve_internal_reasoning_effort(
+                {**instance, 'backend': 'ollama'},
+                'medium',
+            )
+        )
+
+    def test_compound_planner_forwards_reasoning_for_planner_instance(self):
+        execute_chat = Mock(
+            return_value='{"apply": true, "planned_prompt": "A calm narrated story.", "reason": "compound request"}'
+        )
+
+        plan_compound_execution(
+            {'prompt': 'imagine something they would say and then generate an audio clip of it.'},
+            route_info={
+                'capability': 'text_to_speech',
+                'instance': {
+                    'instance_id': 'tts-1',
+                    'model': 'mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16',
+                    'backend': 'mlx',
+                    'capability': 'text_to_speech',
+                    'port': 11504,
+                },
+            },
+            instances=[
+                {
+                    'instance_id': 'planner-1',
+                    'model': 'mlx-community/Qwen3.8-27B-8bit',
+                    'backend': 'mlx',
+                    'capability': 'chat',
+                    'port': 11503,
+                    'readiness': 'ready',
+                    'reasoning_efforts': ['low', 'medium', 'xhigh'],
+                    'session_controls': {
+                        'fields': {
+                            'reasoning_effort': {
+                                'options': ['off', 'low', 'medium', 'xhigh'],
+                                'default_value': 'xhigh',
+                            },
+                        },
+                    },
+                },
+            ],
+            execute_chat_request=execute_chat,
+        )
+
+        self.assertEqual(execute_chat.call_args.kwargs['reasoning_effort'], 'xhigh')
+
     def test_split_visible_image_payload_prefers_explicit_prompt_block(self):
         display_text = (
             "My dream place is a sheltered lagoon at twilight, ringed by pale stone bridges and silver trees.\n\n"

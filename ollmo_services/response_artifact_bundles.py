@@ -905,7 +905,12 @@ def _iter_local_refs(path: Path) -> Iterable[tuple[str, str]]:
             yield f'json_path:{key_path}', value
 
 
-def _artifact_for_dependency_path(path: Path, artifacts_by_path: Mapping[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _artifact_for_dependency_path(
+    path: Path,
+    artifacts_by_path: Mapping[str, dict[str, Any]],
+    *,
+    allow_unregistered: bool = True,
+) -> Optional[dict[str, Any]]:
     try:
         resolved = path.expanduser().resolve(strict=False)
     except OSError:
@@ -913,6 +918,8 @@ def _artifact_for_dependency_path(path: Path, artifacts_by_path: Mapping[str, di
     existing = artifacts_by_path.get(str(resolved))
     if existing:
         return dict(existing)
+    if not allow_unregistered:
+        return None
     if not resolved.exists() or not resolved.is_file():
         return None
     extension = resolved.suffix.lower().lstrip('.')
@@ -952,6 +959,8 @@ def _artifact_for_dependency_path(path: Path, artifacts_by_path: Mapping[str, di
 def _include_linked_bundle_dependencies(
     selected_artifacts: list[dict[str, Any]],
     all_artifacts: list[dict[str, Any]],
+    *,
+    allow_unregistered: bool = True,
 ) -> list[dict[str, Any]]:
     if not selected_artifacts:
         return selected_artifacts
@@ -997,7 +1006,11 @@ def _include_linked_bundle_dependencies(
             dependency_key = str(dependency)
             if dependency_key in seen_paths:
                 continue
-            artifact = _artifact_for_dependency_path(dependency, artifacts_by_path)
+            artifact = _artifact_for_dependency_path(
+                dependency,
+                artifacts_by_path,
+                allow_unregistered=allow_unregistered,
+            )
             if not artifact:
                 continue
             seen_paths.add(dependency_key)
@@ -1110,12 +1123,32 @@ def bundle_response_artifacts(
     target_name: str | None = None,
     bundle_root: Path | str = DEFAULT_BUNDLE_ROOT,
     created_at: str | None = None,
+    required_public_source_path: Path | str | None = None,
+    require_public_output_surface: bool = False,
+    allow_unregistered_linked_dependencies: bool = True,
+    max_artifact_count: int | None = None,
+    max_total_source_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Copy saved response artifacts into a portable bundle and verify local links."""
     if not isinstance(response_payload, Mapping):
         raise ValueError('response_payload must be a mapping')
     existing_artifacts = _collect_existing_artifacts(response_payload)
+    has_output_surface, _public_keys = _public_output_artifact_filter(response_payload)
+    if require_public_output_surface and not has_output_surface:
+        raise ValueError('Exact fulfilled public output truth is required for this bundle.')
     public_artifacts = _filter_public_bundle_artifacts(response_payload, existing_artifacts)
+    if required_public_source_path is not None:
+        try:
+            required_source = Path(required_public_source_path).expanduser().resolve(strict=False)
+        except OSError as exc:
+            raise ValueError('The required public artifact path is invalid.') from exc
+        public_source_paths = {
+            Path(_clean_text(item.get('source_path'))).expanduser().resolve(strict=False)
+            for item in public_artifacts
+            if _clean_text(item.get('source_path'))
+        }
+        if required_source not in public_source_paths:
+            raise ValueError('The requested artifact is not a fulfilled public output of this response.')
     carried_predecessor_artifacts = _authorized_carried_predecessor_artifacts(
         response_payload,
         public_artifacts,
@@ -1127,11 +1160,21 @@ def bundle_response_artifacts(
         for item in _include_linked_bundle_dependencies(
             selected_artifacts,
             all_artifacts,
+            allow_unregistered=allow_unregistered_linked_dependencies,
         )
         if _is_bundleable_artifact(item)
     ]
     if not artifacts:
         raise ValueError('No existing local response artifacts were available to bundle.')
+    if max_artifact_count is not None and len(artifacts) > max(0, int(max_artifact_count)):
+        raise ValueError('The response artifact set exceeds the preview file-count limit.')
+    if max_total_source_bytes is not None:
+        total_source_bytes = sum(
+            Path(_clean_text(item.get('source_path'))).stat().st_size
+            for item in artifacts
+        )
+        if total_source_bytes > max(0, int(max_total_source_bytes)):
+            raise ValueError('The response artifact set exceeds the preview byte limit.')
 
     entrypoint_artifact = _select_entrypoint(artifacts)
     bundle_dir = _make_bundle_dir(

@@ -3502,6 +3502,7 @@ class ResponseFrameTests(unittest.TestCase):
                 "temperature": "0.4",
                 "topP": "0.8",
                 "maxTokens": "777",
+                "reasoningEffort": "medium",
                 "voice": "alloy",
                 "lang_code": "de",
                 "response_format": "mp3",
@@ -3542,6 +3543,7 @@ class ResponseFrameTests(unittest.TestCase):
         self.assertEqual(snapshot["values"]["generation"]["temperature"], 0.4)
         self.assertEqual(snapshot["values"]["generation"]["top_p"], 0.8)
         self.assertEqual(snapshot["values"]["generation"]["max_tokens"], 777)
+        self.assertEqual(snapshot["values"]["generation"]["reasoning_effort"], "medium")
         self.assertEqual(snapshot["values"]["audio"]["voice"], "alloy")
         self.assertEqual(snapshot["values"]["audio"]["lang_code"], "de")
         self.assertEqual(snapshot["values"]["audio"]["response_format"], "mp3")
@@ -3573,6 +3575,7 @@ class ResponseFrameTests(unittest.TestCase):
                 "speed": "1.0",
                 "pitch": 1.0,
                 "image_count": "1",
+                "reasoning_effort": "off",
             },
             {"capability": "vision"},
         )

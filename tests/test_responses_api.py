@@ -786,6 +786,352 @@ class ResponsesApiTests(unittest.TestCase):
             self.assertEqual(image_response.status_code, 200)
             self.assertEqual(image_response.data, b"png")
 
+    def test_interactive_html_artifact_preview_is_sandboxed_and_serves_signed_local_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifacts_root = Path(tmpdir) / "artifacts"
+            documents_dir = artifacts_root / "documents"
+            project_dir = documents_dir / "atelier"
+            project_dir.mkdir(parents=True)
+            image_dir = project_dir / "assets"
+            image_dir.mkdir(parents=True)
+            index_path = project_dir / "index.html"
+            configurator_path = project_dir / "configurator.html"
+            styles_path = project_dir / "styles.css"
+            pricing_path = project_dir / "pricing.json"
+            image_path = image_dir / "chair.png"
+            quoted_name_path = project_dir / 'quoted"name.html'
+            index_path.write_text(
+                (
+                    '<!doctype html><html><head>'
+                    '<link rel="stylesheet" href="styles.css">'
+                    '</head><body>'
+                    '<a href="configurator.html">Configure</a>'
+                    '<a href="#story">Story</a>'
+                    '<a href="mailto:atelier@example.test">Inquire</a>'
+                    '<img src="assets/chair.png">'
+                    '<script>window.previewReady = true;</script>'
+                    '</body></html>'
+                ),
+                encoding="utf-8",
+            )
+            configurator_path.write_text(
+                (
+                    '<!doctype html><html><head><title>Configure</title></head><body>'
+                    '<script>fetch("pricing.json").then((response) => response.json());</script>'
+                    '</body></html>'
+                ),
+                encoding="utf-8",
+            )
+            styles_path.write_text("body { color: rebeccapurple; }", encoding="utf-8")
+            pricing_path.write_text('{"base_price": 2400}\n', encoding="utf-8")
+            image_path.write_bytes(b"png")
+            quoted_name_path.write_text('<!doctype html><title>Quoted</title>', encoding="utf-8")
+
+            with patch("ollmo_webserver.ARTIFACT_OUTPUTS_DOCUMENTS_DIR", documents_dir):
+                preview_response = self.client.get(
+                    "/api/preview_saved_artifact",
+                    query_string={"path": str(index_path)},
+                )
+
+                self.assertEqual(preview_response.status_code, 200)
+                wrapper_html = preview_response.get_data(as_text=True)
+                self.assertIn(
+                    'sandbox="allow-scripts allow-top-navigation-to-custom-protocols"',
+                    wrapper_html,
+                )
+                self.assertNotIn('window.previewReady = true', wrapper_html)
+                frame_src = wrapper_html.split('<iframe src="', 1)[1].split('"', 1)[0]
+                wrapper_csp = preview_response.headers.get("Content-Security-Policy", "")
+                self.assertIn(
+                    "frame-src http://localhost/api/preview_saved_artifact_assets/",
+                    wrapper_csp,
+                )
+                self.assertNotIn("frame-src 'self'", wrapper_csp)
+                self.assertIn("default-src 'none'", wrapper_csp)
+
+                frame_response = self.client.get(frame_src)
+                self.assertEqual(frame_response.status_code, 200)
+                html = frame_response.get_data(as_text=True)
+                self.assertIn('<base href="/api/preview_saved_artifact_assets/', html)
+                self.assertIn('window.previewReady = true', html)
+                base_href = html.split('<base href="', 1)[1].split('"', 1)[0]
+                self.assertTrue(base_href.endswith("/index.html"), base_href)
+                base_dir = base_href.rsplit("/", 1)[0] + "/"
+                csp = frame_response.headers.get("Content-Security-Policy", "")
+                self.assertIn("sandbox allow-scripts", csp)
+                self.assertIn("allow-top-navigation-to-custom-protocols", csp)
+                self.assertIn("script-src", csp)
+                self.assertIn("'unsafe-inline'", csp)
+                self.assertNotIn("allow-same-origin", csp)
+                self.assertNotIn("allow-top-navigation ", csp)
+                self.assertNotIn("allow-top-navigation-by-user-activation", csp)
+                self.assertNotIn("allow-popups", csp)
+                self.assertNotIn("'unsafe-eval'", csp)
+                self.assertIn("form-action 'none'", csp)
+                self.assertEqual(preview_response.headers.get("Referrer-Policy"), "no-referrer")
+
+                css_response = self.client.get(f"{base_dir}styles.css")
+                configurator_response = self.client.get(f"{base_dir}configurator.html")
+                pricing_response = self.client.get(f"{base_dir}pricing.json")
+                image_response = self.client.get(f"{base_dir}assets/chair.png")
+                same_page_response = self.client.get(base_href)
+
+                token = base_href.split("/api/preview_saved_artifact_assets/", 1)[1].split("/", 1)[0]
+                tampered_token = ("A" if not token.startswith("A") else "B") + token[1:]
+                tampered_response = self.client.get(
+                    f"/api/preview_saved_artifact_assets/{tampered_token}/pricing.json"
+                )
+
+                strict_response = self.client.get(
+                    "/api/view_saved_artifact",
+                    query_string={"path": str(index_path)},
+                )
+                quoted_name_response = self.client.get(
+                    "/api/preview_saved_artifact",
+                    query_string={"path": str(quoted_name_path)},
+                )
+
+            self.assertEqual(css_response.status_code, 200)
+            self.assertIn(b"rebeccapurple", css_response.data)
+            self.assertEqual(configurator_response.status_code, 200)
+            self.assertIn(b'fetch("pricing.json")', configurator_response.data)
+            self.assertIn("sandbox allow-scripts", configurator_response.headers.get("Content-Security-Policy", ""))
+            self.assertEqual(pricing_response.status_code, 200)
+            self.assertEqual(pricing_response.get_json(), {"base_price": 2400})
+            self.assertEqual(pricing_response.headers.get("Access-Control-Allow-Origin"), "*")
+            self.assertEqual(pricing_response.headers.get("Cross-Origin-Resource-Policy"), "cross-origin")
+            self.assertEqual(image_response.status_code, 200)
+            self.assertEqual(image_response.data, b"png")
+            self.assertEqual(same_page_response.status_code, 200)
+            self.assertIn(b'window.previewReady = true', same_page_response.data)
+            self.assertEqual(tampered_response.status_code, 404)
+            self.assertEqual(quoted_name_response.status_code, 200)
+            self.assertIn(
+                'title="Preview of quoted&quot;name.html"',
+                quoted_name_response.get_data(as_text=True),
+            )
+            strict_csp = strict_response.headers.get("Content-Security-Policy", "")
+            self.assertIn("script-src 'self'", strict_csp)
+            strict_script_policy = next(
+                directive.strip()
+                for directive in strict_csp.split(";")
+                if directive.strip().startswith("script-src")
+            )
+            self.assertNotIn("'unsafe-inline'", strict_script_policy)
+
+    def test_interactive_html_preview_rejects_a_flat_artifact_root_capability(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            documents_dir = Path(tmpdir) / "artifacts" / "documents"
+            documents_dir.mkdir(parents=True)
+            index_path = documents_dir / "index.html"
+            secret_path = documents_dir / "unrelated-secret.json"
+            index_path.write_text('<!doctype html><title>Flat</title>', encoding="utf-8")
+            secret_path.write_text('{"secret": true}', encoding="utf-8")
+
+            with patch("ollmo_webserver.ARTIFACT_OUTPUTS_DOCUMENTS_DIR", documents_dir):
+                response = self.client.get(
+                    "/api/preview_saved_artifact",
+                    query_string={"path": str(index_path)},
+                )
+
+            self.assertEqual(response.status_code, 400)
+
+    def test_flat_response_html_uses_an_expiring_response_bound_preview_package(self):
+        import ollmo_webserver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents_dir = root / "artifacts" / "documents"
+            documents_dir.mkdir(parents=True)
+            persistent_bundles = root / "artifacts" / "bundles"
+            preview_root = root / "preview-cache"
+            index_path = documents_dir / "index.html"
+            configurator_path = documents_dir / "configurator.html"
+            styles_path = documents_dir / "styles.css"
+            pricing_path = documents_dir / "pricing.json"
+            image_path = documents_dir / "chair.png"
+            unrelated_path = documents_dir / "unrelated-secret.json"
+            repair_path = documents_dir / "repair.html"
+
+            index_path.write_text(
+                (
+                    '<!doctype html><link rel="stylesheet" href="styles.css">'
+                    '<a href="configurator.html">Configure</a>'
+                    '<a href="unrelated-secret.json">Unrelated</a>'
+                    '<img src="chair.png">'
+                ),
+                encoding="utf-8",
+            )
+            configurator_path.write_text(
+                '<!doctype html><script>fetch("pricing.json")</script>',
+                encoding="utf-8",
+            )
+            styles_path.write_text("body { color: rebeccapurple; }", encoding="utf-8")
+            pricing_path.write_text('{"base_price": 2400}\n', encoding="utf-8")
+            image_path.write_bytes(b"png")
+            unrelated_path.write_text('{"secret": true}\n', encoding="utf-8")
+            repair_path.write_text("<!doctype html><title>Repair only</title>", encoding="utf-8")
+
+            response_id = "resp_flat_html_preview"
+            public_artifacts = [
+                {"type": "text", "status": "fulfilled", "path": str(index_path), "artifact_ref": "artifact:index"},
+                {"type": "text", "status": "fulfilled", "path": str(configurator_path), "artifact_ref": "artifact:configurator"},
+                {"type": "text", "status": "fulfilled", "path": str(styles_path), "artifact_ref": "artifact:styles"},
+                {"type": "text", "status": "fulfilled", "path": str(pricing_path), "artifact_ref": "artifact:pricing"},
+                {"type": "image", "status": "fulfilled", "path": str(image_path), "artifact_ref": "artifact:chair"},
+            ]
+            _RESPONSE_LOOKUP[response_id] = {
+                "id": response_id,
+                "status": "completed",
+                "lifecycle_state": "completed",
+                "expires_at_ts": time.time() + 3600,
+                "response_payload": {
+                    "id": response_id,
+                    "status": "completed",
+                    "lifecycle_state": "completed",
+                    "outputs": copy.deepcopy(public_artifacts),
+                    "artifacts": [
+                        *copy.deepcopy(public_artifacts),
+                        {"type": "text", "status": "repair_needed", "path": str(repair_path)},
+                    ],
+                },
+            }
+            other_response_id = "resp_other_flat_html_preview"
+            _RESPONSE_LOOKUP[other_response_id] = {
+                "id": other_response_id,
+                "status": "completed",
+                "lifecycle_state": "completed",
+                "expires_at_ts": time.time() + 3600,
+                "response_payload": {
+                    "id": other_response_id,
+                    "status": "completed",
+                    "lifecycle_state": "completed",
+                    "outputs": [
+                        {
+                            "type": "text",
+                            "status": "fulfilled",
+                            "path": str(unrelated_path),
+                        }
+                    ],
+                },
+            }
+
+            with (
+                patch("ollmo_webserver.ARTIFACT_OUTPUTS_DOCUMENTS_DIR", documents_dir),
+                patch("ollmo_webserver.ARTIFACT_BUNDLES_DIR", persistent_bundles),
+                patch("ollmo_webserver._SAVED_HTML_PREVIEW_TEMP_ROOT", preview_root),
+                patch("ollmo_webserver._persist_response_artifact_bundle_record") as persist_bundle,
+                patch("ollmo_webserver._find_artifact_registry_record_by_artifact_ref") as registry_lookup,
+            ):
+                ollmo_webserver._SAVED_HTML_PREVIEW_PACKAGES.clear()
+                preview_response = self.client.get(
+                    "/api/preview_saved_artifact",
+                    query_string={"path": str(index_path), "response_id": response_id},
+                )
+                self.assertEqual(preview_response.status_code, 200)
+                frame_src = preview_response.get_data(as_text=True).split(
+                    '<iframe src="', 1
+                )[1].split('"', 1)[0]
+                frame_response = self.client.get(frame_src)
+                self.assertEqual(frame_response.status_code, 200)
+
+                self.assertEqual(len(ollmo_webserver._SAVED_HTML_PREVIEW_PACKAGES), 1)
+                preview_id, record = next(
+                    iter(ollmo_webserver._SAVED_HTML_PREVIEW_PACKAGES.items())
+                )
+                package_root = Path(record["bundle_path"])
+                self.assertTrue(package_root.is_dir())
+                self.assertFalse((package_root / "manifest.json").exists())
+                self.assertFalse(persistent_bundles.exists())
+                persist_bundle.assert_not_called()
+                registry_lookup.assert_not_called()
+                absolute_expiry = record["expires_at_monotonic"]
+
+                token = frame_src.split(
+                    "/api/preview_saved_artifact_assets/", 1
+                )[1].split("/", 1)[0]
+                configurator_copy = next(package_root.rglob("configurator.html"))
+                pricing_copy = next(package_root.rglob("pricing.json"))
+                styles_copy = next(package_root.rglob("styles.css"))
+                image_copy = next(package_root.rglob("chair.png"))
+
+                def preview_asset(path):
+                    relative = path.relative_to(package_root).as_posix()
+                    return self.client.get(
+                        f"/api/preview_saved_artifact_assets/{token}/{relative}"
+                    )
+
+                configurator_response = preview_asset(configurator_copy)
+                pricing_response = preview_asset(pricing_copy)
+                styles_response = preview_asset(styles_copy)
+                image_response = preview_asset(image_copy)
+                unrelated_response = self.client.get(
+                    f"/api/preview_saved_artifact_assets/{token}/unrelated-secret.json"
+                )
+                manifest_response = self.client.get(
+                    f"/api/preview_saved_artifact_assets/{token}/manifest.json"
+                )
+                repair_response = self.client.get(
+                    "/api/preview_saved_artifact",
+                    query_string={"path": str(repair_path), "response_id": response_id},
+                )
+                wrong_response = self.client.get(
+                    "/api/preview_saved_artifact",
+                    query_string={
+                        "path": str(index_path),
+                        "response_id": other_response_id,
+                    },
+                )
+
+                self.assertEqual(configurator_response.status_code, 200)
+                self.assertEqual(pricing_response.get_json(), {"base_price": 2400})
+                self.assertIn(b"rebeccapurple", styles_response.data)
+                self.assertEqual(image_response.data, b"png")
+                self.assertEqual(unrelated_response.status_code, 404)
+                self.assertEqual(manifest_response.status_code, 404)
+                self.assertEqual(repair_response.status_code, 409)
+                self.assertEqual(wrong_response.status_code, 409)
+                self.assertEqual(record["expires_at_monotonic"], absolute_expiry)
+
+                for response in (
+                    frame_response,
+                    configurator_response,
+                    pricing_response,
+                    styles_response,
+                    image_response,
+                    unrelated_response,
+                    manifest_response,
+                    wrong_response,
+                ):
+                    response.close()
+                ollmo_webserver._expire_saved_html_preview_package(
+                    preview_id,
+                    str(package_root),
+                )
+                self.assertFalse(package_root.exists())
+                self.assertFalse(ollmo_webserver._SAVED_HTML_PREVIEW_PACKAGES)
+                expired_response = self.client.get(frame_src)
+                self.assertEqual(expired_response.status_code, 404)
+                self.assertTrue(index_path.exists())
+                self.assertTrue(unrelated_path.exists())
+
+    def test_interactive_html_preview_token_allows_null_bytes_inside_its_signature(self):
+        import ollmo_webserver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_root = Path(tmpdir).resolve()
+            digest_with_null = (b"a" * 15) + b"\0" + (b"b" * 16)
+            with patch("ollmo_webserver.hmac.new") as hmac_new:
+                hmac_new.return_value.digest.return_value = digest_with_null
+                token = ollmo_webserver._encode_saved_artifact_interactive_preview_base_root(
+                    base_root
+                )
+                decoded = ollmo_webserver._decode_saved_artifact_interactive_preview_base_root(
+                    token
+                )
+
+            self.assertEqual(decoded, base_root)
+
     def test_api_ghost_preferences_round_trip_persists_ui_payload(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "ghost_preferences.json"
@@ -3428,10 +3774,12 @@ class ResponsesApiTests(unittest.TestCase):
     def test_canonical_responses_chat_returns_normalized_envelope(self, mock_lookup, mock_execute):
         mock_lookup.return_value = {
             "instance_id": "chat-1",
-            "model": "gpt-oss:20b",
-            "backend": "ollama",
+            "model": "mlx-community/Qwen3.8-27B-8bit",
+            "request_model": "/tmp/qwen3.8",
+            "backend": "mlx",
             "capability": "chat",
-            "port": 11435,
+            "port": 11502,
+            "reasoning_efforts": ["low", "medium", "xhigh"],
         }
         mock_execute.return_value = "Hello from Ollmo."
 
@@ -3442,6 +3790,7 @@ class ResponsesApiTests(unittest.TestCase):
                 "instructions": "be concise",
                 "input": "hello",
                 "maxTokens": 777,
+                "reasoningEffort": "medium",
             },
         )
 
@@ -3460,6 +3809,10 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(payload["response_frame"]["target"]["instance_id"], "chat-1")
         self.assertEqual(payload["response_frame"]["request"]["input"], "hello")
         self.assertEqual(payload["response_frame"]["controls"]["values"]["generation"]["max_tokens"], 777)
+        self.assertEqual(
+            payload["response_frame"]["controls"]["values"]["generation"]["reasoning_effort"],
+            "medium",
+        )
         self.assertEqual(payload["working_frame"]["kind"], "ollmo.working_frame")
         self.assertEqual(payload["working_frame"]["status"], "frozen")
         self.assertEqual(payload["response_frame"]["working_frame"]["status"], "frozen")
@@ -3473,7 +3826,7 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(payload["output_branches"][0]["type"], "text")
         self.assertEqual(payload["work_tree"]["kind"], "ollmo.work_tree")
         called = mock_execute.call_args
-        self.assertEqual(called.kwargs["target_port"], 11435)
+        self.assertEqual(called.kwargs["target_port"], 11502)
         self.assertEqual(
             called.kwargs["messages"],
             [
@@ -3482,6 +3835,62 @@ class ResponsesApiTests(unittest.TestCase):
             ],
         )
         self.assertEqual(called.kwargs["max_tokens"], 777)
+        self.assertEqual(called.kwargs["reasoning_effort"], "medium")
+
+    @patch("ollmo_webserver._execute_chat_backend_request")
+    @patch("ollmo_webserver._lookup_instance")
+    def test_canonical_responses_chat_records_omitted_reasoning_default(
+        self,
+        mock_lookup,
+        mock_execute,
+    ):
+        mock_lookup.return_value = {
+            "instance_id": "chat-1",
+            "model": "mlx-community/Qwen3.8-27B-8bit",
+            "request_model": "/tmp/qwen3.8",
+            "backend": "mlx",
+            "capability": "chat",
+            "port": 11502,
+            "reasoning_efforts": ["low", "medium", "xhigh"],
+            "reasoning_effort_default": "xhigh",
+            "session_controls": {
+                "fields": {
+                    "reasoning_effort": {
+                        "options": ["off", "low", "medium", "xhigh"],
+                        "default_value": "xhigh",
+                    },
+                },
+            },
+        }
+        mock_execute.return_value = "Reasoned locally."
+
+        response = self.client.post(
+            "/api/responses",
+            json={
+                "instance_id": "chat-1",
+                "input": "hello",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            payload["response_frame"]["controls"]["values"]["generation"]["reasoning_effort"],
+            "xhigh",
+        )
+        self.assertEqual(
+            payload["response_frame"]["request"]["request_meta"]["reasoning_effort_control"],
+            {
+                "value": "xhigh",
+                "explicit": False,
+                "scope": "model_instance",
+                "source_instance_id": "chat-1",
+            },
+        )
+        self.assertEqual(
+            mock_execute.call_args.kwargs["reasoning_effort"],
+            "xhigh",
+        )
 
     @patch("ollmo_webserver._execute_chat_backend_request")
     @patch("ollmo_webserver._lookup_instance")
@@ -5522,10 +5931,12 @@ class ResponsesApiTests(unittest.TestCase):
     def test_canonical_responses_chat_streams_sse(self, mock_lookup, mock_stream):
         mock_lookup.return_value = {
             "instance_id": "chat-1",
-            "model": "gpt-oss:20b",
-            "backend": "ollama",
+            "model": "mlx-community/Qwen3.8-27B-8bit",
+            "request_model": "/tmp/qwen3.8",
+            "backend": "mlx",
             "capability": "chat",
-            "port": 11435,
+            "port": 11502,
+            "reasoning_efforts": ["low", "medium", "xhigh"],
         }
         mock_stream.return_value = Response(
             "event: response.created\ndata: {}\n\n"
@@ -5540,6 +5951,7 @@ class ResponsesApiTests(unittest.TestCase):
                 "instance_id": "chat-1",
                 "input": "hello",
                 "stream": True,
+                "reasoning_effort": "low",
             },
         )
 
@@ -5551,6 +5963,51 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertIn("Hello streamed.", body)
         self.assertIn("event: response.completed", body)
         mock_stream.assert_called_once()
+        self.assertEqual(mock_stream.call_args.kwargs["reasoning_effort"], "low")
+
+    @patch("ollmo_webserver._lookup_instance")
+    def test_canonical_responses_rejects_invalid_reasoning_effort(self, mock_lookup):
+        mock_lookup.return_value = {
+            "instance_id": "chat-1",
+            "model": "mlx-community/Qwen3.8-27B-8bit",
+            "backend": "mlx",
+            "capability": "chat",
+            "port": 11502,
+        }
+
+        response = self.client.post(
+            "/api/responses",
+            json={
+                "instance_id": "chat-1",
+                "input": "hello",
+                "reasoning_effort": "extreme",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort", response.get_json()["error"])
+
+    @patch("ollmo_webserver._lookup_instance")
+    def test_canonical_responses_rejects_unadvertised_reasoning_effort(self, mock_lookup):
+        mock_lookup.return_value = {
+            "instance_id": "mlx-generic-1",
+            "model": "mlx-community/Generic-8B",
+            "backend": "mlx",
+            "capability": "chat",
+            "port": 11502,
+        }
+
+        response = self.client.post(
+            "/api/responses",
+            json={
+                "instance_id": "mlx-generic-1",
+                "input": "hello",
+                "reasoning_effort": "low",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not available", response.get_json()["error"])
 
     @patch("ollmo_webserver._execute_chat_backend_request")
     @patch("ollmo_webserver._resolve_responses_target_instance")
@@ -7972,10 +8429,19 @@ class ResponsesApiTests(unittest.TestCase):
                     "chat-1",
                     {
                         "instance_id": "chat-1",
-                        "model": "gemma4:e4b",
-                        "backend": "ollama",
+                        "model": "mlx-community/Qwen3.8-27B-8bit",
+                        "backend": "mlx",
                         "capability": "chat",
                         "port": 11437,
+                        "reasoning_efforts": ["low", "medium", "xhigh"],
+                        "session_controls": {
+                            "fields": {
+                                "reasoning_effort": {
+                                    "options": ["off", "low", "medium", "xhigh"],
+                                    "default_value": "xhigh",
+                                },
+                            },
+                        },
                     },
                     None,
                     None,
@@ -8027,6 +8493,10 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(
             mock_execute_chat_backend_request.call_args.kwargs["max_tokens"],
             512,
+        )
+        self.assertEqual(
+            mock_execute_chat_backend_request.call_args.kwargs["reasoning_effort"],
+            "xhigh",
         )
 
     @patch("ollmo_webserver._resolve_ghost_auto_route")
@@ -10465,12 +10935,17 @@ class ResponsesApiTests(unittest.TestCase):
                     backend="ollama",
                     capability="chat",
                     messages=[{"role": "user", "content": "hello"}],
+                    reasoning_effort="xhigh",
                 )
 
         body = response.get_data(as_text=True)
         self.assertIn("Fallback text", body)
         self.assertIn("event: response.completed", body)
         mock_execute_chat_backend_request.assert_called_once()
+        self.assertEqual(
+            mock_execute_chat_backend_request.call_args.kwargs["reasoning_effort"],
+            "xhigh",
+        )
 
     @patch("ollmo_webserver._schedule_response_late_fill", return_value=True)
     @patch("ollmo_webserver._execute_chat_backend_request")
@@ -27848,6 +28323,32 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertTrue(expose_input_artifacts)
         self.assertIn('context_strategy', route_info['route_runtime'])
 
+    def test_responses_infer_execution_payload_preserves_camel_case_reasoning_effort(self):
+        with app.test_request_context('/api/responses', method='POST'):
+            infer_payload, _route_info, _has_file_context, _expose_input_artifacts = (
+                _build_responses_infer_execution_payload(
+                    {
+                        'prompt': 'Describe the image.',
+                        'reasoningEffort': 'medium',
+                        'file_path': '/tmp/qwen38-reference.png',
+                    },
+                    route_info=None,
+                    instance={
+                        'instance_id': 'qwen38-1',
+                        'model': 'mlx-community/Qwen3.8-27B-8bit',
+                        'backend': 'mlx',
+                        'capability': 'vision_analysis',
+                    },
+                    instance_id='qwen38-1',
+                    backend='mlx',
+                    capability='vision_analysis',
+                    request_model_override='/tmp/qwen38',
+                    upload_present=False,
+                )
+            )
+
+        self.assertEqual(infer_payload['reasoning_effort'], 'medium')
+
     def test_responses_infer_execution_payload_route_overrides_stale_payload_capability(self):
         with app.test_request_context('/api/responses', method='POST'):
             infer_payload, _route_info, has_file_context, _expose_input_artifacts = (
@@ -28742,9 +29243,19 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                     'instance_id': 'chat-1',
                     'instance': {
                         'instance_id': 'chat-1',
-                        'model': 'gemma4:26b',
-                        'backend': 'ollama',
+                        'model': 'mlx-community/Qwen3.8-9B-8bit',
+                        'backend': 'mlx',
                         'capability': 'chat',
+                        'reasoning_efforts': ['low', 'medium'],
+                        'reasoning_effort_default': 'medium',
+                        'session_controls': {
+                            'fields': {
+                                'reasoning_effort': {
+                                    'options': ['off', 'low', 'medium'],
+                                    'default_value': 'medium',
+                                },
+                            },
+                        },
                     },
                 },
                 None,
@@ -28766,6 +29277,15 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 request_payload={
                     'ghost_route': True,
                     'prompt': 'Compare the two generated image analyses.',
+                    'reasoning_effort': 'xhigh',
+                    'request_meta': {
+                        'reasoning_effort_control': {
+                            'value': 'xhigh',
+                            'explicit': True,
+                            'scope': 'model_instance',
+                            'source_instance_id': 'qwen-root',
+                        },
+                    },
                 },
                 assistant_message='Vision evidence is ready.',
                 source_route_payload=None,
@@ -28776,6 +29296,8 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertEqual(plan['execution_contract']['workload_task_ref']['task_id'], 'task-phase-5')
         self.assertEqual(plan['effective_data']['execution_contract']['phase_id'], 'phase-5')
         self.assertEqual(plan['infer_payload']['execution_contract']['output_obligation_ref']['obligation_id'], 'obligation-phase-5')
+        self.assertEqual(plan['effective_data']['reasoning_effort'], 'medium')
+        self.assertEqual(plan['infer_payload']['reasoning_effort'], 'medium')
         resolved_payload = mock_resolve_route.call_args.args[0]
         self.assertEqual(resolved_payload['execution_contract']['depends_on'], ['phase-3', 'phase-4'])
 

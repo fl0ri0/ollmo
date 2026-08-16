@@ -61,6 +61,170 @@ def test_codex_connection_is_a_compact_visible_external_card():
     assert "font-size: 0.56rem" in _css_rule(css, ".external-target-card__detail")
 
 
+def test_reasoning_effort_control_is_schema_bound_and_uses_model_default_on_first_use():
+    html = WEB_UI_PATH.read_text()
+    settings = (ROOT / "static" / "ui" / "settings-history.js").read_text()
+    request_transport = (ROOT / "static" / "ui" / "request-transport.js").read_text()
+
+    assert 'data-setting-key="reasoning_effort"' in html
+    assert 'id="setting-reasoning-effort"' in html
+    assert "reasoningEffort: 'off'" in html
+    assert "reasoningEffortExplicit: false" in html
+    assert "Uses the model's declared default on first use" in html
+    assert "reasoning_effort: { stateKey: 'reasoningEffort', requestKey: 'reasoning_effort' }" in html
+    assert "settingReasoningEffort: document.getElementById('setting-reasoning-effort')" in html
+    assert "reasoningEffortToken" in settings
+    assert "state.settings.reasoningEffort" in settings
+    assert "reasoningEffortField?.options" in settings
+    assert "reasoningEffortOptions.includes(currentReasoningEffort)" in settings
+    assert "field?.default_value" in settings
+    assert "reasoningEffortExplicit" in settings
+    assert "hasExplicitReasoningEffortPreference" in settings
+    assert "fieldKey === 'reasoning_effort'" in request_transport
+    assert "!transformedMatchesOption" in request_transport
+    assert "getReasoningEffortDefaultValue" in request_transport
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required for frontend VM tests")
+def test_reasoning_effort_defaults_and_serialization_are_target_schema_bound():
+    result = _run_node(
+        r"""
+        const fs = require('fs');
+        const vm = require('vm');
+
+        function makeOption() {
+          return { value: '', textContent: '' };
+        }
+        function makeSelect() {
+          const node = { value: '', options: [], appendChild(option) { this.options.push(option); }, focus() {} };
+          Object.defineProperty(node, 'innerHTML', {
+            get() { return ''; },
+            set() { this.options = []; },
+          });
+          return node;
+        }
+
+        const context = {
+          console,
+          document: { createElement: () => makeOption() },
+          settingsDefaults: {
+            temperature: null, topP: null, reasoningEffort: 'off', reasoningEffortExplicit: false,
+            sttLanguage: '', sttTask: 'transcribe', imageAspectRatio: 'auto', imageWidth: null,
+            imageHeight: null, imageCount: 1, ocrMode: 'auto', pdfMaxPages: null, pdfDpi: 300,
+            pdfPageTimeoutSec: 180, pdfSynthesize: false, ttsVoice: '', ttsInstruct: '',
+            ttsLanguage: '', ttsResponseFormat: '', ttsSpeed: null, ttsPitch: null,
+          },
+          elements: {
+            settingSttLanguage: makeSelect(), settingSttTask: makeSelect(),
+            settingReasoningEffort: makeSelect(), settingImageAspectRatio: makeSelect(),
+            settingOcrMode: makeSelect(), settingTtsVoice: makeSelect(),
+            settingTtsLanguage: makeSelect(), settingTtsResponseFormat: makeSelect(),
+          },
+          state: {
+            settingsGlobal: {}, settingsByModel: {}, settings: {},
+            inference: {}, modelSettingsOpen: false, modelSettingsAutoOpened: false,
+          },
+          SESSION_CONTROL_BINDINGS: {
+            reasoning_effort: { stateKey: 'reasoningEffort', requestKey: 'reasoning_effort' },
+          },
+          setTimeout, clearTimeout,
+        };
+        context.globalThis = context;
+        vm.createContext(context);
+        vm.runInContext(fs.readFileSync('static/ui/settings-history.js', 'utf8'), context);
+        vm.runInContext(fs.readFileSync('static/ui/request-transport.js', 'utf8'), context);
+
+        vm.runInContext(`
+        const qwenSchema = {
+          enabled: true,
+          fields: {
+            reasoning_effort: {
+              visible: true,
+              kind: 'select',
+              options: ['off', 'low', 'medium', 'xhigh'],
+              default_value: 'xhigh',
+            },
+          },
+        };
+        const narrowSchema = {
+          enabled: true,
+          fields: { reasoning_effort: { visible: true, kind: 'select', options: ['off', 'low'] } },
+        };
+        const ghostTarget = { model: 'ghost-qwen', backend: 'mlx', session_controls: qwenSchema };
+        const pinnedTarget = { model: 'pinned-qwen', backend: 'mlx', session_controls: qwenSchema };
+        const directTarget = { model: 'direct-qwen', backend: 'mlx', session_controls: qwenSchema };
+        let owner = ghostTarget;
+        getCurrentSettingsOwnerInstance = () => owner;
+        makeModelKey = (model, backend) => backend + '::' + model;
+        saveSettings = () => {};
+        applySettings = () => {};
+
+        state.settingsGlobal = sanitizeSettingsObject({});
+        state.settingsByModel = {};
+        state.settings = sanitizeSettingsObject({});
+        const firstUse = [];
+        for (const target of [ghostTarget, pinnedTarget, directTarget]) {
+          owner = target;
+          state.settings = sanitizeSettingsObject({});
+          refreshSessionControlSelectOptions(target);
+          firstUse.push({ value: state.settings.reasoningEffort, explicit: state.settings.reasoningEffortExplicit });
+        }
+
+        const legacyOffSettings = sanitizeSettingsObject({ reasoningEffort: 'off' });
+        const legacyOnSettings = sanitizeSettingsObject({ reasoningEffort: 'xhigh' });
+        const legacyOff = { value: legacyOffSettings.reasoningEffort, explicit: legacyOffSettings.reasoningEffortExplicit };
+        const legacyOn = { value: legacyOnSettings.reasoningEffort, explicit: legacyOnSettings.reasoningEffortExplicit };
+        state.settings = legacyOffSettings;
+        refreshSessionControlSelectOptions(ghostTarget);
+        const migratedLegacyOff = { value: state.settings.reasoningEffort, explicit: state.settings.reasoningEffortExplicit };
+
+        state.settings = sanitizeSettingsObject({ reasoningEffort: 'off', reasoningEffortExplicit: true });
+        refreshSessionControlSelectOptions(ghostTarget);
+        const explicitOff = { value: state.settings.reasoningEffort, explicit: state.settings.reasoningEffortExplicit };
+        state.settingsByModel['mlx::ghost-qwen'] = {
+          reasoningEffort: 'off',
+          reasoningEffortExplicit: true,
+        };
+        loadSettingsForInstance(ghostTarget);
+        const reloadedOff = { value: state.settings.reasoningEffort, explicit: state.settings.reasoningEffortExplicit };
+
+        state.settings = sanitizeSettingsObject({ reasoningEffort: 'xhigh', reasoningEffortExplicit: false });
+        const targetDefault = buildSessionControlRequestFields(ghostTarget);
+        const heterogeneousTarget = buildSessionControlRequestFields({
+          ...directTarget,
+          session_controls: narrowSchema,
+        });
+        state.settings = sanitizeSettingsObject({ reasoningEffort: 'xhigh', reasoningEffortExplicit: true });
+        const unsupportedExplicit = buildSessionControlRequestFields({
+          ...directTarget,
+          session_controls: narrowSchema,
+        });
+        const noOptionsTarget = buildSessionControlRequestFields({
+          ...directTarget,
+          session_controls: { enabled: true, fields: { reasoning_effort: { visible: true, options: [] } } },
+        });
+        globalThis.result = { firstUse, legacyOff, legacyOn, migratedLegacyOff, explicitOff, reloadedOff, targetDefault, heterogeneousTarget, unsupportedExplicit, noOptionsTarget };
+        `, context);
+        process.stdout.write(JSON.stringify(context.result));
+        """
+    )
+
+    assert result["firstUse"] == [
+        {"value": "xhigh", "explicit": False},
+        {"value": "xhigh", "explicit": False},
+        {"value": "xhigh", "explicit": False},
+    ]
+    assert result["legacyOff"] == {"value": "off", "explicit": False}
+    assert result["legacyOn"] == {"value": "xhigh", "explicit": True}
+    assert result["migratedLegacyOff"] == {"value": "xhigh", "explicit": False}
+    assert result["explicitOff"] == {"value": "off", "explicit": True}
+    assert result["reloadedOff"] == {"value": "off", "explicit": True}
+    assert result["targetDefault"] == {"reasoning_effort": "xhigh"}
+    assert result["heterogeneousTarget"] == {"reasoning_effort": "low"}
+    assert result["unsupportedExplicit"] == {}
+    assert result["noOptionsTarget"] == {}
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for frontend VM tests")
 def test_selectable_codex_projects_into_direct_targets_and_tabs_not_running_instances():
     result = _run_node(

@@ -2657,6 +2657,7 @@ def translate_responses_payload_to_infer_payload(payload: dict) -> dict:
         'width',
         'height',
         'seed',
+        'reasoning_effort',
         'execution_contract',
         'workload_task_ref',
         'output_obligation_ref',
@@ -2673,6 +2674,9 @@ def translate_responses_payload_to_infer_payload(payload: dict) -> dict:
         value = payload.get(key)
         if value not in (None, ''):
             translated[key] = value
+
+    if 'reasoning_effort' not in translated and payload.get('reasoningEffort') not in (None, ''):
+        translated['reasoning_effort'] = payload.get('reasoningEffort')
 
     prompt = extract_responses_prompt(payload)
     if prompt:

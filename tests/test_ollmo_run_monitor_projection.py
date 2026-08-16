@@ -1,8 +1,34 @@
+import subprocess
+import sys
+from pathlib import Path
+
 from scripts.ollmo_run_monitor import (
     _collect_runtime_repair_authority,
     _render_human,
     _wave_diagnostic_from_history,
 )
+
+
+def test_monitor_compatibility_entrypoint_imports_from_any_working_directory(
+    tmp_path: Path,
+) -> None:
+    entrypoint = (
+        Path(__file__).resolve().parents[1]
+        / 'state'
+        / 'ollmo_run_monitor'
+        / 'monitor_once.py'
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(entrypoint), '--help'],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'Append Ollmo run monitor reports from local runtime truth.' in result.stdout
 
 
 def _base_report(wave: dict) -> dict:

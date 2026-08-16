@@ -113,7 +113,7 @@ class ChatApiTests(unittest.TestCase):
     @patch("ollmo_webserver.is_port_listening", return_value=True)
     @patch("ollmo_webserver.requests.post")
     @patch("ollmo_webserver.load_running_instances")
-    def test_mlx_chat_falls_back_to_reasoning_when_content_empty(
+    def test_mlx_chat_keeps_default_reasoning_private_when_content_empty(
         self,
         mock_running_instances,
         mock_post,
@@ -127,6 +127,7 @@ class ChatApiTests(unittest.TestCase):
                 "backend": "mlx",
                 "capability": "chat",
                 "port": 11502,
+                "reasoning_efforts": ["low", "medium", "xhigh"],
             }
         ]
         mock_response = Mock()
@@ -153,10 +154,97 @@ class ChatApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["content"], "Hello from reasoning fallback.")
-        self.assertFalse(mock_post.call_args.kwargs["json"].get("enable_thinking"))
+        self.assertEqual(response.get_json()["content"], "")
+        self.assertTrue(mock_post.call_args.kwargs["json"].get("enable_thinking"))
+        self.assertEqual(
+            mock_post.call_args.kwargs["json"]["reasoning_effort"],
+            "medium",
+        )
         self.assertEqual(mock_post.call_args.kwargs["json"]["max_tokens"], 654)
         self.assertEqual(mock_post.call_args.kwargs["timeout"], 900)
+
+    @patch("ollmo_webserver.is_port_listening", return_value=True)
+    @patch("ollmo_webserver.requests.post")
+    @patch("ollmo_webserver.load_running_instances")
+    def test_mlx_chat_forwards_camel_case_reasoning_effort(
+        self,
+        mock_running_instances,
+        mock_post,
+        _mock_is_port_listening,
+    ):
+        mock_running_instances.return_value = [
+            {
+                "instance_id": "mlx-qwen38-1",
+                "model": "mlx-community/Qwen3.8-27B-8bit",
+                "request_model": "/tmp/qwen3.8",
+                "backend": "mlx",
+                "capability": "chat",
+                "port": 11502,
+                "reasoning_efforts": ["low", "medium", "xhigh"],
+            }
+        ]
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "Final answer", "reasoning": "private"}}]
+        }
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "instance_id": "mlx-qwen38-1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoningEffort": "medium",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["content"], "Final answer")
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertTrue(payload["enable_thinking"])
+        self.assertEqual(payload["reasoning_effort"], "medium")
+
+    @patch("ollmo_webserver.load_running_instances")
+    def test_chat_rejects_reasoning_effort_when_model_does_not_advertise_it(
+        self,
+        mock_running_instances,
+    ):
+        mock_running_instances.return_value = [
+            {
+                "instance_id": "mlx-generic-1",
+                "model": "mlx-community/Generic-8B",
+                "request_model": "/tmp/generic",
+                "backend": "mlx",
+                "capability": "chat",
+                "port": 11502,
+            }
+        ]
+
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "instance_id": "mlx-generic-1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not available", response.get_json()["error"])
+
+    def test_chat_rejects_invalid_reasoning_effort(self):
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "instance_id": "mlx-qwen38-1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "extreme",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort", response.get_json()["error"])
 
     @patch("ollmo_webserver.is_port_listening", return_value=True)
     @patch("ollmo_webserver.requests.post")

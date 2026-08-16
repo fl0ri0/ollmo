@@ -7,6 +7,10 @@ import re
 from typing import Any, Callable, Optional
 
 from helpers.model_capabilities import CAPABILITY_CHAT, normalize_backend, normalize_capability
+from helpers.session_controls import (
+    build_session_controls,
+    normalize_reasoning_effort,
+)
 from ollmo_g.control_hints import (
     infer_tts_instruct_from_prompt,
     infer_tts_language_from_prompt,
@@ -25,6 +29,7 @@ from ollmo_services.tts_source import extract_explicit_tts_source_text
 
 CAPABILITY_TEXT_TO_SPEECH = 'text_to_speech'
 CAPABILITY_IMAGE_GENERATION = 'image_generation'
+_REASONING_EFFORT_UNSET = object()
 
 _FENCED_JSON_RE = re.compile(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', re.IGNORECASE)
 _JSON_OBJECT_RE = re.compile(r'(\{[\s\S]*\})')
@@ -157,6 +162,74 @@ _IMAGE_ACTION_ALIASES = {
     'render_image',
     'render_images',
 }
+
+
+def resolve_internal_reasoning_effort(
+    instance: Optional[dict[str, Any]],
+    requested: Any = _REASONING_EFFORT_UNSET,
+) -> Optional[str]:
+    """Resolve reasoning only for the local instance performing this helper call.
+
+    Internal Ghost calls may use a different chat model than the user-facing
+    route.  An explicit effort is therefore validated against that helper
+    instance, while an omitted effort is derived from its own Session Controls
+    schema.  Unsupported values and non-MLX targets fail closed by omission.
+    """
+
+    target = instance if isinstance(instance, dict) else {}
+    if normalize_backend(target.get('backend')) != 'mlx':
+        return None
+
+    schema = target.get('session_controls')
+    if not isinstance(schema, dict):
+        schema = build_session_controls(target)
+    fields = schema.get('fields') if isinstance(schema.get('fields'), dict) else {}
+    field = fields.get('reasoning_effort') if isinstance(fields, dict) else None
+    if not isinstance(field, dict):
+        schema = build_session_controls(target)
+        fields = schema.get('fields') if isinstance(schema.get('fields'), dict) else {}
+        field = fields.get('reasoning_effort') if isinstance(fields, dict) else None
+    options = (
+        [str(item or '').strip().lower() for item in field.get('options', []) if str(item or '').strip()]
+        if isinstance(field, dict) and isinstance(field.get('options'), list)
+        else []
+    )
+
+    if requested is not _REASONING_EFFORT_UNSET and requested not in (None, ''):
+        try:
+            effort = normalize_reasoning_effort(requested)
+            if effort is None:
+                return None
+            if effort != 'off' and effort not in options:
+                return None
+            return effort
+        except ValueError:
+            return None
+
+    if not options:
+        return None
+
+    candidates = []
+    if isinstance(field, dict):
+        candidates.append(field.get('default_value'))
+    candidates.append(target.get('reasoning_effort_default'))
+    candidates.extend(('medium', *[item for item in options if item != 'off']))
+    for candidate in candidates:
+        try:
+            effort = normalize_reasoning_effort(candidate)
+        except ValueError:
+            continue
+        if effort and effort in options:
+            return effort
+    return None
+
+
+def _payload_reasoning_effort(payload: dict[str, Any]) -> Any:
+    if payload.get('reasoning_effort') not in (None, ''):
+        return payload.get('reasoning_effort')
+    if payload.get('reasoningEffort') not in (None, ''):
+        return payload.get('reasoningEffort')
+    return _REASONING_EFFORT_UNSET
 
 
 def _strip_markdown_wrappers(value: str) -> str:
@@ -1396,8 +1469,8 @@ def plan_compound_execution(
         )
         return updated_payload, applied_meta
 
-    planner_instance = select_router_instance(instances)
-    if not planner_instance:
+    selected_planner_instance = select_router_instance(instances)
+    if not selected_planner_instance:
         return base_payload, {
             'attempted': True,
             'applied': False,
@@ -1406,6 +1479,18 @@ def plan_compound_execution(
             'semantic_role_mode': str((semantic_role_profile or {}).get('mode') or '').strip() or None,
             'phase_graph': request_phase_graph,
         }
+    planner_instance = selected_planner_instance
+    selected_instance_id = str(selected_planner_instance.get('instance_id') or '').strip()
+    for candidate in instances:
+        if (
+            isinstance(candidate, dict)
+            and selected_instance_id
+            and str(candidate.get('instance_id') or '').strip() == selected_instance_id
+        ):
+            # Router selection remains authoritative; restore the selected
+            # instance's full metadata for its local reasoning schema.
+            planner_instance = candidate
+            break
 
     planner_messages = [
         {
@@ -1430,6 +1515,10 @@ def plan_compound_execution(
         },
     ]
     effective_timeout_sec = max(1, int(planner_timeout_sec or 90))
+    planner_reasoning_effort = resolve_internal_reasoning_effort(
+        planner_instance,
+        _payload_reasoning_effort(base_payload),
+    )
 
     planner_raw = execute_chat_request(
         target_port=int(planner_instance['port']),
@@ -1440,6 +1529,7 @@ def plan_compound_execution(
         request_model_override=str(planner_instance.get('request_model') or '').strip() or None,
         temperature=0.15,
         max_tokens=32768,
+        reasoning_effort=planner_reasoning_effort,
         timeout_override_sec=effective_timeout_sec,
     )
     parsed = _extract_json_payload(planner_raw)

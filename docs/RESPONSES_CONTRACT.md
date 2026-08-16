@@ -424,6 +424,7 @@ Required session controls are hard requirements only after Ollmo has applied saf
 
 Safe defaults:
 
+- `reasoning_effort` uses the actual local target model's advertised default when omitted; explicit Off remains Off, and unsupported non-Off values are rejected.
 - `tts_voice` may use `default_first_option` when a backend exposes a speaker list.
 - generic `tts_instruct` may default to `Use a natural, conversational voice.` for text-to-speech when no stricter voice description is present.
 

@@ -7,6 +7,7 @@ import logging
 import socket
 import datetime as dt
 import hashlib
+import hmac
 import secrets
 import re
 from collections import Counter
@@ -469,6 +470,56 @@ ARTIFACT_REGISTRY_LEDGER = DEFAULT_ARTIFACT_REGISTRY_LEDGER
 INFER_SLOT_TTL_SEC = 1800
 RESPONSE_LOOKUP_TTL_SEC = 1800
 MAX_PDF_INLINE_RESPONSE_CHARS = 400_000
+
+
+def _bounded_environment_integer(
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+SAVED_HTML_PREVIEW_TTL_SECONDS = _bounded_environment_integer(
+    'OLLMO_HTML_PREVIEW_TTL_SECONDS',
+    default=1800,
+    minimum=60,
+    maximum=86400,
+)
+SAVED_HTML_PREVIEW_MAX_PACKAGES = _bounded_environment_integer(
+    'OLLMO_HTML_PREVIEW_MAX_PACKAGES',
+    default=24,
+    minimum=1,
+    maximum=128,
+)
+SAVED_HTML_PREVIEW_MAX_FILES = _bounded_environment_integer(
+    'OLLMO_HTML_PREVIEW_MAX_FILES',
+    default=64,
+    minimum=1,
+    maximum=512,
+)
+SAVED_HTML_PREVIEW_MAX_PACKAGE_BYTES = _bounded_environment_integer(
+    'OLLMO_HTML_PREVIEW_MAX_PACKAGE_BYTES',
+    default=256 * 1024 * 1024,
+    minimum=1024 * 1024,
+    maximum=2 * 1024 * 1024 * 1024,
+)
+SAVED_HTML_PREVIEW_MAX_TOTAL_BYTES = _bounded_environment_integer(
+    'OLLMO_HTML_PREVIEW_MAX_TOTAL_BYTES',
+    default=512 * 1024 * 1024,
+    minimum=1024 * 1024,
+    maximum=4 * 1024 * 1024 * 1024,
+)
+_SAVED_HTML_PREVIEW_TEMP_DIR = tempfile.TemporaryDirectory(prefix='ollmo-html-preview-')
+_SAVED_HTML_PREVIEW_TEMP_ROOT = Path(_SAVED_HTML_PREVIEW_TEMP_DIR.name).resolve()
+_SAVED_HTML_PREVIEW_PACKAGES: dict[str, dict[str, Any]] = {}
+_SAVED_HTML_PREVIEW_PACKAGES_LOCK = threading.RLock()
 _INFER_INFLIGHT: dict[str, float] = {}
 _INFER_INFLIGHT_LOCK = threading.Lock()
 _RESPONSE_LOOKUP: dict[str, dict[str, Any]] = {}
@@ -9033,6 +9084,78 @@ def _response_artifact_bundle_requires_canonical_payload(payload: Mapping[str, A
     return any(key in omitted for key in ('artifacts_tail', 'outputs_tail'))
 
 
+def _load_response_artifact_bundle_source_payload(
+    response_id: str,
+    *,
+    hydrate_registry: bool = True,
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], int]:
+    """Load exact response-owned artifact truth without creating bundle state."""
+    record, error, status_code = _get_bounded_response_lookup_record(response_id)
+    if error:
+        public_error = 'Response not found.'
+        if error.get('code') and error.get('code') != 'response_frame_not_found':
+            public_error = error.get('message') or public_error
+        return None, {'error': public_error, 'error_detail': error}, status_code
+    if not record:
+        return None, {'error': 'Response not found.'}, 404
+
+    bounded_payload = (
+        copy.deepcopy(record.get('response_payload'))
+        if isinstance(record.get('response_payload'), Mapping)
+        else {}
+    )
+    if not bounded_payload:
+        return None, {'error': 'Response has no artifact payload to bundle.'}, 409
+    if _response_artifact_bundle_requires_canonical_payload(bounded_payload):
+        expected_frame_identity = _response_wire_frame_identity(bounded_payload)
+        if expected_frame_identity is None:
+            return None, {
+                'error': 'Exact response artifact truth cannot be bound to a frozen frame.',
+                'error_detail': {
+                    'code': 'response_artifact_bundle_frame_binding_missing',
+                },
+            }, 409
+        canonical_state = _load_latest_response_state(
+            _normalize_response_lookup_id(response_id),
+            frames_dir=RESPONSE_FRAMES_DIR,
+        )
+        canonical_payload = (
+            canonical_state.get('response_payload')
+            if isinstance(canonical_state.get('response_payload'), Mapping)
+            else None
+        )
+        if canonical_state.get('ok') is not True or not canonical_payload:
+            return None, {
+                'error': 'Exact response artifact truth is unavailable for complete bundling.',
+                'error_detail': canonical_state.get('error') or {
+                    'code': 'response_artifact_bundle_exact_truth_unavailable',
+                },
+            }, 409
+        canonical_frame_identity = _response_wire_frame_identity(canonical_payload)
+        if canonical_frame_identity != expected_frame_identity:
+            return None, {
+                'error': 'Response artifact truth changed before complete bundling.',
+                'error_detail': {
+                    'code': 'response_artifact_bundle_frame_binding_mismatch',
+                    'expected_frame_id': expected_frame_identity[0],
+                    'expected_frame_sequence': expected_frame_identity[1],
+                    'canonical_frame_id': canonical_frame_identity[0]
+                    if canonical_frame_identity
+                    else None,
+                    'canonical_frame_sequence': canonical_frame_identity[1]
+                    if canonical_frame_identity
+                    else None,
+                },
+            }, 409
+        bounded_payload = copy.deepcopy(dict(canonical_payload))
+    response_payload = (
+        _hydrate_bundle_payload_artifacts_from_registry(bounded_payload)
+        if hydrate_registry
+        else bounded_payload
+    )
+    return response_payload, None, 200
+
+
 def _persist_response_artifact_bundle_record(bundle_payload: Mapping[str, Any]) -> None:
     record = _build_response_artifact_bundle_registry_record(bundle_payload)
     _persist_artifact_registry_record(record, ledger_path=ARTIFACT_REGISTRY_LEDGER)
@@ -9233,6 +9356,7 @@ def _stream_chat_backend_as_responses(
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
     route_payload: Optional[dict[str, Any]] = None,
     response_id: Optional[str] = None,
     request_payload: Optional[dict[str, Any]] = None,
@@ -9249,6 +9373,7 @@ def _stream_chat_backend_as_responses(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
         route_payload=route_payload,
         response_id=response_id,
         request_payload=request_payload,
@@ -10017,6 +10142,287 @@ _SAVED_VIEWABLE_ARTIFACT_PATH_ERROR = (
     "artifacts/ocr/, artifacts/transcripts/, artifacts/documents/, artifacts/settings/, "
     "artifacts/inputs/, or artifacts/bundles/ are allowed."
 )
+_SAVED_INTERACTIVE_PREVIEW_PATH_ERROR = (
+    "Invalid HTML preview path. Only existing HTML files under Ollmo artifact roots are allowed."
+)
+_SAVED_INTERACTIVE_PREVIEW_TOKEN_VERSION = b'v1'
+_SAVED_INTERACTIVE_PREVIEW_SIGNING_KEY = secrets.token_bytes(32)
+
+
+def _saved_html_preview_temp_subdir(name: str) -> Path:
+    root = Path(_SAVED_HTML_PREVIEW_TEMP_ROOT).expanduser().resolve(strict=False)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = (root / name).resolve(strict=False)
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return target
+
+
+def _delete_saved_html_preview_package_path(raw_path: Any) -> None:
+    try:
+        path = Path(str(raw_path or '')).expanduser().resolve(strict=False)
+        packages_root = _saved_html_preview_temp_subdir('packages')
+    except (OSError, ValueError):
+        return
+    if path == packages_root or not is_path_within(path, packages_root):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _retire_saved_html_preview_package(
+    preview_id: str,
+    expected_path: str,
+    *,
+    reason: str,
+) -> None:
+    delete_path = ''
+    with _SAVED_HTML_PREVIEW_PACKAGES_LOCK:
+        record = _SAVED_HTML_PREVIEW_PACKAGES.get(preview_id)
+        if not isinstance(record, Mapping):
+            return
+        if str(record.get('bundle_path') or '') != str(expected_path or ''):
+            return
+        record['retire_reason'] = reason
+        if int(record.get('lease_count') or 0) <= 0:
+            _SAVED_HTML_PREVIEW_PACKAGES.pop(preview_id, None)
+            timer = record.get('timer')
+            if isinstance(timer, threading.Timer):
+                timer.cancel()
+            delete_path = str(record.get('bundle_path') or '')
+    if delete_path:
+        _delete_saved_html_preview_package_path(delete_path)
+
+
+def _expire_saved_html_preview_package(preview_id: str, expected_path: str) -> None:
+    _retire_saved_html_preview_package(
+        preview_id,
+        expected_path,
+        reason='absolute_ttl_expired',
+    )
+
+
+def _saved_html_preview_package_for_root(base_root: Path) -> tuple[str, Optional[dict[str, Any]]]:
+    resolved_root = base_root.resolve(strict=False)
+    packages_root = _saved_html_preview_temp_subdir('packages')
+    if not is_path_within(resolved_root, packages_root):
+        return '', None
+    now = time.monotonic()
+    expired: tuple[str, str] | None = None
+    with _SAVED_HTML_PREVIEW_PACKAGES_LOCK:
+        for preview_id, record in _SAVED_HTML_PREVIEW_PACKAGES.items():
+            if str(record.get('bundle_path') or '') != str(resolved_root):
+                continue
+            if record.get('retire_reason'):
+                return preview_id, None
+            if now >= float(record.get('expires_at_monotonic') or 0.0):
+                expired = (preview_id, str(record.get('bundle_path') or ''))
+                break
+            return preview_id, record
+    if expired:
+        _expire_saved_html_preview_package(*expired)
+        return expired[0], None
+    return 'unregistered', None
+
+
+def _acquire_saved_html_preview_package_lease(base_root: Path) -> tuple[bool, Optional[str]]:
+    preview_id, record = _saved_html_preview_package_for_root(base_root)
+    if not preview_id:
+        return False, None
+    if not isinstance(record, Mapping):
+        return True, None
+    expired: tuple[str, str] | None = None
+    with _SAVED_HTML_PREVIEW_PACKAGES_LOCK:
+        current = _SAVED_HTML_PREVIEW_PACKAGES.get(preview_id)
+        if not isinstance(current, dict) or current.get('retire_reason'):
+            return True, None
+        if time.monotonic() >= float(current.get('expires_at_monotonic') or 0.0):
+            expired = (preview_id, str(current.get('bundle_path') or ''))
+        else:
+            current['lease_count'] = int(current.get('lease_count') or 0) + 1
+            current['last_access_monotonic'] = time.monotonic()
+    if expired:
+        _expire_saved_html_preview_package(*expired)
+        return True, None
+    return True, preview_id
+
+
+def _release_saved_html_preview_package_lease(preview_id: str) -> None:
+    delete_path = ''
+    with _SAVED_HTML_PREVIEW_PACKAGES_LOCK:
+        record = _SAVED_HTML_PREVIEW_PACKAGES.get(preview_id)
+        if not isinstance(record, dict):
+            return
+        record['lease_count'] = max(0, int(record.get('lease_count') or 0) - 1)
+        if record.get('retire_reason') and int(record.get('lease_count') or 0) == 0:
+            _SAVED_HTML_PREVIEW_PACKAGES.pop(preview_id, None)
+            timer = record.get('timer')
+            if isinstance(timer, threading.Timer):
+                timer.cancel()
+            delete_path = str(record.get('bundle_path') or '')
+    if delete_path:
+        _delete_saved_html_preview_package_path(delete_path)
+
+
+def _saved_html_preview_source_fingerprints(
+    copied_artifacts: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    fingerprints: list[dict[str, Any]] = []
+    for artifact in copied_artifacts:
+        source_path = str(artifact.get('source_path') or '').strip()
+        if not source_path:
+            continue
+        source = Path(source_path).expanduser().resolve(strict=False)
+        fingerprints.append(
+            {
+                'path': str(source),
+                'size_bytes': source.stat().st_size,
+                'sha256': _hash_file_sha256(source),
+            }
+        )
+    return sorted(fingerprints, key=lambda item: item['path'])
+
+
+def _create_response_bound_saved_html_preview_package(
+    response_id: str,
+    source_path: Path,
+) -> tuple[Optional[Path], Optional[dict[str, Any]], int]:
+    response_payload, error_payload, status_code = _load_response_artifact_bundle_source_payload(
+        response_id,
+        hydrate_registry=False,
+    )
+    if error_payload or response_payload is None:
+        return None, error_payload or {'error': 'Response artifact truth is unavailable.'}, status_code
+
+    staging_root = _saved_html_preview_temp_subdir('staging')
+    packages_root = _saved_html_preview_temp_subdir('packages')
+    staging_dir = Path(tempfile.mkdtemp(prefix='preview-', dir=staging_root)).resolve()
+    final_dir: Optional[Path] = None
+    try:
+        bundle_payload = _bundle_response_artifacts(
+            response_payload,
+            target_name=f'preview-{secrets.token_hex(6)}',
+            bundle_root=staging_dir,
+            required_public_source_path=source_path,
+            require_public_output_surface=True,
+            allow_unregistered_linked_dependencies=False,
+            max_artifact_count=SAVED_HTML_PREVIEW_MAX_FILES,
+            max_total_source_bytes=min(
+                SAVED_HTML_PREVIEW_MAX_PACKAGE_BYTES,
+                SAVED_HTML_PREVIEW_MAX_TOTAL_BYTES,
+            ),
+        )
+        bundle_dir = Path(str(bundle_payload.get('bundle_path') or '')).resolve(strict=False)
+        copied_artifacts = [
+            item
+            for item in (bundle_payload.get('copied_artifacts') or [])
+            if isinstance(item, Mapping)
+        ]
+        requested_source = source_path.resolve(strict=False)
+        selected_relative_path = ''
+        for artifact in copied_artifacts:
+            raw_source = str(artifact.get('source_path') or '').strip()
+            raw_copied = str(artifact.get('path') or '').strip()
+            if not raw_source or not raw_copied:
+                continue
+            if Path(raw_source).expanduser().resolve(strict=False) != requested_source:
+                continue
+            selected_relative_path = Path(raw_copied).resolve(strict=False).relative_to(
+                bundle_dir
+            ).as_posix()
+            break
+        if not selected_relative_path:
+            raise ValueError('The requested HTML artifact was not copied into the preview package.')
+        manifest_path = bundle_dir / 'manifest.json'
+        if manifest_path.exists():
+            manifest_path.unlink()
+        source_fingerprints = _saved_html_preview_source_fingerprints(copied_artifacts)
+        preview_id = secrets.token_urlsafe(18)
+        final_dir = (packages_root / preview_id).resolve(strict=False)
+        while final_dir.exists():
+            preview_id = secrets.token_urlsafe(18)
+            final_dir = (packages_root / preview_id).resolve(strict=False)
+        os.replace(bundle_dir, final_dir)
+        selected_path = (final_dir / selected_relative_path).resolve(strict=False)
+        package_size = sum(
+            path.stat().st_size
+            for path in final_dir.rglob('*')
+            if path.is_file()
+        )
+        if package_size > SAVED_HTML_PREVIEW_MAX_PACKAGE_BYTES:
+            raise ValueError('The generated preview package exceeds the preview byte limit.')
+        now = time.monotonic()
+        frame_identity = _response_wire_frame_identity(response_payload)
+        record: dict[str, Any] = {
+            'preview_id': preview_id,
+            'response_id': _normalize_response_lookup_id(response_id),
+            'frame_id': frame_identity[0] if frame_identity else None,
+            'frame_sequence': frame_identity[1] if frame_identity else None,
+            'source_path': str(requested_source),
+            'source_fingerprints': source_fingerprints,
+            'bundle_path': str(final_dir),
+            'selected_path': str(selected_path),
+            'size_bytes': package_size,
+            'created_at_monotonic': now,
+            'last_access_monotonic': now,
+            'expires_at_monotonic': now + SAVED_HTML_PREVIEW_TTL_SECONDS,
+            'lease_count': 0,
+            'retire_reason': None,
+        }
+        timer = threading.Timer(
+            SAVED_HTML_PREVIEW_TTL_SECONDS,
+            _expire_saved_html_preview_package,
+            args=(preview_id, str(final_dir)),
+        )
+        timer.daemon = True
+        record['timer'] = timer
+
+        delete_paths: list[str] = []
+        keep_new_package = True
+        with _SAVED_HTML_PREVIEW_PACKAGES_LOCK:
+            _SAVED_HTML_PREVIEW_PACKAGES[preview_id] = record
+            while (
+                len(_SAVED_HTML_PREVIEW_PACKAGES) > SAVED_HTML_PREVIEW_MAX_PACKAGES
+                or sum(
+                    int(item.get('size_bytes') or 0)
+                    for item in _SAVED_HTML_PREVIEW_PACKAGES.values()
+                ) > SAVED_HTML_PREVIEW_MAX_TOTAL_BYTES
+            ):
+                candidates = [
+                    (key, item)
+                    for key, item in _SAVED_HTML_PREVIEW_PACKAGES.items()
+                    if key != preview_id and int(item.get('lease_count') or 0) == 0
+                ]
+                if not candidates:
+                    keep_new_package = False
+                    removed = _SAVED_HTML_PREVIEW_PACKAGES.pop(preview_id, None)
+                    if isinstance(removed, Mapping):
+                        delete_paths.append(str(removed.get('bundle_path') or ''))
+                    break
+                victim_id, victim = min(
+                    candidates,
+                    key=lambda pair: float(pair[1].get('last_access_monotonic') or 0.0),
+                )
+                _SAVED_HTML_PREVIEW_PACKAGES.pop(victim_id, None)
+                victim_timer = victim.get('timer')
+                if isinstance(victim_timer, threading.Timer):
+                    victim_timer.cancel()
+                delete_paths.append(str(victim.get('bundle_path') or ''))
+        for delete_path in delete_paths:
+            _delete_saved_html_preview_package_path(delete_path)
+        if not keep_new_package:
+            return None, {'error': 'HTML preview capacity is currently in use.'}, 503
+        timer.start()
+        return selected_path, None, 200
+    except ValueError as exc:
+        if final_dir is not None:
+            _delete_saved_html_preview_package_path(final_dir)
+        return None, {'error': str(exc)}, 409
+    except OSError as exc:
+        logging.exception('Could not create temporary HTML preview package: %s', exc)
+        if final_dir is not None:
+            _delete_saved_html_preview_package_path(final_dir)
+        return None, {'error': 'Temporary HTML preview package could not be created.'}, 500
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _resolve_saved_artifact_request_path(raw_path: str, *, resolver, invalid_error: str):
@@ -10100,6 +10506,107 @@ def _saved_artifact_preview_base_href(resolved: Path) -> str:
     return prefix
 
 
+def _saved_artifact_interactive_preview_base_root_for_path(resolved: Path) -> Path:
+    """Scope a preview to one portable bundle or one source-artifact directory."""
+    resolved_path = resolved.resolve(strict=False)
+    temp_packages_root = _saved_html_preview_temp_subdir('packages')
+    if is_path_within(resolved_path, temp_packages_root):
+        try:
+            relative = resolved_path.relative_to(temp_packages_root)
+        except ValueError:
+            relative = Path()
+        if relative.parts:
+            package_root = (temp_packages_root / relative.parts[0]).resolve(strict=False)
+            _preview_id, record = _saved_html_preview_package_for_root(package_root)
+            if package_root.is_dir() and isinstance(record, Mapping):
+                return package_root
+        raise ValueError('Temporary HTML preview package is unavailable or expired.')
+    bundles_root = Path(ARTIFACT_BUNDLES_DIR).expanduser().resolve(strict=False)
+    if is_path_within(resolved_path, bundles_root):
+        try:
+            relative = resolved_path.relative_to(bundles_root)
+        except ValueError:
+            relative = Path()
+        if relative.parts:
+            bundle_root = (bundles_root / relative.parts[0]).resolve(strict=False)
+            if bundle_root.is_dir():
+                return bundle_root
+    for artifact_root in _saved_viewable_artifact_roots():
+        if resolved_path.parent == artifact_root.resolve(strict=False):
+            raise ValueError(
+                'Flat artifact roots are not an interactive preview capability boundary.'
+            )
+    return resolved_path.parent
+
+
+def _encode_saved_artifact_interactive_preview_base_root(base_root: Path) -> str:
+    root_bytes = str(base_root.resolve(strict=False)).encode('utf-8')
+    payload = _SAVED_INTERACTIVE_PREVIEW_TOKEN_VERSION + b'\0' + root_bytes
+    signature = hmac.new(
+        _SAVED_INTERACTIVE_PREVIEW_SIGNING_KEY,
+        payload,
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(payload + b'\0' + signature).decode('ascii').rstrip('=')
+
+
+def _decode_saved_artifact_interactive_preview_base_root(token: str) -> Optional[Path]:
+    cleaned = str(token or '').strip()
+    if not cleaned:
+        return None
+    try:
+        padded = cleaned + ('=' * (-len(cleaned) % 4))
+        decoded = base64.urlsafe_b64decode(padded.encode('ascii'))
+        if len(decoded) <= hashlib.sha256().digest_size:
+            return None
+        signature = decoded[-hashlib.sha256().digest_size:]
+        signed_payload = decoded[:-hashlib.sha256().digest_size]
+        if not signed_payload.endswith(b'\0'):
+            return None
+        payload = signed_payload[:-1]
+        expected = hmac.new(
+            _SAVED_INTERACTIVE_PREVIEW_SIGNING_KEY,
+            payload,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        version, root_bytes = payload.split(b'\0', 1)
+        if version != _SAVED_INTERACTIVE_PREVIEW_TOKEN_VERSION:
+            return None
+        base_root = Path(root_bytes.decode('utf-8')).expanduser().resolve(strict=False)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not base_root.exists() or not base_root.is_dir():
+        return None
+    return base_root
+
+
+def _saved_artifact_interactive_preview_urls(
+    resolved: Path,
+    *,
+    base_token: str | None = None,
+) -> tuple[str, str]:
+    base_root = (
+        _decode_saved_artifact_interactive_preview_base_root(base_token)
+        if base_token
+        else _saved_artifact_interactive_preview_base_root_for_path(resolved)
+    )
+    if base_root is None or not is_path_within(resolved.resolve(strict=False), base_root):
+        raise ValueError('HTML preview path is outside its signed artifact base.')
+    token = base_token or _encode_saved_artifact_interactive_preview_base_root(base_root)
+    route_prefix = f'/api/preview_saved_artifact_assets/{quote(token, safe="")}/'
+    try:
+        relative_file = resolved.resolve(strict=False).relative_to(base_root).as_posix().strip('/')
+    except ValueError as exc:
+        raise ValueError('HTML preview path is outside its signed artifact base.') from exc
+    if not relative_file:
+        raise ValueError('HTML preview path does not identify a file inside its signed artifact base.')
+    base_href = f'{route_prefix}{quote(relative_file, safe="/")}'
+    absolute_asset_prefix = f'{request.url_root.rstrip("/")}{route_prefix}'
+    return base_href, absolute_asset_prefix
+
+
 def _inject_saved_artifact_preview_base(html_text: str, *, base_href: str) -> str:
     base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
     head_match = re.search(r'<head\b[^>]*>', html_text, flags=re.IGNORECASE)
@@ -10125,6 +10632,84 @@ def _html_saved_artifact_preview_response(resolved: Path, *, mimetype: str):
     return response
 
 
+def _apply_saved_artifact_interactive_preview_headers(response, *, asset_prefix: str):
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'none'; "
+        f"img-src {asset_prefix} data: blob:; "
+        f"style-src {asset_prefix} 'unsafe-inline' data:; "
+        f"script-src {asset_prefix} 'unsafe-inline'; "
+        f"connect-src {asset_prefix}; "
+        f"font-src {asset_prefix} data:; "
+        f"media-src {asset_prefix} data: blob:; "
+        "object-src 'none'; frame-src 'none'; worker-src 'none'; "
+        f"base-uri {asset_prefix}; "
+        "form-action 'none'; frame-ancestors 'self'; "
+        "sandbox allow-scripts allow-top-navigation-to-custom-protocols"
+    )
+    response.headers['Permissions-Policy'] = (
+        'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), midi=()'
+    )
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    return response
+
+
+def _html_saved_artifact_interactive_preview_wrapper_response(resolved: Path):
+    frame_src, asset_prefix = _saved_artifact_interactive_preview_urls(resolved)
+    escaped_frame_src = html_lib.escape(frame_src, quote=True)
+    escaped_title_text = html_lib.escape(resolved.name, quote=False)
+    escaped_title_attribute = html_lib.escape(resolved.name, quote=True)
+    body = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<title>Preview — {escaped_title_text}</title>'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>html,body,iframe{width:100%;height:100%;margin:0;border:0}'
+        'body{overflow:hidden;background:#111}iframe{display:block}</style>'
+        '</head><body>'
+        f'<iframe src="{escaped_frame_src}" '
+        'sandbox="allow-scripts allow-top-navigation-to-custom-protocols" '
+        f'title="Preview of {escaped_title_attribute}" referrerpolicy="no-referrer"></iframe>'
+        '</body></html>'
+    )
+    response = Response(body, mimetype='text/html')
+    response.headers.set('Content-Disposition', 'inline', filename=resolved.name)
+    response.headers['Content-Security-Policy'] = (
+        f"default-src 'none'; style-src 'unsafe-inline'; frame-src {asset_prefix}; "
+        "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+    )
+    response.headers['Permissions-Policy'] = (
+        'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), midi=()'
+    )
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    return response
+
+
+def _html_saved_artifact_interactive_preview_response(
+    resolved: Path,
+    *,
+    mimetype: str,
+    base_token: str | None = None,
+):
+    try:
+        html_text = resolved.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        html_text = resolved.read_text(encoding='utf-8', errors='replace')
+    base_href, asset_prefix = _saved_artifact_interactive_preview_urls(
+        resolved,
+        base_token=base_token,
+    )
+    body = _inject_saved_artifact_preview_base(html_text, base_href=base_href)
+    response = Response(body, mimetype=mimetype or 'text/html')
+    response.headers.set('Content-Disposition', 'inline', filename=resolved.name)
+    return _apply_saved_artifact_interactive_preview_headers(
+        response,
+        asset_prefix=asset_prefix,
+    )
+
+
 def _resolve_saved_artifact_preview_asset_path(base_token: str, asset_path: str) -> Optional[Path]:
     base_root = _decode_saved_artifact_preview_base_root(base_token)
     if base_root is None:
@@ -10137,7 +10722,7 @@ def _resolve_saved_artifact_preview_asset_path(base_token: str, asset_path: str)
         return None
     try:
         candidate = (base_root / unquote(parsed.path)).resolve(strict=False)
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not candidate.exists() or not candidate.is_file():
         return None
@@ -10145,6 +10730,69 @@ def _resolve_saved_artifact_preview_asset_path(base_token: str, asset_path: str)
     if not any(is_path_within(candidate, root) for root in allowed_roots):
         return None
     return candidate
+
+
+def _resolve_saved_artifact_interactive_preview_asset_path(
+    base_token: str,
+    asset_path: str,
+) -> Optional[Path]:
+    base_root = _decode_saved_artifact_interactive_preview_base_root(base_token)
+    if base_root is None:
+        return None
+    raw_asset_path = str(asset_path or '').strip()
+    if not raw_asset_path:
+        return None
+    parsed = urlparse(raw_asset_path)
+    if parsed.scheme or parsed.netloc:
+        return None
+    try:
+        candidate = (base_root / unquote(parsed.path)).resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+    if not is_path_within(candidate, base_root):
+        return None
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    in_saved_root = any(
+        is_path_within(candidate, root)
+        for root in _saved_viewable_artifact_roots()
+    )
+    temp_preview_id, temp_record = _saved_html_preview_package_for_root(base_root)
+    in_active_temp_package = bool(temp_preview_id and isinstance(temp_record, Mapping))
+    if not in_saved_root and not in_active_temp_package:
+        return None
+    return candidate
+
+
+def _send_saved_artifact_interactive_preview_asset_response(
+    resolved: Path,
+    *,
+    base_token: str,
+):
+    mimetype, _ = mimetypes.guess_type(str(resolved))
+    normalized_mimetype = str(mimetype or '').split(';', 1)[0].strip().lower()
+    if (
+        normalized_mimetype in {'text/html', 'application/xhtml+xml'}
+        or resolved.suffix.lower() in {'.html', '.htm'}
+    ):
+        response = _html_saved_artifact_interactive_preview_response(
+            resolved,
+            mimetype=mimetype or 'text/html',
+            base_token=base_token,
+        )
+    else:
+        response = send_file(
+            str(resolved),
+            as_attachment=False,
+            download_name=resolved.name,
+            mimetype=mimetype or 'application/octet-stream',
+        )
+        response.headers['Content-Security-Policy'] = "sandbox; default-src 'none'"
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Cross-Origin-Resource-Policy'] = 'cross-origin'
+    return response
 
 
 def _apply_saved_artifact_html_security_headers(response):
@@ -10204,6 +10852,7 @@ def _openai_chat_completions(
     timeout_sec: int = 600,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> dict:
     if backend == 'mlx':
         return _mlx_chat_completions(
@@ -10213,6 +10862,7 @@ def _openai_chat_completions(
             timeout_sec=timeout_sec,
             temperature=temperature,
             top_p=top_p,
+            reasoning_effort=reasoning_effort,
         )
     return _BACKEND_TRANSPORT_RUNTIME.openai_chat_completions(
         backend,
@@ -10222,6 +10872,7 @@ def _openai_chat_completions(
         timeout_sec=timeout_sec,
         temperature=temperature,
         top_p=top_p,
+        reasoning_effort=reasoning_effort,
     )
 
 # --- Routen / Endpunkte ---
@@ -10492,6 +11143,42 @@ def api_view_saved_artifact():
     return _send_saved_artifact_file_response(resolved, as_attachment=False)
 
 
+@app.route('/api/preview_saved_artifact', methods=['GET'])
+def api_preview_saved_artifact():
+    resolved, error_response = _resolve_saved_artifact_request_path(
+        request.args.get("path"),
+        resolver=_resolve_saved_viewable_artifact_path,
+        invalid_error=_SAVED_INTERACTIVE_PREVIEW_PATH_ERROR,
+    )
+    if error_response:
+        return error_response
+    mimetype, _ = mimetypes.guess_type(str(resolved))
+    normalized_mimetype = str(mimetype or '').split(';', 1)[0].strip().lower()
+    if (
+        normalized_mimetype not in {'text/html', 'application/xhtml+xml'}
+        and resolved.suffix.lower() not in {'.html', '.htm'}
+    ):
+        return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 400
+    try:
+        return _html_saved_artifact_interactive_preview_wrapper_response(resolved)
+    except ValueError:
+        raw_response_id = str(request.args.get('response_id') or '').strip()
+        if not raw_response_id:
+            return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 400
+        response_id = _normalize_response_lookup_id(raw_response_id)
+        preview_path, preview_error, status_code = (
+            _create_response_bound_saved_html_preview_package(response_id, resolved)
+        )
+        if preview_error or preview_path is None:
+            return jsonify(
+                preview_error or {"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}
+            ), status_code
+        try:
+            return _html_saved_artifact_interactive_preview_wrapper_response(preview_path)
+        except ValueError:
+            return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 400
+
+
 @app.route('/api/view_saved_artifact_assets/<base_token>/', defaults={'asset_path': ''}, methods=['GET'])
 @app.route('/api/view_saved_artifact_assets/<base_token>/<path:asset_path>', methods=['GET'])
 def api_view_saved_artifact_asset(base_token: str, asset_path: str):
@@ -10499,6 +11186,43 @@ def api_view_saved_artifact_asset(base_token: str, asset_path: str):
     if not resolved:
         return jsonify({"error": _SAVED_VIEWABLE_ARTIFACT_PATH_ERROR}), 404
     return _send_saved_artifact_file_response(resolved, as_attachment=False)
+
+
+@app.route('/api/preview_saved_artifact_assets/<base_token>/', defaults={'asset_path': ''}, methods=['GET'])
+@app.route('/api/preview_saved_artifact_assets/<base_token>/<path:asset_path>', methods=['GET'])
+def api_preview_saved_artifact_asset(base_token: str, asset_path: str):
+    base_root = _decode_saved_artifact_interactive_preview_base_root(base_token)
+    if base_root is None:
+        return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 404
+    is_temporary, lease_id = _acquire_saved_html_preview_package_lease(base_root)
+    if is_temporary and not lease_id:
+        return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 404
+    resolved = _resolve_saved_artifact_interactive_preview_asset_path(base_token, asset_path)
+    if not resolved:
+        if lease_id:
+            _release_saved_html_preview_package_lease(lease_id)
+        return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 404
+    try:
+        response = _send_saved_artifact_interactive_preview_asset_response(
+            resolved,
+            base_token=base_token,
+        )
+    except ValueError:
+        if lease_id:
+            _release_saved_html_preview_package_lease(lease_id)
+        return jsonify({"error": _SAVED_INTERACTIVE_PREVIEW_PATH_ERROR}), 404
+    except Exception:
+        if lease_id:
+            _release_saved_html_preview_package_lease(lease_id)
+        raise
+    if lease_id:
+        # Flask's send_file responses use direct passthrough, which bypasses
+        # Response.close() and therefore its registered lease callback.
+        response.direct_passthrough = False
+        response.call_on_close(
+            lambda: _release_saved_html_preview_package_lease(lease_id)
+        )
+    return response
 
 
 @app.route('/api/delete_saved_artifact', methods=['POST'])
@@ -11839,67 +12563,15 @@ def api_responses_get(response_id: str):
 
 @app.route('/api/responses/<response_id>/bundle_artifacts', methods=['POST'])
 def api_responses_bundle_artifacts(response_id: str):
-    record, error, status_code = _get_bounded_response_lookup_record(response_id)
-    if error:
-        public_error = 'Response not found.'
-        if error.get('code') and error.get('code') != 'response_frame_not_found':
-            public_error = error.get('message') or public_error
-        return jsonify({'error': public_error, 'error_detail': error}), status_code
-    if not record:
-        return jsonify({'error': 'Response not found.'}), 404
-
     data = request.get_json(silent=True) or {}
     target_name = str(data.get('target_name') or '').strip() or None
-    bounded_payload = (
-        copy.deepcopy(record.get('response_payload'))
-        if isinstance(record.get('response_payload'), Mapping)
-        else {}
+    response_payload, error_payload, status_code = _load_response_artifact_bundle_source_payload(
+        response_id
     )
-    if not bounded_payload:
+    if error_payload:
+        return jsonify(error_payload), status_code
+    if response_payload is None:
         return jsonify({'error': 'Response has no artifact payload to bundle.'}), 409
-    if _response_artifact_bundle_requires_canonical_payload(bounded_payload):
-        expected_frame_identity = _response_wire_frame_identity(bounded_payload)
-        if expected_frame_identity is None:
-            return jsonify({
-                'error': 'Exact response artifact truth cannot be bound to a frozen frame.',
-                'error_detail': {
-                    'code': 'response_artifact_bundle_frame_binding_missing',
-                },
-            }), 409
-        canonical_state = _load_latest_response_state(
-            _normalize_response_lookup_id(response_id),
-            frames_dir=RESPONSE_FRAMES_DIR,
-        )
-        canonical_payload = (
-            canonical_state.get('response_payload')
-            if isinstance(canonical_state.get('response_payload'), Mapping)
-            else None
-        )
-        if canonical_state.get('ok') is not True or not canonical_payload:
-            return jsonify({
-                'error': 'Exact response artifact truth is unavailable for complete bundling.',
-                'error_detail': canonical_state.get('error') or {
-                    'code': 'response_artifact_bundle_exact_truth_unavailable',
-                },
-            }), 409
-        canonical_frame_identity = _response_wire_frame_identity(canonical_payload)
-        if canonical_frame_identity != expected_frame_identity:
-            return jsonify({
-                'error': 'Response artifact truth changed before complete bundling.',
-                'error_detail': {
-                    'code': 'response_artifact_bundle_frame_binding_mismatch',
-                    'expected_frame_id': expected_frame_identity[0],
-                    'expected_frame_sequence': expected_frame_identity[1],
-                    'canonical_frame_id': canonical_frame_identity[0]
-                    if canonical_frame_identity
-                    else None,
-                    'canonical_frame_sequence': canonical_frame_identity[1]
-                    if canonical_frame_identity
-                    else None,
-                },
-            }), 409
-        bounded_payload = copy.deepcopy(dict(canonical_payload))
-    response_payload = _hydrate_bundle_payload_artifacts_from_registry(bounded_payload)
     try:
         bundle_payload = _bundle_response_artifacts(
             response_payload,

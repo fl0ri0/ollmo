@@ -1374,6 +1374,28 @@ class PartialGraphRebaseDurableHandoffTests(unittest.TestCase):
         events = []
         scheduled_calls = []
         finalized = self._finalized_successor()
+        reasoning_control = {
+            'value': 'off',
+            'explicit': True,
+            'scope': 'model_instance',
+            'source_instance_id': 'chat-1',
+        }
+        request_meta = {'reasoning_effort_control': reasoning_control}
+        self.parent_payload['request']['request_meta'] = copy.deepcopy(
+            request_meta
+        )
+        self.parent_payload['response_frame']['request']['request_meta'] = (
+            copy.deepcopy(request_meta)
+        )
+        parent_observation = self._parent_observation_state()
+        parent_observation['response_payload']['request']['request_meta'] = (
+            copy.deepcopy(request_meta)
+        )
+        expected_successor_request = {
+            'prompt': self.root_prompt,
+            'request_meta': request_meta,
+            'reasoning_effort': 'off',
+        }
 
         def finalize(
             payload,
@@ -1385,7 +1407,7 @@ class PartialGraphRebaseDurableHandoffTests(unittest.TestCase):
         ):
             events.append('finalize')
             self.assertTrue(persist)
-            self.assertEqual(request_payload, {'prompt': self.root_prompt})
+            self.assertEqual(request_payload, expected_successor_request)
             self.assertEqual(expected_parent_frame_id, self.parent_frame_id)
             self.assertEqual(expected_parent_frame_sequence, 4)
             self.assertEqual(payload['frame_relation'], self.relation)
@@ -1421,7 +1443,7 @@ class PartialGraphRebaseDurableHandoffTests(unittest.TestCase):
             scheduled_calls.append(copy.deepcopy(kwargs))
             self.assertEqual(
                 kwargs['request_payload'],
-                {'prompt': self.root_prompt},
+                expected_successor_request,
             )
             self.assertEqual(kwargs['assistant_message'], '')
             frame_relation = kwargs['response_payload']['response_frame'][
@@ -1448,7 +1470,7 @@ class PartialGraphRebaseDurableHandoffTests(unittest.TestCase):
         ), patch.object(
             self.owner,
             'load_latest_response_observation_state',
-            return_value=self._parent_observation_state(),
+            return_value=parent_observation,
         ), patch.object(
             self.owner,
             'touch_response_lookup',

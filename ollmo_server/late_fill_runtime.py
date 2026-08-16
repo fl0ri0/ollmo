@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from helpers.session_controls import (
+    normalize_reasoning_effort,
+    resolve_reasoning_effort_for_instance,
+)
 from ollmo_g.control_hints import infer_tts_language_from_prompt
 from ollmo_core.inference import TEXT_ARTIFACT_EXTENSIONS, extract_text_artifact_payloads
 from ollmo_core.runtime_liveness import (
@@ -116,6 +120,76 @@ _TTS_STT_NEGATION_TOKENS = {
     'no',
     'not',
 }
+
+_REASONING_EFFORT_KEYS = ('reasoning_effort', 'reasoningEffort')
+
+
+def _retarget_model_scoped_reasoning_effort(
+    payload: Mapping[str, Any],
+    instance: Optional[dict[str, Any]],
+    *,
+    source_instance_id: str = '',
+) -> dict[str, Any]:
+    """Resolve inherited reasoning against the model that runs this branch."""
+
+    updated = dict(payload or {})
+    request_meta = (
+        updated.get('request_meta')
+        if isinstance(updated.get('request_meta'), Mapping)
+        else {}
+    )
+    reasoning_provenance = (
+        request_meta.get('reasoning_effort_control')
+        if isinstance(request_meta.get('reasoning_effort_control'), Mapping)
+        else {}
+    )
+    requested: Any = None
+    for key in _REASONING_EFFORT_KEYS:
+        if updated.get(key) not in (None, ''):
+            requested = updated.get(key)
+            break
+    if requested in (None, '') and reasoning_provenance.get('value') not in (None, ''):
+        requested = reasoning_provenance.get('value')
+    for key in _REASONING_EFFORT_KEYS:
+        updated.pop(key, None)
+
+    target = instance if isinstance(instance, dict) else {}
+    target_default = resolve_reasoning_effort_for_instance(None, target)
+    if target_default is None:
+        return updated
+
+    try:
+        normalized_requested = normalize_reasoning_effort(requested)
+    except ValueError:
+        normalized_requested = None
+    target_instance_id = str(target.get('instance_id') or '').strip()
+    if not source_instance_id:
+        source_instance_id = str(
+            reasoning_provenance.get('source_instance_id') or ''
+        ).strip()
+    same_instance = bool(
+        source_instance_id
+        and target_instance_id
+        and source_instance_id == target_instance_id
+    )
+
+    if normalized_requested == 'off':
+        resolved = 'off'
+    elif same_instance and normalized_requested is not None:
+        try:
+            resolved = resolve_reasoning_effort_for_instance(
+                normalized_requested,
+                target,
+            )
+        except ValueError:
+            resolved = target_default
+    else:
+        resolved = target_default
+    if resolved is not None:
+        updated['reasoning_effort'] = resolved
+    return updated
+
+
 _AUDIO_VARIANT_HEADER_RE = re.compile(
     r'^(?:audio\s*[- ]?\s*(?:version|variant|variante|fassung)|audiofassung|'
     r'spoken\s+(?:version|variant)|speech\s+(?:version|variant))\s*'
@@ -15823,6 +15897,15 @@ class LateFillRuntimeOwner:
             raise exc
 
         late_fill_instance = late_fill_route_info.get('instance') if isinstance(late_fill_route_info.get('instance'), dict) else {}
+        late_fill_request_payload = _retarget_model_scoped_reasoning_effort(
+            late_fill_request_payload,
+            late_fill_instance,
+            source_instance_id=str(
+                request_payload.get('instance_id')
+                or request_payload.get('instanceId')
+                or ''
+            ).strip(),
+        )
         if str(
             late_fill_instance.get('target_kind') or ''
         ).strip().lower() == 'external':
@@ -17920,6 +18003,27 @@ class LateFillRuntimeOwner:
                     ],
                 }
             successor_request_payload = {'prompt': current_root_prompt}
+            durable_request_meta = (
+                durable_request.get('request_meta')
+                if isinstance(durable_request.get('request_meta'), Mapping)
+                else {}
+            )
+            if durable_request_meta:
+                successor_request_payload['request_meta'] = dict(
+                    durable_request_meta
+                )
+                reasoning_provenance = (
+                    durable_request_meta.get('reasoning_effort_control')
+                    if isinstance(
+                        durable_request_meta.get('reasoning_effort_control'),
+                        Mapping,
+                    )
+                    else {}
+                )
+                if reasoning_provenance.get('value') not in (None, ''):
+                    successor_request_payload['reasoning_effort'] = (
+                        reasoning_provenance.get('value')
+                    )
 
             try:
                 finalized_successor = self.finalize_response_frame_payload(

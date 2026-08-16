@@ -515,8 +515,74 @@ class FrontendMessageStateTests(unittest.TestCase):
         self.assertIn('function copySavedArtifactContent', messages_source)
         self.assertIn("'<i class=\"fas fa-up-right-from-square\"></i> View'", messages_source)
         self.assertIn("'<i class=\"fas fa-copy\"></i> Copy'", messages_source)
-        self.assertIn("window.open(buildSavedArtifactViewUrl(savedArtifactPath)", messages_source)
+        self.assertIn('const canUseInteractivePreview = isHtmlArtifact && (htmlPreviewPath || responseId)', messages_source)
+        self.assertIn('htmlPreviewPath || savedArtifactPath', messages_source)
+        self.assertIn("htmlPreviewPath ? '' : responseId", messages_source)
+        self.assertIn(': buildSavedArtifactViewUrl(savedArtifactPath)', messages_source)
+        self.assertIn("window.open(targetUrl, '_blank', 'noopener,noreferrer')", messages_source)
         self.assertIn('copySavedArtifactContent(savedArtifactPath, copyArtifactButton)', messages_source)
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for frontend message-state tests")
+    def test_html_preview_mapping_prefers_exact_source_path_across_bundle_history(self):
+        script = r"""
+            const assert = require('assert');
+            const fs = require('fs');
+            const vm = require('vm');
+
+            const context = {
+              console,
+              window: {},
+              state: { flaskServerUrl: 'http://127.0.0.1:5001' },
+              elements: {},
+              normalizeCapability: (value) => String(value || '').trim().toLowerCase() || null,
+              normalizeBackend: (value) => String(value || '').trim().toLowerCase() || null,
+              basenameFromPath: (value) => String(value || '').split(/[\\/]/).filter(Boolean).pop() || '',
+            };
+            vm.createContext(context);
+            vm.runInContext(fs.readFileSync('static/ui/messages.js', 'utf8'), context);
+
+            const artifact = { artifact_ref: 'artifact:index', path: '/artifacts/documents/index.html' };
+            const message = {
+              artifactBundles: [
+                {
+                  bundle_id: 'older-exact',
+                  copied_artifacts: [
+                    {
+                      artifact_ref: 'artifact:index',
+                      source_path: '/artifacts/documents/index.html',
+                      path: '/artifacts/bundles/older/index.html',
+                    },
+                  ],
+                },
+                {
+                  bundle_id: 'newer-ref-alias',
+                  copied_artifacts: [
+                    {
+                      artifact_ref: 'artifact:index',
+                      source_path: '/artifacts/documents/other.html',
+                      path: '/artifacts/bundles/newer/other.html',
+                    },
+                  ],
+                },
+              ],
+            };
+
+            assert.strictEqual(
+              context.resolveArtifactHtmlPreviewPath(artifact, message, artifact.path),
+              '/artifacts/bundles/older/index.html'
+            );
+            assert.strictEqual(
+              context.buildSavedArtifactPreviewUrl(artifact.path, 'resp test'),
+              'http://127.0.0.1:5001/api/preview_saved_artifact?path=%2Fartifacts%2Fdocuments%2Findex.html&response_id=resp%20test'
+            );
+        """
+        subprocess.run(
+            ["node", "-e", textwrap.dedent(script)],
+            cwd=".",
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
     def test_ordered_artifact_rendering_preserves_streamed_preview_text(self):
         messages_source = Path("static/ui/messages.js").read_text()
@@ -564,7 +630,13 @@ class FrontendMessageStateTests(unittest.TestCase):
         self.assertIn('Bundle', messages_source)
         self.assertIn('appendResponseArtifactBundleCards', messages_source)
         self.assertIn('openSavedArtifactEntry', messages_source)
-        self.assertIn('open_file: true', messages_source)
+        self.assertIn('buildSavedArtifactPreviewUrl', messages_source)
+        self.assertIn("buildSavedArtifactUrl(savedPath, 'preview_saved_artifact')", messages_source)
+        self.assertIn('artifactIsHtmlLike', messages_source)
+        self.assertIn('resolveArtifactHtmlPreviewPath', messages_source)
+        self.assertIn('bundle.copied_artifacts', messages_source)
+        self.assertIn("buildSavedArtifactViewUrl(savedArtifactPath)", messages_source)
+        self.assertNotIn('open_file: true', messages_source)
         self.assertIn('Open Entry', messages_source)
         self.assertIn('chat-artifact-bundle-card', css_source)
         self.assertIn('width: fit-content', css_source)

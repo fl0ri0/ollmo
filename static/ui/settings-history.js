@@ -43,6 +43,9 @@ function getSessionControlsHint(instance) {
     if (fields.stt_language || fields.stt_task) {
         return 'Speech input controls for the current model.';
     }
+    if (fields.reasoning_effort) {
+        return 'Reasoning controls for the current model.';
+    }
     return 'Per-chat controls for the current model.';
 }
 
@@ -185,7 +188,18 @@ function applyImageAspectPreset(preset) {
 }
 
 function sanitizeSettingsObject(raw = {}) {
-    const source = { ...settingsDefaults, ...(raw || {}) };
+    const rawObject = raw && typeof raw === 'object' ? raw : {};
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(rawObject, key);
+    const source = { ...settingsDefaults, ...rawObject };
+    const reasoningEffortToken = String(source.reasoningEffort ?? settingsDefaults.reasoningEffort ?? 'off')
+        .trim()
+        .toLowerCase();
+    const reasoningEffortExplicit = hasOwn('reasoningEffortExplicit')
+        ? rawObject.reasoningEffortExplicit === true
+        : hasOwn('reasoningEffort') && ['low', 'medium', 'xhigh'].includes(reasoningEffortToken);
+    const reasoningEffort = ['off', 'low', 'medium', 'xhigh'].includes(reasoningEffortToken)
+        ? reasoningEffortToken
+        : 'off';
     const imageWidth = source.imageWidth === '' || source.imageWidth === null || typeof source.imageWidth === 'undefined'
         ? null
         : (() => {
@@ -212,6 +226,8 @@ function sanitizeSettingsObject(raw = {}) {
         topP: source.topP === '' || source.topP === null || typeof source.topP === 'undefined'
             ? null
             : Math.min(1, Math.max(0, Number(source.topP))),
+        reasoningEffort,
+        reasoningEffortExplicit,
         sttLanguage: String(source.sttLanguage || '').trim(),
         sttTask: String(source.sttTask || settingsDefaults.sttTask).trim() || settingsDefaults.sttTask,
         imageAspectRatio,
@@ -241,7 +257,11 @@ function sanitizeSettingsObject(raw = {}) {
     };
 }
 
-function populateSelectOptions(select, values, selectedValue, { fallbackLabel = 'Auto / not set', includeEmptyOption = true } = {}) {
+function populateSelectOptions(select, values, selectedValue, {
+    fallbackLabel = 'Auto / not set',
+    includeEmptyOption = true,
+    labelForValue = null,
+} = {}) {
     if (!select) return;
     const options = Array.isArray(values) ? values.filter(Boolean) : [];
     const desiredValue = String(selectedValue || '').trim();
@@ -259,28 +279,82 @@ function populateSelectOptions(select, values, selectedValue, { fallbackLabel = 
         if (!token) return;
         const option = document.createElement('option');
         option.value = token;
-        option.textContent = token;
+        option.textContent = typeof labelForValue === 'function' ? labelForValue(token) : token;
         select.appendChild(option);
     });
 
     if (desiredValue && !options.some((item) => String(item).trim() === desiredValue)) {
         const currentOption = document.createElement('option');
         currentOption.value = desiredValue;
-        currentOption.textContent = `${desiredValue} (current)`;
+        const currentLabel = typeof labelForValue === 'function' ? labelForValue(desiredValue) : desiredValue;
+        currentOption.textContent = `${currentLabel} (current)`;
         select.appendChild(currentOption);
     }
 
     select.value = desiredValue;
 }
 
+function getSessionControlOptionLabel(fieldKey, field, value) {
+    const token = String(value || '').trim();
+    const optionLabels = field?.option_labels && typeof field.option_labels === 'object'
+        ? field.option_labels
+        : {};
+    if (optionLabels[token]) {
+        return String(optionLabels[token]);
+    }
+    if (fieldKey === 'reasoning_effort') {
+        return ({ off: 'Off', low: 'Low', medium: 'Medium', xhigh: 'XHigh' })[token] || token;
+    }
+    return token;
+}
+
+function hasExplicitReasoningEffortPreference(settings = state.settings) {
+    if (!settings || typeof settings !== 'object') return false;
+    if (Object.prototype.hasOwnProperty.call(settings, 'reasoningEffortExplicit')) {
+        return settings.reasoningEffortExplicit === true;
+    }
+    return Object.prototype.hasOwnProperty.call(settings, 'reasoningEffort');
+}
+
+function getReasoningEffortDefaultValue(field, options = []) {
+    const normalizedOptions = (Array.isArray(options) ? options : [])
+        .map((item) => String(item || '').trim().toLowerCase())
+        .filter(Boolean);
+    const declaredDefault = String(field?.default_value || '').trim().toLowerCase();
+    if (declaredDefault && normalizedOptions.includes(declaredDefault)) {
+        return declaredDefault;
+    }
+    if (normalizedOptions.includes('medium')) return 'medium';
+    return normalizedOptions.find((item) => item !== 'off') || 'off';
+}
+
 function refreshSessionControlSelectOptions(instance = getCurrentSettingsOwnerInstance()) {
     const sttLanguageField = getSessionControlField(instance, 'stt_language');
     const sttTaskField = getSessionControlField(instance, 'stt_task');
+    const reasoningEffortField = getSessionControlField(instance, 'reasoning_effort');
     const imageAspectRatioField = getSessionControlField(instance, 'image_aspect_ratio');
     const ocrModeField = getSessionControlField(instance, 'ocr_mode');
     const ttsVoiceField = getSessionControlField(instance, 'tts_voice');
     const ttsLanguageField = getSessionControlField(instance, 'tts_language');
     const ttsResponseFormatField = getSessionControlField(instance, 'tts_response_format');
+
+    const reasoningEffortOptions = Array.isArray(reasoningEffortField?.options)
+        ? reasoningEffortField.options.map((item) => String(item || '').trim()).filter(Boolean)
+        : [];
+    const currentReasoningEffort = String(state.settings.reasoningEffort || '').trim();
+    const reasoningEffortDefault = getReasoningEffortDefaultValue(reasoningEffortField, reasoningEffortOptions);
+    const desiredReasoningEffort = hasExplicitReasoningEffortPreference()
+        && reasoningEffortOptions.includes(currentReasoningEffort)
+        ? currentReasoningEffort
+        : reasoningEffortDefault;
+    if (
+        reasoningEffortField
+        && reasoningEffortOptions.length
+        && desiredReasoningEffort !== currentReasoningEffort
+    ) {
+        state.settings.reasoningEffort = desiredReasoningEffort;
+        saveSettings();
+    }
 
     populateSelectOptions(
         elements.settingSttLanguage,
@@ -293,6 +367,15 @@ function refreshSessionControlSelectOptions(instance = getCurrentSettingsOwnerIn
         Array.isArray(sttTaskField?.options) ? sttTaskField.options : ['transcribe', 'translate'],
         state.settings.sttTask,
         { includeEmptyOption: false }
+    );
+    populateSelectOptions(
+        elements.settingReasoningEffort,
+        reasoningEffortOptions,
+        reasoningEffortField ? desiredReasoningEffort : state.settings.reasoningEffort,
+        {
+            includeEmptyOption: false,
+            labelForValue: (value) => getSessionControlOptionLabel('reasoning_effort', reasoningEffortField, value),
+        }
     );
     populateSelectOptions(
         elements.settingImageAspectRatio,
@@ -537,6 +620,7 @@ function applySettings(instance = getCurrentSettingsOwnerInstance()) {
     const {
         temperature,
         topP,
+        reasoningEffort,
         sttLanguage,
         sttTask,
         imageAspectRatio,
@@ -561,6 +645,9 @@ function applySettings(instance = getCurrentSettingsOwnerInstance()) {
     }
     if (elements.settingTopP) {
         elements.settingTopP.value = topP ?? '';
+    }
+    if (elements.settingReasoningEffort) {
+        elements.settingReasoningEffort.value = state.settings.reasoningEffort;
     }
     if (elements.settingSttLanguage) {
         elements.settingSttLanguage.value = sttLanguage;
@@ -679,6 +766,19 @@ function attachSettingsListeners() {
         bindNumberSetting(elements.settingTopP, 'top_p', (event) => {
             const raw = String(event.target.value || '').trim();
             state.settings.topP = raw === '' ? null : Math.min(1, Math.max(0, parseFloat(raw) || 0));
+        });
+    }
+
+    if (elements.settingReasoningEffort) {
+        elements.settingReasoningEffort.addEventListener('change', (event) => {
+            state.settings.reasoningEffort = sanitizeSettingsObject({
+                ...state.settings,
+                reasoningEffort: event.target.value,
+                reasoningEffortExplicit: true,
+            }).reasoningEffort;
+            state.settings.reasoningEffortExplicit = true;
+            elements.settingReasoningEffort.value = state.settings.reasoningEffort;
+            saveSettings();
         });
     }
 

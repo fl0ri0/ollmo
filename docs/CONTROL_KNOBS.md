@@ -389,6 +389,28 @@ Then this is the knob to inspect.
 
 For mixed outputs, the surface should prefer canonical `outputs` order when text and artifact outputs are both present. The fallback remains plain message text plus appended artifacts for older or simpler responses.
 
+Interactive HTML preview packages are derived UX state, not response artifacts
+or Closure truth. When a fulfilled HTML output lives directly in a shared flat
+artifact bucket and no persistent bundle copy exists, `View` may create a
+response-bound package under the control-plane process's private temporary
+directory. It uses only exact canonical public output paths and explicit
+response-owned dependencies, never global artifact-ref hydration or arbitrary
+sibling discovery. The package is not written to `artifacts/bundles/`, chat
+history, response frames, or the artifact registry.
+
+The non-UI storage controls are:
+
+- `OLLMO_HTML_PREVIEW_TTL_SECONDS`: absolute package lifetime; default `1800`, clamped to `60..86400`. Asset access does not extend it.
+- `OLLMO_HTML_PREVIEW_MAX_PACKAGES`: process-local package count; default `24`, clamped to `1..128`.
+- `OLLMO_HTML_PREVIEW_MAX_FILES`: maximum files copied into one package; default `64`, clamped to `1..512`.
+- `OLLMO_HTML_PREVIEW_MAX_PACKAGE_BYTES`: maximum bytes in one package; default `268435456` (256 MiB), clamped to 1 MiB..2 GiB.
+- `OLLMO_HTML_PREVIEW_MAX_TOTAL_BYTES`: maximum bytes across the process-local package cache; default `536870912` (512 MiB), clamped to 1 MiB..4 GiB.
+
+The least-recently-used unleased package is removed when count or total-byte
+bounds require space. Expiry is creation-bound rather than sliding, and process
+exit removes the temporary root. These are preview resource controls only; they
+do not truncate canonical artifacts or persistent bundle truth.
+
 ---
 
 ## Quick Debug Flow

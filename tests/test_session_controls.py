@@ -2,11 +2,136 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers.session_controls import build_session_controls
+from helpers.session_controls import (
+    build_session_controls,
+    normalize_reasoning_effort,
+    resolve_reasoning_effort_for_instance,
+    validate_reasoning_effort_for_instance,
+)
 from ollmo_core.lifecycle import list_running_instances
+from ollmo_server.late_fill_runtime import _retarget_model_scoped_reasoning_effort
 
 
 class SessionControlsTests(unittest.TestCase):
+    def test_reasoning_effort_normalizer_accepts_supported_values_and_blank(self):
+        self.assertIsNone(normalize_reasoning_effort(None))
+        self.assertEqual(normalize_reasoning_effort(' LOW '), 'low')
+        self.assertEqual(normalize_reasoning_effort('xhigh'), 'xhigh')
+        self.assertEqual(normalize_reasoning_effort('off'), 'off')
+        with self.assertRaises(ValueError):
+            normalize_reasoning_effort('high')
+
+    def test_chat_schema_exposes_declared_reasoning_effort_options(self):
+        schema = build_session_controls(
+            {
+                'model': 'mlx-community/Qwen3.8-27B-8bit',
+                'backend': 'mlx',
+                'capability': 'chat',
+                'reasoning_efforts': ['xhigh', 'medium', 'low'],
+            }
+        )
+
+        self.assertEqual(
+            schema['fields']['reasoning_effort']['options'],
+            ['off', 'low', 'medium', 'xhigh'],
+        )
+        self.assertEqual(schema['fields']['reasoning_effort']['default_value'], 'medium')
+
+    def test_schema_uses_declared_reasoning_default(self):
+        schema = build_session_controls(
+            {
+                'model': 'mlx-community/Qwen3.8-27B-8bit',
+                'backend': 'mlx',
+                'capability': 'chat',
+                'reasoning_efforts': ['xhigh', 'medium', 'low'],
+                'reasoning_effort_default': 'xhigh',
+            }
+        )
+
+        self.assertEqual(schema['fields']['reasoning_effort']['default_value'], 'xhigh')
+
+    def test_reasoning_effort_is_not_inferred_without_metadata(self):
+        for capability in ('chat', 'vision_analysis'):
+            schema = build_session_controls(
+                {
+                    'model': 'mlx-community/Qwen3.8-27B-8bit',
+                    'backend': 'mlx',
+                    'capability': capability,
+                }
+            )
+            self.assertNotIn('reasoning_effort', schema['fields'])
+
+    def test_vision_schema_exposes_declared_reasoning_effort_options(self):
+        schema = build_session_controls(
+            {
+                'model': 'mlx-community/Qwen3.8-27B-8bit',
+                'backend': 'mlx',
+                'capability': 'vision_analysis',
+                'backend_metadata': {'reasoning_efforts': ['low', 'medium']},
+            }
+        )
+
+        self.assertEqual(
+            schema['fields']['reasoning_effort']['options'],
+            ['off', 'low', 'medium'],
+        )
+
+    def test_reasoning_effort_validation_uses_selected_instance_schema(self):
+        instance = {
+            'model': 'mlx-community/Qwen3.8-27B-8bit',
+            'backend': 'mlx',
+            'capability': 'vision_analysis',
+            'reasoning_efforts': ['low', 'medium'],
+        }
+
+        self.assertEqual(validate_reasoning_effort_for_instance('medium', instance), 'medium')
+        self.assertEqual(validate_reasoning_effort_for_instance('off', {}), 'off')
+        with self.assertRaises(ValueError):
+            validate_reasoning_effort_for_instance('xhigh', instance)
+        with self.assertRaises(ValueError):
+            validate_reasoning_effort_for_instance(
+                'low',
+                {**instance, 'backend': 'ollama'},
+            )
+
+    def test_omitted_reasoning_resolves_to_schema_default_but_off_stays_off(self):
+        instance = {
+            'model': 'mlx-community/Qwen3.8-27B-8bit',
+            'backend': 'mlx',
+            'capability': 'chat',
+            'reasoning_efforts': ['low', 'medium', 'xhigh'],
+            'reasoning_effort_default': 'xhigh',
+        }
+
+        self.assertEqual(resolve_reasoning_effort_for_instance(None, instance), 'xhigh')
+        self.assertEqual(validate_reasoning_effort_for_instance(None, instance), 'xhigh')
+        self.assertEqual(validate_reasoning_effort_for_instance('off', instance), 'off')
+
+    def test_late_fill_preserves_same_target_explicit_effort_from_provenance(self):
+        instance = {
+            'instance_id': 'chat-1',
+            'model': 'mlx-community/Qwen3.8-27B-8bit',
+            'backend': 'mlx',
+            'capability': 'chat',
+            'reasoning_efforts': ['low', 'medium', 'xhigh'],
+            'reasoning_effort_default': 'xhigh',
+        }
+        payload = {
+            'reasoning_effort': 'low',
+            'request_meta': {
+                'reasoning_effort_control': {
+                    'value': 'low',
+                    'explicit': True,
+                    'scope': 'model_instance',
+                    'source_instance_id': 'chat-1',
+                },
+            },
+        }
+
+        resolved = _retarget_model_scoped_reasoning_effort(payload, instance)
+
+        self.assertEqual(resolved['reasoning_effort'], 'low')
+
     def test_chat_schema_exposes_sampling_controls(self):
         schema = build_session_controls(
             {
@@ -22,7 +147,22 @@ class SessionControlsTests(unittest.TestCase):
         self.assertIn('Leave blank for the model default', schema['fields']['temperature']['description'])
         self.assertIn('probability mass', schema['fields']['top_p']['description'])
 
-    def test_generic_vision_analysis_schema_exposes_ocr_controls(self):
+    def test_generic_vision_analysis_schema_exposes_only_advertised_controls(self):
+        schema = build_session_controls(
+            {
+                'model': 'mlx-community/Qwen2.5-VL-3B-Instruct-4bit',
+                'backend': 'mlx',
+                'capability': 'vision_analysis',
+                'reasoning_efforts': ['low', 'medium'],
+            }
+        )
+
+        self.assertTrue(schema['enabled'])
+        self.assertIn('reasoning_effort', schema['fields'])
+        self.assertNotIn('ocr_meta', schema['fields'])
+        self.assertNotIn('pdf_max_pages', schema['fields'])
+
+    def test_generic_vision_analysis_schema_is_empty_without_advertised_controls(self):
         schema = build_session_controls(
             {
                 'model': 'mlx-community/Qwen2.5-VL-3B-Instruct-4bit',
@@ -31,10 +171,8 @@ class SessionControlsTests(unittest.TestCase):
             }
         )
 
-        self.assertTrue(schema['enabled'])
-        self.assertIn('pdf_max_pages', schema['fields'])
-        self.assertEqual(schema['fields']['ocr_meta']['label'], 'OCR / Document Mode')
-        self.assertIn('vision-analysis model', schema['hint'])
+        self.assertFalse(schema['enabled'])
+        self.assertEqual(schema['fields'], {})
 
     def test_glm_ocr_schema_exposes_model_aware_document_modes(self):
         schema = build_session_controls(
@@ -63,6 +201,20 @@ class SessionControlsTests(unittest.TestCase):
 
         self.assertEqual(schema['fields']['ocr_mode']['options'], ['auto', 'markdown', 'free_ocr', 'extract'])
         self.assertIn('DeepSeek-OCR-2', schema['hint'])
+
+    def test_deepseek_ocr_v1_schema_retains_document_controls(self):
+        schema = build_session_controls(
+            {
+                'model': 'mlx-community/DeepSeek-OCR-bf16',
+                'backend': 'mlx',
+                'capability': 'vision_analysis',
+            }
+        )
+
+        self.assertTrue(schema['enabled'])
+        self.assertIn('ocr_meta', schema['fields'])
+        self.assertIn('pdf_max_pages', schema['fields'])
+        self.assertEqual(schema['fields']['ocr_mode']['options'], ['auto', 'extract'])
 
     def test_tts_schema_uses_snapshot_metadata(self):
         schema = build_session_controls(

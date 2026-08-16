@@ -691,6 +691,8 @@ Keep `/api/infer` only for lower-level debugging, narrow compatibility cases, or
 Current direct UI/internal behavior:
 - Direct backend chat route `/api/chat` still exists only as a compatibility wrapper for specialized or older callers.
 - First-party UI execution flows, voice input, `ollmoctl send`, and the Responses workbench use `/api/responses` as the canonical execution surface.
+- Session Controls are derived from the actual target model. MLX models that advertise `reasoning_effort` use their declared non-Off default on first use; an explicit user choice, including Off, persists per model/backend.
+- General vision-language capability does not imply OCR/PDF controls. Document controls are shown only for recognized OCR-specialist families such as DeepSeek-OCR and GLM-OCR; other VLMs keep independently advertised controls such as reasoning.
 - `/api/responses` now rejects plain chat text that claims image/audio generation for a non-chat routed turn when no real image/audio artifact was produced.
 - Arena mode stays chat-only.
 - Voice input button (UI):

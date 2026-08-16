@@ -14,6 +14,7 @@ _CONTROL_ALIASES: dict[str, tuple[str, ...]] = {
     'temperature': ('temperature',),
     'top_p': ('top_p', 'topP'),
     'max_tokens': ('max_tokens', 'maxTokens'),
+    'reasoning_effort': ('reasoning_effort', 'reasoningEffort'),
     'language': ('language', 'stt_language', 'sttLanguage'),
     'task': ('task', 'stt_task', 'sttTask'),
     'voice': ('voice', 'tts_voice', 'ttsVoice'),
@@ -40,7 +41,7 @@ _CONTROL_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 _CONTROL_CATEGORIES: dict[str, tuple[str, ...]] = {
-    'generation': ('temperature', 'top_p', 'max_tokens'),
+    'generation': ('temperature', 'top_p', 'max_tokens', 'reasoning_effort'),
     'audio': ('language', 'task', 'voice', 'lang_code', 'response_format', 'instruct', 'speed', 'pitch'),
     'image': ('width', 'height', 'aspect_ratio', 'image_count', 'seed'),
     'document': (
@@ -79,6 +80,7 @@ _DEFAULT_TEXT_VALUES: dict[str, set[str]] = {
     'task': {'transcribe'},
     'ocr_mode': {'auto'},
     'aspect_ratio': {'auto', 'custom'},
+    'reasoning_effort': {'off'},
 }
 _DEFAULT_NUMBER_VALUES: dict[str, float] = {
     'image_count': 1,

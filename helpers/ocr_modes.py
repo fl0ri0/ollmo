@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 GLM_OCR_MODES = ['auto', 'text', 'table', 'formula', 'extract']
+DEEPSEEK_OCR_MODES = ['auto', 'extract']
 DEEPSEEK_OCR2_MODES = ['auto', 'markdown', 'free_ocr', 'extract']
 
 GENERIC_OCR_FALLBACK_PROMPT = 'Analyze this image and extract relevant text and details.'
@@ -18,8 +19,14 @@ def get_ocr_model_family(model_name: str | None) -> str | None:
     model_name_lower = str(model_name or '').strip().lower()
     if not model_name_lower:
         return None
-    if 'deepseek-ocr-2' in model_name_lower:
+    if (
+        'deepseek-ocr-2' in model_name_lower
+        or 'deepseek-ocr2' in model_name_lower
+        or 'deepseek_ocr_2' in model_name_lower
+    ):
         return 'deepseek_ocr2'
+    if 'deepseek-ocr' in model_name_lower or 'deepseek_ocr' in model_name_lower:
+        return 'deepseek_ocr'
     if 'glm-ocr' in model_name_lower:
         return 'glm_ocr'
     return None
@@ -31,6 +38,8 @@ def get_ocr_mode_options(model_name: str | None) -> list[str]:
         return list(GLM_OCR_MODES)
     if family == 'deepseek_ocr2':
         return list(DEEPSEEK_OCR2_MODES)
+    if family == 'deepseek_ocr':
+        return list(DEEPSEEK_OCR_MODES)
     return []
 
 
@@ -49,6 +58,13 @@ def get_ocr_mode_copy(model_name: str | None) -> dict[str, str]:
             'label': 'DeepSeek OCR 2 Mode',
             'description': 'Use DeepSeek-OCR-2 markdown conversion or free OCR presets for document images and PDFs.',
             'mode_description': 'Choose a DeepSeek-OCR-2 OCR preset or use your typed prompt for extraction.',
+        }
+    if family == 'deepseek_ocr':
+        return {
+            'hint': 'DeepSeek-OCR document extraction controls for this vision-analysis model.',
+            'label': 'DeepSeek OCR Mode',
+            'description': 'Use DeepSeek-OCR document extraction controls for OCR/image and PDF requests.',
+            'mode_description': 'Choose automatic or explicit DeepSeek-OCR extraction.',
         }
     return {
         'hint': 'PDF OCR controls for this vision-analysis model.',

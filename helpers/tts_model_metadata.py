@@ -51,6 +51,20 @@ _MLX_VLM_CONVERSION_RE = re.compile(
     r'converted\s+to\s+MLX\s+format.*?using\s+mlx-vlm\s+version\s+\*{0,2}([0-9][0-9A-Za-z_.-]*)\*{0,2}',
     re.IGNORECASE | re.DOTALL,
 )
+_REASONING_EFFORT_GUARD_RE = re.compile(
+    r'(?:reasoning_effort|resolved_reasoning_effort)'
+    r'.{0,2500}?\bnot\s+in\s*[\(\[](?P<body>[^\)\]]+)[\)\]]',
+    re.IGNORECASE | re.DOTALL,
+)
+_REASONING_EFFORT_LITERAL_RE = re.compile(
+    r"['\"](off|low|medium|xhigh)['\"]",
+    re.IGNORECASE,
+)
+_REASONING_EFFORT_DEFAULT_RE = re.compile(
+    r"(?:reasoning_effort|resolved_reasoning_effort)\s*\|\s*default\s*\(\s*['\"]"
+    r"(?P<default>off|low|medium|xhigh)['\"]\s*\)",
+    re.IGNORECASE,
+)
 
 
 def _zip_member_stems(path: Path) -> list[str]:
@@ -139,6 +153,47 @@ def _extract_mlx_vlm_conversion_version(text: str) -> str:
     return str(match.group(1) or '').strip()
 
 
+def _read_chat_template_text(snapshot_path: Path) -> str:
+    template_path = snapshot_path / 'chat_template.jinja'
+    if not template_path.exists():
+        return ''
+    try:
+        return template_path.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            return template_path.read_text(errors='ignore')
+        except Exception:
+            return ''
+    except Exception:
+        return ''
+
+
+def _extract_reasoning_efforts_from_chat_template(text: str) -> list[str]:
+    """Return literal reasoning efforts declared by a chat template.
+
+    This intentionally looks for a template guard such as
+    ``reasoning_effort not in ('xhigh', 'medium', 'low')`` rather than
+    inferring support from model names or prose in a model card.
+    """
+
+    efforts: list[str] = []
+    for match in _REASONING_EFFORT_GUARD_RE.finditer(text or ''):
+        body = match.group('body') or ''
+        for raw in _REASONING_EFFORT_LITERAL_RE.findall(body):
+            token = str(raw or '').strip().lower()
+            if token and token not in efforts:
+                efforts.append(token)
+    return efforts
+
+
+def _extract_reasoning_effort_default_from_chat_template(text: str) -> str | None:
+    """Return the template's declared default, if it uses the supported contract."""
+    match = _REASONING_EFFORT_DEFAULT_RE.search(text or '')
+    if not match:
+        return None
+    return str(match.group('default') or '').strip().lower() or None
+
+
 def _read_model_card_text(snapshot_path: Path) -> str:
     readme_path = snapshot_path / 'README.md'
     if not readme_path.exists():
@@ -202,6 +257,7 @@ def read_snapshot_model_metadata(model_name: Optional[str], model_path: Optional
             config_payload = {}
 
     model_card_text = _read_model_card_text(snapshot_path)
+    chat_template_text = _read_chat_template_text(snapshot_path)
     front_matter = _parse_front_matter(model_card_text)
     model_type = str(config_payload.get('tts_model_type') or config_payload.get('model_type') or '').strip().lower()
     capability = _pipeline_capability_tag(front_matter, model_type, name)
@@ -225,6 +281,14 @@ def read_snapshot_model_metadata(model_name: Optional[str], model_path: Optional
     mlx_vlm_conversion_version = _extract_mlx_vlm_conversion_version(model_card_text)
     if mlx_vlm_conversion_version:
         metadata['snapshot_mlx_vlm_conversion_version'] = mlx_vlm_conversion_version
+    reasoning_efforts = _extract_reasoning_efforts_from_chat_template(chat_template_text)
+    if reasoning_efforts:
+        metadata['reasoning_efforts'] = reasoning_efforts
+        reasoning_effort_default = _extract_reasoning_effort_default_from_chat_template(
+            chat_template_text
+        )
+        if reasoning_effort_default in reasoning_efforts:
+            metadata['reasoning_effort_default'] = reasoning_effort_default
 
     if capability:
         metadata['provider_capabilities'] = [capability]

@@ -11,6 +11,10 @@ from typing import Any, Mapping, Optional
 from flask import jsonify
 
 from helpers.model_capabilities import CAPABILITY_SPEECH_TO_TEXT
+from helpers.session_controls import (
+    normalize_reasoning_effort,
+    validate_reasoning_effort_for_instance,
+)
 
 
 def _normalize_structured_text_artifact_extension(value: Any) -> str:
@@ -830,6 +834,15 @@ class InferRuntimeOwner:
         try:
             speed = parse_float_with_bounds(data.get("speed"), default=1.0, minimum=0.5, maximum=2.0)
             pitch = parse_float_with_bounds(data.get("pitch"), default=1.0, minimum=0.5, maximum=2.0)
+            reasoning_effort = normalize_reasoning_effort(
+                data.get('reasoning_effort')
+                if data.get('reasoning_effort') not in (None, '')
+                else data.get('reasoningEffort')
+            )
+            reasoning_effort = validate_reasoning_effort_for_instance(
+                reasoning_effort,
+                instance,
+            )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         has_width = raw_width not in (None, '')
@@ -1131,6 +1144,7 @@ class InferRuntimeOwner:
                 prompt_is_semantic_materializer_payload=bool(
                     semantic_materializer_prompt
                 ),
+                reasoning_effort=reasoning_effort,
             )
             infer_artifacts = InferArtifacts(
                 temp_path=temp_path,
@@ -1193,11 +1207,12 @@ class InferRuntimeOwner:
                     messages,
                     timeout_sec=timeout_sec,
                 )),
-                "mlx_chat_completions": (lambda port, _model_name, messages, timeout_sec=600: mlx_chat_completions(
+                "mlx_chat_completions": (lambda port, _model_name, messages, timeout_sec=600, reasoning_effort=None: mlx_chat_completions(
                     port,
                     request_model_name,
                     messages,
                     timeout_sec=timeout_sec,
+                    reasoning_effort=reasoning_effort,
                 )),
                 "request_timeout_error": request_timeout_error,
                 "request_connection_error": request_connection_error,

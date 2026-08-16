@@ -94,6 +94,26 @@ function buildSessionControlRequestFields(instance) {
         const transformedMatchesOption = typeof normalizedTransformed === 'string'
             ? options.some((item) => item === normalizedTransformed)
             : false;
+        if (fieldKey === 'reasoning_effort') {
+            const explicit = typeof hasExplicitReasoningEffortPreference === 'function'
+                ? hasExplicitReasoningEffortPreference(state.settings)
+                : Object.prototype.hasOwnProperty.call(state.settings || {}, 'reasoningEffortExplicit')
+                    ? state.settings.reasoningEffortExplicit === true
+                    : Object.prototype.hasOwnProperty.call(state.settings || {}, 'reasoningEffort');
+            if (!explicit) {
+                transformed = typeof getReasoningEffortDefaultValue === 'function'
+                    ? getReasoningEffortDefaultValue(field, options)
+                    : (options.includes('medium') ? 'medium' : (options.find((item) => item !== 'off') || 'off'));
+            } else if (!transformedMatchesOption) {
+                return;
+            }
+            const resolvedReasoningEffort = typeof transformed === 'string'
+                ? transformed.trim()
+                : transformed;
+            if (!options.includes(resolvedReasoningEffort)) {
+                return;
+            }
+        }
         if (
             field?.default_first_option &&
             options.length &&

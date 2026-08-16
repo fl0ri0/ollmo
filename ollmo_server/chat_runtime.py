@@ -12,6 +12,10 @@ from typing import Any, Optional
 
 from flask import Response, jsonify, stream_with_context
 
+from helpers.session_controls import (
+    normalize_reasoning_effort,
+    validate_reasoning_effort_for_instance,
+)
 from ollmo_server.response_semantics_runtime import (
     attach_phase_output_acceptance,
     classify_phase_output_text,
@@ -50,6 +54,7 @@ class ChatRuntimeOwner:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         route_payload: Optional[dict[str, Any]] = None,
         response_id: Optional[str] = None,
         request_payload: Optional[dict[str, Any]] = None,
@@ -174,6 +179,7 @@ class ChatRuntimeOwner:
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                 )
                 delta_iter = iter_openai_stream_deltas(upstream_response)
             else:
@@ -315,6 +321,10 @@ class ChatRuntimeOwner:
                         capability=capability,
                         messages=messages,
                         request_model_override=request_model_override,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
                     )
 
                 phase_acceptance_attempts: list[dict[str, Any]] = []
@@ -340,6 +350,7 @@ class ChatRuntimeOwner:
                                 temperature=temperature,
                                 top_p=top_p,
                                 max_tokens=max_tokens,
+                                reasoning_effort=reasoning_effort,
                             )
                             phase_acceptance_attempts.append(
                                 classify_phase_output_text(retried_text)
@@ -598,6 +609,11 @@ class ChatRuntimeOwner:
                 minimum=1,
                 maximum=1_000_000,
             ) if data.get('max_tokens') not in (None, '') or data.get('maxTokens') not in (None, '') else None
+            reasoning_effort = normalize_reasoning_effort(
+                data.get('reasoning_effort')
+                if data.get('reasoning_effort') not in (None, '')
+                else data.get('reasoningEffort')
+            )
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 400
 
@@ -620,6 +636,18 @@ class ChatRuntimeOwner:
 
         backend = normalize_backend(backend)
         capability = capability or infer_capability(model_name, backend)
+        try:
+            reasoning_effort = validate_reasoning_effort_for_instance(
+                reasoning_effort,
+                instance_info
+                or {
+                    'model': model_name,
+                    'backend': backend,
+                    'capability': capability,
+                },
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
 
         if backend not in ('ollama', 'mlx', 'llama_cpp'):
             logging.error('Unknown backend type: %s', backend)
@@ -689,6 +717,7 @@ class ChatRuntimeOwner:
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
             )
             logging.info('Received response from backend %s (port %s).', backend, target_port)
             log_unified_event(
