@@ -236,6 +236,12 @@ _GENERATE_AUDIO_ACTION_RE = re.compile(
 _DIRECT_IMAGE_DESCRIPTION_PREFIX_RE = re.compile(
     r'(?i)^\s*(?:of|showing|depicting|featuring|with)\s+'
 )
+_DIRECT_IMAGE_ADJACENT_CONSTRAINT_RE = re.compile(
+    r'^\s*[.;!?\n]+\s*'
+    r'(?P<constraint>(?:do\s+not|don[\'’]?t|dont|never)\s+'
+    r'(?:include|add|place|put|feature|contain|depict|show|display|render)\b[^.;!?\n]{0,180})',
+    re.IGNORECASE,
+)
 _DIRECT_MEDIA_DEICTIC_PAYLOAD_RE = re.compile(
     r'^\s*(?:it|this|that|these|those|them|him|her|daraus|davon|dies(?:e|er|es|en|em)?|'
     r'das|sie|es)(?:\b|$)|'
@@ -464,7 +470,7 @@ _POST_TEXT_TO_IMAGE_RE = re.compile(
 )
 _TEXT_OUTPUT_ACTION_RE = re.compile(
     r'\b('
-    r'write|describe|caption|summari[sz]e|confirm|explain|translate|compare|'
+    r'write|describe|caption|summari[sz]e|confirm|explain|translate|compare|report|'
     r'visible\s+details|sichtbare\s+details|sichtbaren\s+details|'
     r'check|verify|evaluate|review|assess|name|list|enumerate|'
     r'vergleich(?:e|en|st|t)?|'
@@ -1982,6 +1988,14 @@ def _direct_clause_local_media_payloads(
             continue
         description = tail[prefix.end():].strip(' \t,:-')
         if description and not _DIRECT_MEDIA_DEICTIC_PAYLOAD_RE.match(description):
+            adjacent_constraint = _DIRECT_IMAGE_ADJACENT_CONSTRAINT_RE.match(
+                prompt[clause_end:]
+            )
+            if adjacent_constraint:
+                description = (
+                    f'{description}. '
+                    f'{adjacent_constraint.group("constraint").strip()}'
+                )
             image_payloads.append(description)
 
     tts_source = resolve_explicit_tts_source(prompt)
@@ -4973,19 +4987,24 @@ def _current_phase_reason(
     return 'current phase remains text-capable while downstream materialization phases depend on its output'
 
 
-def _direct_stt_is_generated_audio_follow_up(
+def _direct_evidence_is_generated_media_follow_up(
     capability: Any,
     downstream_branches: list[dict[str, Any]],
 ) -> bool:
-    """Return whether the graph already binds STT to a generated-audio producer."""
+    """Return whether an evidence phase depends on same-turn generated media."""
 
-    if normalize_capability(capability) != CAPABILITY_SPEECH_TO_TEXT:
+    normalized_capability = normalize_capability(capability)
+    producer_capability = {
+        CAPABILITY_SPEECH_TO_TEXT: CAPABILITY_TEXT_TO_SPEECH,
+        CAPABILITY_VISION_ANALYSIS: CAPABILITY_IMAGE_GENERATION,
+    }.get(normalized_capability)
+    if not producer_capability:
         return False
-    audio_producer_tokens: set[str] = set()
+    producer_tokens: set[str] = set()
     for branch in downstream_branches:
-        if normalize_capability(branch.get('capability')) != CAPABILITY_TEXT_TO_SPEECH:
+        if normalize_capability(branch.get('capability')) != producer_capability:
             continue
-        audio_producer_tokens.update(
+        producer_tokens.update(
             token
             for token in (
                 _clean_text(branch.get('phase_id')),
@@ -4993,17 +5012,17 @@ def _direct_stt_is_generated_audio_follow_up(
             )
             if token
         )
-    if not audio_producer_tokens:
+    if not producer_tokens:
         return False
     for branch in downstream_branches:
-        if normalize_capability(branch.get('capability')) != CAPABILITY_SPEECH_TO_TEXT:
+        if normalize_capability(branch.get('capability')) != normalized_capability:
             continue
         dependencies = {
             _clean_text(item)
             for item in (branch.get('depends_on') or [])
             if _clean_text(item)
         }
-        if dependencies.intersection(audio_producer_tokens):
+        if dependencies.intersection(producer_tokens):
             return True
     return False
 
@@ -5334,7 +5353,7 @@ def build_request_phase_graph(
             current_phase_role = f'{current_phase_capability}_evidence'
         elif (
             direct_capability in {CAPABILITY_VISION_ANALYSIS, CAPABILITY_SPEECH_TO_TEXT}
-            and not _direct_stt_is_generated_audio_follow_up(
+            and not _direct_evidence_is_generated_media_follow_up(
                 direct_capability,
                 promoted_downstream_branches,
             )

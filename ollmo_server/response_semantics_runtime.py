@@ -9,7 +9,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from helpers.model_capabilities import (
     CAPABILITY_CHAT,
@@ -65,7 +65,10 @@ from ollmo_services.responses import (
     extract_canonical_predecessor_image_prompts,
     extract_responses_current_turn_prompt,
 )
-from ollmo_services.semantic_review_verdict import semantic_review_verdict_from_text
+from ollmo_services.semantic_review_verdict import (
+    semantic_review_verdict_freeze_acceptance,
+    semantic_review_verdict_from_text,
+)
 from ollmo_services.tts_source import resolve_explicit_tts_source
 
 
@@ -109,6 +112,19 @@ _INTENT_SEMANTIC_QUALITY_RE = re.compile(
     r')\b',
     re.IGNORECASE,
 )
+
+_GLOBAL_SEMANTIC_TEXT_CARRIER_LIMIT = 16_000
+_GLOBAL_SEMANTIC_ARTIFACT_EXCERPT_LIMIT = 16_000
+_GLOBAL_SEMANTIC_ARTIFACT_EXCERPT_TOTAL_LIMIT = 64_000
+_GLOBAL_SEMANTIC_LATE_FILL_BRANCH_LIMIT = 128
+_GLOBAL_SEMANTIC_REVIEW_EVIDENCE_POLICY = (
+    'global_semantic_review_instruction_sha256_v1'
+)
+_BRANCH_SEMANTIC_REVIEW_EVIDENCE_POLICY = (
+    'branch_semantic_review_instruction_sha256_v1'
+)
+_SEMANTIC_REVIEW_VISIBILITY = 'internal'
+_SEMANTIC_REVIEW_SURFACE_ROLE = 'closure_evidence'
 _LINKED_IMAGE_INTENT_RE = re.compile(
     r'\b(?:use|insert|include|embed|link|reference|wire|place|background|hero|'
     r'nutze|verwende|fuege|füge|verlinke|referenziere|hintergrund)\b'
@@ -679,6 +695,7 @@ _CLOSURE_REPAIR_PAYLOAD_KEYS = (
     'semantic_review_verdict',
     'semantic_review_verdict_status',
     'semantic_review_recommended_transition',
+    'semantic_review_evidence_binding',
     'branch_semantic_review',
     'branch_semantic_review_branch_id',
     'branch_semantic_review_phase_id',
@@ -729,8 +746,8 @@ _MULTI_IMAGE_HEADING_LINE_RE = re.compile(
 _INLINE_LABELED_IMAGE_PROMPT_LINE_RE = re.compile(
     r'(?i)^\s*(?:[-*#>\u2022]+\s*)?(?:\*\*+|__+|\*)?\s*'
     r'(?:'
-    r'(?:image|bild|visual|scene)\s*(?:prompt\s*)?(?:\d+|[ivx]+)?(?:\s*\([^)]+\))?'
-    r'|prompt\s*(?:\d+|[ivx]+)?(?:\s*\([^)]+\))?'
+    r'(?:image|bild|visual|scene)(?:[\s_-]*prompt)?[\s_-]*(?:\d+|[ivx]+)?(?:\s*\([^)]+\))?'
+    r'|prompt[\s_-]*(?:\d+|[ivx]+)?(?:\s*\([^)]+\))?'
     r'|[a-z0-9][\w ._-]{0,80}\.(?:png|jpe?g|webp|gif|avif)'
     r')'
     r'\s*(?:\*\*+|__+|\*)?\s*:\s*(?P<body>.*)$'
@@ -4162,6 +4179,15 @@ def _is_image_prompt_section_stop(raw_line: Any) -> bool:
         return True
     if _is_named_text_artifact_section_heading(stripped):
         return True
+    if re.fullmatch(r'#{1,6}\s+\S.*', stripped):
+        normalized_heading = _normalize_handoff_heading_line(stripped)
+        if not (
+            _is_image_prompt_section_heading(stripped)
+            or _MULTI_IMAGE_HEADING_LINE_RE.fullmatch(normalized_heading)
+            or _INLINE_LABELED_IMAGE_PROMPT_LINE_RE.match(stripped)
+            or _ARTIFACT_LABELED_IMAGE_PROMPT_HEADING_RE.fullmatch(stripped)
+        ):
+            return True
     if re.fullmatch(r'(?:html|css|javascript|js|index|styles?|page files?|text artifacts?)', lowered):
         return True
     if re.match(r'(?:phase|internal phase|closure|materialization|artifact|runtime)\s+contract\b', lowered):
@@ -4545,9 +4571,15 @@ def _inline_labeled_image_prompt_body(raw_line: Any) -> Optional[str]:
 
 def _inline_labeled_image_prompt_body_is_title(raw_value: Any) -> bool:
     text = str(raw_value or '').strip()
-    if not text or not re.search(r'(?:\*\*+|__+)\s*$', text):
+    wrapped_plain_title = bool(
+        re.fullmatch(r'(?:\([^()\n]{1,120}\)|\[[^\[\]\n]{1,120}\])', text)
+    )
+    wrapped_markdown_title = bool(re.search(r'(?:\*\*+|__+)\s*$', text))
+    if not text or not (wrapped_plain_title or wrapped_markdown_title):
         return False
     normalized = re.sub(r'(?:\*\*+|__+|`+)', '', text).strip()
+    if wrapped_plain_title:
+        normalized = normalized[1:-1].strip()
     if not normalized or re.search(r'[.!?]\s*$', normalized):
         return False
     return len(re.findall(r'\w+', normalized)) <= 10
@@ -6751,6 +6783,68 @@ class ResponseSemanticsRuntimeOwner:
             return str(value)
 
     @staticmethod
+    def _semantic_manifest_sha256(records: Sequence[Mapping[str, Any]]) -> str:
+        canonical_records = sorted(
+            (
+                {
+                    str(key): value
+                    for key, value in record.items()
+                    if value not in (None, '', [], {})
+                }
+                for record in records
+                if isinstance(record, Mapping)
+            ),
+            key=lambda record: json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=str,
+            ),
+        )
+        encoded = json.dumps(
+            canonical_records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=str,
+        ).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _semantic_review_evidence_sha256_from_record(record: Mapping[str, Any]) -> str:
+        if not isinstance(record, Mapping):
+            return ''
+        binding = (
+            record.get('semantic_review_evidence_binding')
+            if isinstance(record.get('semantic_review_evidence_binding'), Mapping)
+            else {}
+        )
+        execution_contract = (
+            record.get('execution_contract')
+            if isinstance(record.get('execution_contract'), Mapping)
+            else {}
+        )
+        contract_binding = (
+            execution_contract.get('semantic_review_evidence_binding')
+            if isinstance(
+                execution_contract.get('semantic_review_evidence_binding'),
+                Mapping,
+            )
+            else {}
+        )
+        for value in (
+            binding.get('sha256'),
+            record.get('semantic_review_evidence_sha256'),
+            contract_binding.get('sha256'),
+            execution_contract.get('semantic_review_evidence_sha256'),
+        ):
+            digest = str(value or '').strip().lower()
+            if re.fullmatch(r'[0-9a-f]{64}', digest):
+                return digest
+        return ''
+
+    @staticmethod
     def _late_fill_branch_record(
         artifact_payload: Optional[dict[str, Any]],
         branch_id: str,
@@ -6782,18 +6876,38 @@ class ResponseSemanticsRuntimeOwner:
         branch_id: str,
         *,
         review_id: str = 'global-semantic-closure-review',
+        expected_evidence_sha256: str = '',
     ) -> dict[str, Any]:
         record, status = cls._late_fill_branch_record(artifact_payload, branch_id)
         if not record or status != 'fulfilled':
             return {}
+        expected_digest = str(expected_evidence_sha256 or '').strip().lower()
+        if expected_digest:
+            completed_digest = cls._semantic_review_evidence_sha256_from_record(record)
+            if completed_digest != expected_digest:
+                return {}
         raw_verdict = record.get('semantic_review_verdict')
         if isinstance(raw_verdict, Mapping):
-            verdict = semantic_review_verdict_from_text(
-                raw_verdict,
-                review_id=review_id,
-                branch_id=branch_id,
-                phase_id=str(record.get('phase_id') or '').strip(),
-            )
+            if (
+                str(raw_verdict.get('kind') or '').strip()
+                == 'ollmo.semantic_review_verdict'
+                and raw_verdict.get('parse_status')
+                and isinstance(raw_verdict.get('declared_schema'), Mapping)
+            ):
+                # This is an already-normalized runtime envelope. Preserve its
+                # original declared-schema provenance; re-normalizing it would
+                # make runtime-added defaults look model-declared.
+                verdict = dict(raw_verdict)
+                verdict['review_id'] = review_id
+                verdict['branch_id'] = branch_id
+                verdict['phase_id'] = str(record.get('phase_id') or '').strip()
+            else:
+                verdict = semantic_review_verdict_from_text(
+                    raw_verdict,
+                    review_id=review_id,
+                    branch_id=branch_id,
+                    phase_id=str(record.get('phase_id') or '').strip(),
+                )
         else:
             result_text = ''
             for key in ('result_text', 'output_text', 'text', 'transcript', 'content'):
@@ -6808,7 +6922,349 @@ class ResponseSemanticsRuntimeOwner:
                 phase_id=str(record.get('phase_id') or '').strip(),
             )
         verdict['completed_branch_status'] = status
+        if expected_digest:
+            verdict['reviewed_evidence_sha256'] = expected_digest
         return cls._compact_mapping(verdict)
+
+    @classmethod
+    def _global_semantic_review_evidence_summary(
+        cls,
+        review: Any,
+    ) -> dict[str, Any]:
+        """Project recursive decision reviews into bounded reviewer evidence."""
+        if not isinstance(review, Mapping):
+            return {}
+
+        def _bounded_text(value: Any, limit: int = 800) -> str:
+            text = str(value or '').strip()
+            if len(text) <= limit:
+                return text
+            return f'{text[:limit]}…'
+
+        summary: dict[str, Any] = {}
+        for key in (
+            'kind',
+            'status',
+            'reason',
+            'policy',
+            'review_id',
+            'frame_count',
+            'proposal_count',
+            'contract_count',
+            'required_count',
+            'pending_count',
+            'failed_count',
+            'fulfilled_count',
+            'semantic_review_required_count',
+            'decision_count',
+        ):
+            value = review.get(key)
+            if isinstance(value, str):
+                value = _bounded_text(value)
+            if isinstance(value, (str, int, float, bool)) and value not in ('', None):
+                summary[key] = value
+
+        record_limit = 32
+        for list_key in ('proposals', 'contracts'):
+            raw_records = review.get(list_key) if isinstance(review.get(list_key), list) else []
+            records: list[dict[str, Any]] = []
+            for raw_record in raw_records[:record_limit]:
+                if not isinstance(raw_record, Mapping):
+                    continue
+                record: dict[str, Any] = {}
+                for key in (
+                    'kind',
+                    'id',
+                    'proposal_id',
+                    'contract_id',
+                    'review_id',
+                    'status',
+                    'branch_id',
+                    'phase_id',
+                    'obligation_id',
+                    'task_id',
+                    'decision_action',
+                    'recommended_transition',
+                    'reason',
+                    'confidence',
+                    'semantic_review_lens',
+                    'semantic_review_lens_id',
+                ):
+                    value = raw_record.get(key)
+                    if isinstance(value, str):
+                        value = _bounded_text(value)
+                    if isinstance(value, (str, int, float, bool)) and value not in ('', None):
+                        record[key] = value
+                for key in (
+                    'evidence_refs',
+                    'review_criteria',
+                    'semantic_review_criteria',
+                    'allowed_transitions',
+                ):
+                    values = [
+                        _bounded_text(item, 320)
+                        for item in cls._string_list(raw_record.get(key))[:32]
+                    ]
+                    if values:
+                        record[key] = values
+                if record:
+                    records.append(record)
+            if records:
+                summary[list_key] = records
+            summary[f'{list_key[:-1]}_count'] = len(raw_records)
+            if len(raw_records) > record_limit:
+                summary[f'{list_key}_truncated'] = True
+        return cls._compact_mapping(summary)
+
+    @staticmethod
+    def _bounded_global_semantic_text(
+        value: Any,
+        *,
+        limit: int = _GLOBAL_SEMANTIC_TEXT_CARRIER_LIMIT,
+    ) -> str:
+        text = str(value or '').strip()
+        if len(text) <= limit:
+            return text
+        marker = '\n[… middle omitted from bounded semantic-review evidence …]\n'
+        available = max(0, limit - len(marker))
+        head_size = (available * 3) // 4
+        tail_size = available - head_size
+        return f'{text[:head_size]}{marker}{text[-tail_size:] if tail_size else ""}'
+
+    @classmethod
+    def _bounded_semantic_value(cls, value: Any, *, limit: int) -> Any:
+        if isinstance(value, str):
+            return cls._bounded_global_semantic_text(value, limit=limit)
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        return cls._bounded_global_semantic_text(
+            cls._json_for_semantic_review_prompt(value),
+            limit=limit,
+        )
+
+    @classmethod
+    def _global_semantic_late_fill_summary(
+        cls,
+        late_fill: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(late_fill, Mapping):
+            return {}
+        summary: dict[str, Any] = {}
+
+        def _is_global_review_record(record: Mapping[str, Any]) -> bool:
+            execution_contract = (
+                record.get('execution_contract')
+                if isinstance(record.get('execution_contract'), Mapping)
+                else {}
+            )
+            stage_direction = str(
+                record.get('stage_direction')
+                or execution_contract.get('stage_direction')
+                or ''
+            ).strip()
+            identity = ' '.join(
+                str(record.get(field) or '').strip().lower()
+                for field in ('branch_id', 'phase_id')
+            )
+            return (
+                stage_direction == 'run_global_semantic_closure_review'
+                or 'global-semantic-closure-review' in identity
+            )
+
+        for key in ('completed_branches', 'failed_branches', 'pending_branches'):
+            source_records = late_fill.get(key) if isinstance(late_fill.get(key), list) else []
+            raw_records = [
+                item
+                for item in source_records
+                if not isinstance(item, Mapping) or not _is_global_review_record(item)
+            ]
+            records: list[dict[str, Any]] = []
+            for raw_record in raw_records[:_GLOBAL_SEMANTIC_LATE_FILL_BRANCH_LIMIT]:
+                if isinstance(raw_record, Mapping):
+                    error = raw_record.get('error') if isinstance(raw_record.get('error'), Mapping) else {}
+                    record = {
+                        field: raw_record.get(field)
+                        for field in (
+                            'branch_id',
+                            'phase_id',
+                            'obligation_id',
+                            'capability',
+                            'output_type',
+                            'status',
+                            'saved_text_path',
+                            'saved_audio_path',
+                            'saved_image_path',
+                            'artifact_ref',
+                            'content_payload_source',
+                            'code',
+                            'stage',
+                            'reason',
+                            'repair_action',
+                            'retryable',
+                        )
+                        if raw_record.get(field) not in (None, '', [], {})
+                    }
+                    for field in ('code', 'stage', 'message'):
+                        value = error.get(field)
+                        if value not in (None, '', [], {}) and field not in record:
+                            record[f'error_{field}'] = value
+                    depends_on = [
+                        cls._bounded_global_semantic_text(item, limit=160)
+                        for item in cls._string_list(raw_record.get('depends_on'))[:32]
+                    ]
+                    if depends_on:
+                        record['depends_on'] = depends_on
+                    record = {
+                        field: cls._bounded_global_semantic_text(value, limit=600)
+                        if isinstance(value, str)
+                        else value
+                        for field, value in record.items()
+                    }
+                else:
+                    record = {
+                        'branch_id': cls._bounded_global_semantic_text(raw_record, limit=600),
+                    }
+                records.append(cls._compact_mapping(record))
+            if records:
+                summary[key] = records
+            branch_count_key = {
+                'completed_branches': 'completed_branch_count',
+                'failed_branches': 'failed_branch_count',
+                'pending_branches': 'pending_branch_count',
+            }[key]
+            summary[branch_count_key] = len(raw_records)
+            if len(raw_records) > _GLOBAL_SEMANTIC_LATE_FILL_BRANCH_LIMIT:
+                summary[f'{key}_truncated'] = True
+        if int(summary.get('failed_branch_count') or 0) > 0:
+            summary['status'] = 'failed'
+        elif int(summary.get('pending_branch_count') or 0) > 0:
+            summary['status'] = 'pending'
+        elif int(summary.get('completed_branch_count') or 0) > 0:
+            summary['status'] = 'completed'
+        for capability_key, branch_key in (
+            ('completed_capabilities', 'completed_branches'),
+            ('failed_capabilities', 'failed_branches'),
+        ):
+            capabilities = list(
+                dict.fromkeys(
+                    str(record.get('capability') or '').strip()
+                    for record in summary.get(branch_key) or []
+                    if isinstance(record, Mapping)
+                    and str(record.get('capability') or '').strip()
+                )
+            )
+            if capabilities:
+                summary[capability_key] = capabilities[:32]
+            if len(capabilities) > 32:
+                summary[f'{capability_key}_truncated'] = True
+        return cls._compact_mapping(summary)
+
+    def _resolved_semantic_review_artifact_path(
+        self,
+        path_value: Any,
+    ) -> Optional[Path]:
+        raw_path = str(path_value or '').strip()
+        resolver = self.hooks.get('resolve_semantic_review_artifact_path')
+        if not raw_path or not callable(resolver):
+            return None
+        try:
+            resolved = resolver(raw_path)
+            if resolved is None:
+                return None
+            path = Path(resolved).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        return path if path.is_file() else None
+
+    def _global_semantic_text_artifact_excerpt(
+        self,
+        path_value: Any,
+        *,
+        byte_limit: int,
+    ) -> dict[str, Any]:
+        raw_path = str(path_value or '').strip()
+        if not raw_path or byte_limit <= 0:
+            return {}
+        path = self._resolved_semantic_review_artifact_path(raw_path)
+        if path is None:
+            return {}
+        if path.suffix.lower().lstrip('.') not in TEXT_ARTIFACT_EXTENSIONS:
+            return {}
+        try:
+            size_bytes = path.stat().st_size
+            if not path.is_file():
+                return {}
+            excerpt_marker = b'\n[... middle omitted ...]\n'
+            excerpt_bytes = (
+                byte_limit
+                if size_bytes <= byte_limit
+                else max(0, byte_limit - len(excerpt_marker))
+            )
+            head_size = excerpt_bytes if size_bytes <= byte_limit else (excerpt_bytes * 3) // 4
+            tail_size = 0 if size_bytes <= byte_limit else excerpt_bytes - head_size
+            digest = hashlib.sha256()
+            head = bytearray()
+            tail = bytearray()
+            actual_size_bytes = 0
+            with path.open('rb') as handle:
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    actual_size_bytes += len(chunk)
+                    if len(head) < head_size:
+                        head.extend(chunk[: head_size - len(head)])
+                    if tail_size:
+                        tail.extend(chunk)
+                        if len(tail) > tail_size:
+                            del tail[:-tail_size]
+            truncated = actual_size_bytes > byte_limit
+            if truncated and tail_size:
+                content = bytes(head) + excerpt_marker + bytes(tail)
+                mode = 'head_tail'
+            else:
+                content = bytes(head[:byte_limit])
+                mode = 'head' if truncated else 'full'
+        except (OSError, RuntimeError, ValueError):
+            return {}
+        return {
+            'content_excerpt': content.decode('utf-8', errors='replace'),
+            'content_excerpt_mode': mode,
+            'content_excerpt_truncated': truncated,
+            'content_source_size_bytes': actual_size_bytes,
+            'current_content_sha256': digest.hexdigest(),
+        }
+
+    def _global_semantic_artifact_file_identity(
+        self,
+        path_value: Any,
+    ) -> dict[str, Any]:
+        raw_path = str(path_value or '').strip()
+        if not raw_path:
+            return {}
+        path = self._resolved_semantic_review_artifact_path(raw_path)
+        if path is None:
+            return {'current_file_status': 'outside_allowed_artifact_roots'}
+        try:
+            if not path.is_file():
+                return {'current_file_status': 'missing'}
+            digest = hashlib.sha256()
+            size_bytes = 0
+            with path.open('rb') as handle:
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+        except (OSError, RuntimeError, ValueError):
+            return {'current_file_status': 'unreadable'}
+        return {
+            'current_file_status': 'available',
+            'current_file_size_bytes': size_bytes,
+            'current_file_sha256': digest.hexdigest(),
+        }
 
     def _global_semantic_evidence_payload(
         self,
@@ -6821,96 +7277,241 @@ class ResponseSemanticsRuntimeOwner:
         payload = artifact_payload if isinstance(artifact_payload, dict) else {}
         late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
         artifacts = self._hook('build_canonical_response_artifacts')(payload) if payload else []
+        artifact_records = [
+            item
+            for item in (artifacts or [])
+            if isinstance(item, Mapping)
+        ]
         artifact_refs: list[dict[str, Any]] = []
-        for item in artifacts or []:
-            if not isinstance(item, Mapping):
+        artifact_manifest_records: list[dict[str, Any]] = []
+        artifact_limit = 128
+        artifact_excerpt_bytes_remaining = _GLOBAL_SEMANTIC_ARTIFACT_EXCERPT_TOTAL_LIMIT
+        for index, item in enumerate(artifact_records):
+            artifact_path = item.get('path') or item.get('source_path')
+            artifact_ref = {
+                'type': item.get('type'),
+                'path': artifact_path,
+                'name': item.get('name'),
+                'ref': item.get('ref') or item.get('artifact_ref'),
+                'branch_id': item.get('branch_id'),
+                'phase_id': item.get('phase_id'),
+                'status': item.get('status'),
+                'sha256': item.get('sha256') or item.get('content_sha256'),
+                'size_bytes': item.get('size_bytes'),
+            }
+            artifact_ref.update(
+                self._global_semantic_artifact_file_identity(artifact_path)
+            )
+            artifact_manifest_records.append(self._compact_mapping(artifact_ref))
+            if index >= artifact_limit:
                 continue
+            display_ref = dict(artifact_ref)
+            if str(item.get('type') or '').strip().lower() == 'text':
+                excerpt_budget = min(
+                    _GLOBAL_SEMANTIC_ARTIFACT_EXCERPT_LIMIT,
+                    artifact_excerpt_bytes_remaining,
+                )
+                excerpt = self._global_semantic_text_artifact_excerpt(
+                    artifact_path,
+                    byte_limit=excerpt_budget,
+                )
+                if excerpt:
+                    display_ref.update(excerpt)
+                    excerpt_bytes_used = len(
+                        str(excerpt.get('content_excerpt') or '').encode(
+                            'utf-8',
+                            errors='replace',
+                        )
+                    )
+                    artifact_excerpt_bytes_remaining = max(
+                        0,
+                        artifact_excerpt_bytes_remaining - excerpt_bytes_used,
+                    )
             artifact_refs.append(
+                self._compact_mapping(display_ref)
+            )
+        artifact_dependency_ids = list(
+            dict.fromkeys(
+                str(item.get('phase_id') or item.get('branch_id') or '').strip()
+                for item in artifact_manifest_records
+                if str(item.get('phase_id') or item.get('branch_id') or '').strip()
+            )
+        )
+        artifact_manifest_sha256 = self._semantic_manifest_sha256(
+            artifact_manifest_records
+        )
+        closure_check_limit = 128
+        closure_check_records: list[dict[str, Any]] = []
+        for check in checks:
+            if not isinstance(check, Mapping):
+                continue
+            check_kind = str(check.get('check_kind') or '').strip()
+            branch_id = str(check.get('branch_id') or check.get('phase_id') or '').strip()
+            stage_direction = str(check.get('stage_direction') or '').strip()
+            if (
+                check_kind == 'global_semantic_closure'
+                or stage_direction == 'run_global_semantic_closure_review'
+                or 'global-semantic-closure-review' in branch_id.lower()
+            ):
+                continue
+            closure_check_records.append(
                 self._compact_mapping(
                     {
-                        'type': item.get('type'),
-                        'path': item.get('path') or item.get('source_path'),
-                        'name': item.get('name'),
-                        'ref': item.get('ref') or item.get('artifact_ref'),
-                        'branch_id': item.get('branch_id'),
-                        'phase_id': item.get('phase_id'),
+                        key: check.get(key)
+                        for key in (
+                            'check_kind',
+                            'status',
+                            'evidence',
+                            'reason',
+                            'obligation_id',
+                            'phase_id',
+                            'branch_id',
+                            'capability',
+                            'output_type',
+                            'role',
+                            'depends_on',
+                            'review_criteria',
+                            'review_criteria_status',
+                            'semantic_review_required',
+                            'semantic_review_criteria',
+                            'repair_action',
+                        )
                     }
                 )
             )
+        closure_check_manifest_sha256 = self._semantic_manifest_sha256(
+            closure_check_records
+        )
         return self._compact_mapping(
             {
                 'artifact_refs': artifact_refs,
-                'late_fill': {
-                    key: late_fill.get(key)
-                    for key in (
-                        'status',
-                        'completed_capabilities',
-                        'failed_capabilities',
-                        'completed_branches',
-                        'failed_branches',
-                        'pending_branches',
-                    )
-                    if late_fill.get(key) not in (None, '', [], {})
-                },
-                'closure_checks': [
-                    self._compact_mapping(
-                        {
-                            key: check.get(key)
-                            for key in (
-                                'check_kind',
-                                'status',
-                                'evidence',
-                                'reason',
-                                'obligation_id',
-                                'phase_id',
-                                'branch_id',
-                                'capability',
-                                'output_type',
-                                'role',
-                                'depends_on',
-                                'review_criteria',
-                                'review_criteria_status',
-                                'semantic_review_required',
-                                'semantic_review_criteria',
-                                'repair_action',
-                            )
-                        }
-                    )
-                    for check in checks
-                    if isinstance(check, Mapping)
-                ],
-                'intent_graph_adequacy': {
-                    key: intent_graph_adequacy.get(key)
-                    for key in ('status', 'reason', 'expected_output_counts', 'graph_output_counts', 'checks')
-                    if isinstance(intent_graph_adequacy, Mapping) and intent_graph_adequacy.get(key) not in (None, '', [], {})
-                },
-                'semantic_decision_review': (
+                'artifact_ref_count': len(artifact_records),
+                'artifact_refs_truncated': len(artifact_records) > artifact_limit,
+                'artifact_manifest_sha256': artifact_manifest_sha256,
+                'artifact_manifest_policy': 'canonical_artifact_current_bytes_sha256_v1',
+                'artifact_dependency_ids': artifact_dependency_ids,
+                'late_fill': self._global_semantic_late_fill_summary(late_fill),
+                'closure_checks': closure_check_records[:closure_check_limit],
+                'closure_check_count': len(closure_check_records),
+                'closure_checks_truncated': len(closure_check_records) > closure_check_limit,
+                'closure_check_manifest_sha256': closure_check_manifest_sha256,
+                'closure_check_manifest_policy': 'closure_check_projection_sha256_v1',
+                'intent_graph_adequacy': self._global_semantic_intent_graph_adequacy_summary(
+                    intent_graph_adequacy
+                ),
+                'semantic_decision_review': self._global_semantic_review_evidence_summary(
                     decision_contract.get('semantic_decision_review')
                     if isinstance(decision_contract, Mapping)
                     else None
                 ),
-                'controlled_attention_review': (
+                'controlled_attention_review': self._global_semantic_review_evidence_summary(
                     decision_contract.get('controlled_attention_review')
                     if isinstance(decision_contract, Mapping)
                     else None
                 ),
-                'aspiration_review': (
+                'aspiration_review': self._global_semantic_review_evidence_summary(
                     decision_contract.get('aspiration_review')
                     if isinstance(decision_contract, Mapping)
                     else None
                 ),
-                'commitment_review': (
+                'commitment_review': self._global_semantic_review_evidence_summary(
                     decision_contract.get('commitment_review')
                     if isinstance(decision_contract, Mapping)
                     else None
                 ),
-                'semantic_quality_review': (
+                'semantic_quality_review': self._global_semantic_review_evidence_summary(
                     decision_contract.get('semantic_quality_review')
                     if isinstance(decision_contract, Mapping)
                     else None
                 ),
             }
         )
+
+    @classmethod
+    def _global_semantic_intent_graph_adequacy_summary(
+        cls,
+        review: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(review, Mapping):
+            return {}
+        summary: dict[str, Any] = {}
+        for key in (
+            'status',
+            'reason',
+            'intent_obligation_count',
+            'required_intent_obligation_count',
+        ):
+            value = review.get(key)
+            if isinstance(value, str):
+                value = cls._bounded_global_semantic_text(value, limit=800)
+            if value not in (None, '', [], {}):
+                summary[key] = value
+        for key in (
+            'expected_output_counts',
+            'graph_output_counts',
+            'expected_capability_counts',
+            'graph_capability_counts',
+        ):
+            raw_counts = review.get(key) if isinstance(review.get(key), Mapping) else {}
+            records = [
+                {
+                    'key': cls._bounded_global_semantic_text(raw_key, limit=160),
+                    'value': cls._bounded_semantic_value(raw_value, limit=600),
+                }
+                for raw_key, raw_value in raw_counts.items()
+            ]
+            if records:
+                summary[key] = {
+                    record['key']: record['value']
+                    for record in records[:64]
+                }
+                summary[f'{key}_count'] = len(records)
+                summary[f'{key}_sha256'] = cls._semantic_manifest_sha256(records)
+                if len(records) > 64:
+                    summary[f'{key}_truncated'] = True
+        for key in ('required_intent_capabilities', 'intent_obligation_kinds'):
+            values = [
+                cls._bounded_global_semantic_text(item, limit=320)
+                for item in cls._string_list(review.get(key))[:64]
+            ]
+            if values:
+                summary[key] = values
+        raw_checks = review.get('checks') if isinstance(review.get('checks'), list) else []
+        check_records: list[dict[str, Any]] = []
+        for raw_check in raw_checks:
+            if not isinstance(raw_check, Mapping):
+                continue
+            record = {
+                key: raw_check.get(key)
+                for key in (
+                    'check_kind',
+                    'status',
+                    'evidence',
+                    'reason',
+                    'obligation_id',
+                    'phase_id',
+                    'branch_id',
+                    'capability',
+                    'output_type',
+                    'repair_action',
+                )
+                if raw_check.get(key) not in (None, '', [], {})
+            }
+            record = {
+                key: cls._bounded_semantic_value(value, limit=600)
+                for key, value in record.items()
+            }
+            check_records.append(cls._compact_mapping(record))
+        if check_records:
+            summary['checks'] = check_records[:128]
+            summary['check_count'] = len(check_records)
+            summary['check_manifest_sha256'] = cls._semantic_manifest_sha256(
+                check_records
+            )
+            summary['check_manifest_policy'] = 'intent_graph_adequacy_check_projection_sha256_v1'
+            if len(check_records) > 128:
+                summary['checks_truncated'] = True
+        return cls._compact_mapping(summary)
 
     def _global_semantic_review_instruction(
         self,
@@ -6919,6 +7520,8 @@ class ResponseSemanticsRuntimeOwner:
         output_text: str,
         evidence_payload: Mapping[str, Any],
     ) -> str:
+        bounded_prompt = self._bounded_global_semantic_text(prompt)
+        bounded_output_text = self._bounded_global_semantic_text(output_text)
         return (
             'Run a whole-turn semantic closure review for the current Ollmo response.\n'
             '\n'
@@ -6952,11 +7555,31 @@ class ResponseSemanticsRuntimeOwner:
             'Use verdict "failed" when evidence proves missing or wrong work.\n'
             'Use verdict "uncertain" when evidence is insufficient or ambiguous.\n'
             '\n'
-            f'Current user intent:\n{prompt}\n\n'
-            f'Current response text:\n{output_text}\n\n'
+            f'Current user intent:\n{bounded_prompt}\n\n'
+            f'Current response text:\n{bounded_output_text}\n\n'
             'Runtime evidence:\n'
             f'{self._json_for_semantic_review_prompt(evidence_payload)}'
         )
+
+    @staticmethod
+    def _global_semantic_review_generation(content_payload: str) -> dict[str, Any]:
+        digest_input = (
+            f'{_GLOBAL_SEMANTIC_REVIEW_EVIDENCE_POLICY}\0'
+            f'{str(content_payload or "")}'
+        ).encode('utf-8')
+        digest = hashlib.sha256(digest_input).hexdigest()
+        generation_id = f'global-semantic-closure-review-{digest}'
+        return {
+            'kind': 'ollmo.semantic_review_evidence_binding',
+            'policy': _GLOBAL_SEMANTIC_REVIEW_EVIDENCE_POLICY,
+            'logical_review_id': 'global-semantic-closure-review',
+            'generation_id': generation_id,
+            'sha256': digest,
+            'branch_id': f'branch-{generation_id}',
+            'phase_id': f'phase-{generation_id}',
+            'obligation_id': f'obligation-{generation_id}',
+            'task_id': f'task-{generation_id}',
+        }
 
     @staticmethod
     def _semantic_review_branch_slug(value: Any) -> str:
@@ -6965,15 +7588,111 @@ class ResponseSemanticsRuntimeOwner:
         return token or 'unknown-branch'
 
     @classmethod
-    def _branch_semantic_review_identity(cls, check: Mapping[str, Any]) -> tuple[str, str, str]:
+    def _branch_semantic_review_generation(
+        cls,
+        check: Mapping[str, Any],
+        content_payload: str,
+    ) -> dict[str, Any]:
         source_branch_id = str(check.get('branch_id') or check.get('phase_id') or check.get('obligation_id') or '').strip()
         source_phase_id = str(check.get('phase_id') or source_branch_id or '').strip()
         slug = cls._semantic_review_branch_slug(source_branch_id or source_phase_id or check.get('obligation_id'))
-        return (
-            f'branch-semantic-review-{slug}',
-            f'phase-semantic-review-{slug}',
-            f'obligation-semantic-review-{slug}',
-        )
+        logical_review_id = f'branch-semantic-review:{source_branch_id or source_phase_id}'
+        digest = hashlib.sha256(
+            (
+                f'{_BRANCH_SEMANTIC_REVIEW_EVIDENCE_POLICY}\0'
+                f'{logical_review_id}\0{str(content_payload or "")}'
+            ).encode('utf-8')
+        ).hexdigest()
+        generation_id = f'branch-semantic-review-{slug}-{digest}'
+        return {
+            'kind': 'ollmo.semantic_review_evidence_binding',
+            'policy': _BRANCH_SEMANTIC_REVIEW_EVIDENCE_POLICY,
+            'logical_review_id': logical_review_id,
+            'generation_id': generation_id,
+            'source_branch_id': source_branch_id,
+            'source_phase_id': source_phase_id,
+            'sha256': digest,
+            'branch_id': f'branch-{generation_id}',
+            'phase_id': f'phase-{generation_id}',
+            'obligation_id': f'obligation-{generation_id}',
+            'task_id': f'task-{generation_id}',
+        }
+
+    @classmethod
+    def _branch_semantic_check_projection(
+        cls,
+        check: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        projection = {
+            key: check.get(key)
+            for key in (
+                'check_kind',
+                'status',
+                'evidence',
+                'reason',
+                'obligation_id',
+                'phase_id',
+                'branch_id',
+                'capability',
+                'output_type',
+                'role',
+                'review_criteria_status',
+                'semantic_review_required',
+                'semantic_review_lens',
+                'success_definition',
+                'content_payload_source',
+            )
+            if check.get(key) not in (None, '', [], {})
+        }
+        projection = {
+            key: cls._bounded_semantic_value(value, limit=1_200)
+            for key, value in projection.items()
+        }
+        for key in (
+            'depends_on',
+            'review_criteria',
+            'semantic_review_criteria',
+            'failure_modes',
+            'semantic_lens_evidence_requirements',
+            'evidence_requirements',
+        ):
+            values = [
+                cls._bounded_global_semantic_text(item, limit=600)
+                for item in cls._string_list(check.get(key))[:64]
+            ]
+            if values:
+                projection[key] = values
+        input_refs: list[dict[str, Any]] = []
+        for raw_ref in check.get('input_refs') or []:
+            if not isinstance(raw_ref, Mapping):
+                continue
+            ref = {
+                key: raw_ref.get(key)
+                for key in (
+                    'kind',
+                    'ref',
+                    'phase_id',
+                    'branch_id',
+                    'obligation_id',
+                    'role',
+                    'path',
+                    'name',
+                )
+                if raw_ref.get(key) not in (None, '', [], {})
+            }
+            input_refs.append(
+                cls._compact_mapping(
+                    {
+                        key: cls._bounded_semantic_value(value, limit=600)
+                        for key, value in ref.items()
+                    }
+                )
+            )
+            if len(input_refs) >= 64:
+                break
+        if input_refs:
+            projection['input_refs'] = input_refs
+        return cls._compact_mapping(projection)
 
     @classmethod
     def _check_is_branch_semantic_review_target(cls, check: Mapping[str, Any]) -> bool:
@@ -7009,24 +7728,66 @@ class ResponseSemanticsRuntimeOwner:
         branch_record, branch_status = self._late_fill_branch_record(payload, source_branch_id)
         artifacts = self._hook('build_canonical_response_artifacts')(payload) if payload else []
         artifact_refs: list[dict[str, Any]] = []
+        artifact_manifest_digest = hashlib.sha256()
+        artifact_manifest_count = 0
+        artifact_excerpt_bytes_remaining = _GLOBAL_SEMANTIC_ARTIFACT_EXCERPT_LIMIT
         for item in artifacts or []:
             if not isinstance(item, Mapping):
                 continue
             item_branch = str(item.get('branch_id') or item.get('phase_id') or '').strip()
-            if item_branch and item_branch not in {source_branch_id, source_phase_id}:
+            if item_branch not in {source_branch_id, source_phase_id}:
                 continue
-            artifact_refs.append(
-                self._compact_mapping(
-                    {
-                        'type': item.get('type'),
-                        'path': item.get('path') or item.get('source_path'),
-                        'name': item.get('name'),
-                        'ref': item.get('ref') or item.get('artifact_ref'),
-                        'branch_id': item.get('branch_id'),
-                        'phase_id': item.get('phase_id'),
-                    }
-                )
+            artifact_path = item.get('path') or item.get('source_path')
+            artifact_ref = {
+                'type': item.get('type'),
+                'path': artifact_path,
+                'name': item.get('name'),
+                'ref': item.get('ref') or item.get('artifact_ref'),
+                'branch_id': item.get('branch_id'),
+                'phase_id': item.get('phase_id'),
+                'status': item.get('status'),
+                'sha256': item.get('sha256') or item.get('content_sha256'),
+                'size_bytes': item.get('size_bytes'),
+            }
+            artifact_ref.update(
+                self._global_semantic_artifact_file_identity(artifact_path)
             )
+            artifact_ref = self._compact_mapping(artifact_ref)
+            encoded_manifest_record = json.dumps(
+                artifact_ref,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=str,
+            ).encode('utf-8', errors='replace')
+            artifact_manifest_digest.update(
+                len(encoded_manifest_record).to_bytes(8, byteorder='big')
+            )
+            artifact_manifest_digest.update(encoded_manifest_record)
+            artifact_manifest_count += 1
+            if len(artifact_refs) >= 64:
+                continue
+            display_ref = {
+                key: self._bounded_semantic_value(value, limit=1_200)
+                for key, value in artifact_ref.items()
+            }
+            if str(item.get('type') or '').strip().lower() == 'text':
+                excerpt = self._global_semantic_text_artifact_excerpt(
+                    artifact_path,
+                    byte_limit=artifact_excerpt_bytes_remaining,
+                )
+                if excerpt:
+                    display_ref.update(excerpt)
+                    artifact_excerpt_bytes_remaining = max(
+                        0,
+                        artifact_excerpt_bytes_remaining
+                        - len(
+                            str(excerpt.get('content_excerpt') or '').encode(
+                                'utf-8', errors='replace'
+                            )
+                        ),
+                    )
+            artifact_refs.append(self._compact_mapping(display_ref))
         branch_output_text = ''
         for key in ('result_text', 'output_text', 'content_payload', 'text', 'transcript'):
             value = branch_record.get(key) if isinstance(branch_record, Mapping) else None
@@ -7035,58 +7796,46 @@ class ResponseSemanticsRuntimeOwner:
                 break
         if not branch_output_text and str(check.get('evidence') or '').strip() == 'current_phase_output_text':
             branch_output_text = str(output_text or '').strip()
+        bounded_branch_output = self._bounded_global_semantic_text(branch_output_text)
+        branch_check = self._branch_semantic_check_projection(check)
+        branch_record_projection = {
+            key: branch_record.get(key)
+            for key in (
+                'branch_id',
+                'phase_id',
+                'capability',
+                'output_type',
+                'status',
+                'content_payload_source',
+                'saved_text_path',
+                'saved_audio_path',
+                'saved_image_path',
+            )
+            if isinstance(branch_record, Mapping) and branch_record.get(key) not in (None, '', [], {})
+        }
         return self._compact_mapping(
             {
                 'review_scope': 'branch_only',
                 'source_branch_id': source_branch_id,
                 'source_phase_id': source_phase_id,
                 'branch_late_fill_status': branch_status or None,
-                'branch_record': {
-                    key: branch_record.get(key)
-                    for key in (
-                        'branch_id',
-                        'phase_id',
-                        'capability',
-                        'output_type',
-                        'result_text',
-                        'content_payload_source',
-                        'saved_text_path',
-                        'saved_audio_path',
-                        'saved_image_path',
-                    )
-                    if isinstance(branch_record, Mapping) and branch_record.get(key) not in (None, '', [], {})
-                },
-                'branch_output_text': branch_output_text or None,
+                'branch_record': branch_record_projection,
+                'branch_output_text': bounded_branch_output or None,
+                'branch_output_size_chars': len(branch_output_text),
+                'branch_output_sha256': (
+                    hashlib.sha256(
+                        branch_output_text.encode('utf-8', errors='replace')
+                    ).hexdigest()
+                    if branch_output_text
+                    else None
+                ),
                 'artifact_refs': artifact_refs,
-                'branch_check': {
-                    key: check.get(key)
-                    for key in (
-                        'check_kind',
-                        'status',
-                        'evidence',
-                        'reason',
-                        'obligation_id',
-                        'phase_id',
-                        'branch_id',
-                        'capability',
-                        'output_type',
-                        'role',
-                        'depends_on',
-                        'review_criteria',
-                        'review_criteria_status',
-                        'semantic_review_required',
-                        'semantic_review_criteria',
-                        'semantic_review_lens',
-                        'success_definition',
-                        'failure_modes',
-                        'semantic_lens_evidence_requirements',
-                        'semantic_review_lens_contract',
-                        'execution_contract',
-                        'input_refs',
-                        'content_payload_source',
-                    )
-                    if check.get(key) not in (None, '', [], {})
-                },
+                'artifact_ref_count': artifact_manifest_count,
+                'artifact_refs_truncated': artifact_manifest_count > 64,
+                'artifact_manifest_sha256': artifact_manifest_digest.hexdigest(),
+                'artifact_manifest_policy': 'branch_artifact_ordered_length_prefixed_sha256_v2',
+                'branch_check': branch_check,
+                'branch_check_sha256': self._semantic_manifest_sha256([branch_check]),
             }
         )
 
@@ -7097,6 +7846,8 @@ class ResponseSemanticsRuntimeOwner:
         check: Mapping[str, Any],
         evidence_payload: Mapping[str, Any],
     ) -> str:
+        bounded_prompt = self._bounded_global_semantic_text(prompt)
+        bounded_check = self._branch_semantic_check_projection(check)
         return (
             'Run a branch-local semantic review for the current Ollmo response graph.\n'
             '\n'
@@ -7133,51 +7884,153 @@ class ResponseSemanticsRuntimeOwner:
             'Use the provided semantic_review_lens and success_definition as the review posture for this branch. '
             'They are advisory only, but they define what kind of success should be checked and which failure modes matter.\n'
             '\n'
-            f'Current user intent for context only:\n{prompt}\n\n'
+            f'Current user intent for context only:\n{bounded_prompt}\n\n'
             'Branch under review:\n'
-            f'{self._json_for_semantic_review_prompt(check)}\n\n'
+            f'{self._json_for_semantic_review_prompt(bounded_check)}\n\n'
             'Branch runtime evidence:\n'
             f'{self._json_for_semantic_review_prompt(evidence_payload)}'
         )
+
+    def _branch_semantic_review_contract(
+        self,
+        *,
+        artifact_payload: Optional[dict[str, Any]],
+        check: Mapping[str, Any],
+        prompt: str,
+        output_text: str,
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        evidence_payload = self._branch_semantic_evidence_payload(
+            artifact_payload=artifact_payload,
+            check=check,
+            output_text=output_text,
+        )
+        content_payload = self._branch_semantic_review_instruction(
+            prompt=prompt,
+            check=check,
+            evidence_payload=evidence_payload,
+        )
+        evidence_binding = self._branch_semantic_review_generation(
+            check,
+            content_payload,
+        )
+        return evidence_payload, content_payload, evidence_binding
 
     def _apply_branch_semantic_verdict_to_check(
         self,
         check: Mapping[str, Any],
         *,
         artifact_payload: Optional[dict[str, Any]],
+        prompt: str,
+        output_text: str,
     ) -> dict[str, Any]:
         updated = dict(check)
         if not self._check_is_branch_semantic_review_target(updated):
             return updated
-        review_branch_id, review_phase_id, _ = self._branch_semantic_review_identity(updated)
+        _, _, evidence_binding = self._branch_semantic_review_contract(
+            artifact_payload=artifact_payload,
+            check=updated,
+            prompt=prompt,
+            output_text=output_text,
+        )
+        review_branch_id = str(evidence_binding.get('branch_id') or '').strip()
+        review_phase_id = str(evidence_binding.get('phase_id') or '').strip()
+        evidence_sha256 = str(evidence_binding.get('sha256') or '').strip().lower()
+        logical_review_id = str(evidence_binding.get('logical_review_id') or '').strip()
         verdict = self._semantic_review_verdict_from_late_fill(
             artifact_payload,
             review_branch_id,
-            review_id=f'branch-semantic-review:{str(updated.get("branch_id") or updated.get("phase_id") or "").strip()}',
+            review_id=logical_review_id,
+            expected_evidence_sha256=evidence_sha256,
+        )
+        previous_evidence_binding = (
+            dict(updated.get('branch_semantic_review_evidence_binding'))
+            if isinstance(
+                updated.get('branch_semantic_review_evidence_binding'),
+                Mapping,
+            )
+            else {}
         )
         updated['branch_semantic_review_branch_id'] = review_branch_id
         updated['branch_semantic_review_phase_id'] = review_phase_id
         updated['branch_semantic_review_source_branch_id'] = str(updated.get('branch_id') or '').strip() or None
         updated['branch_semantic_review_source_phase_id'] = str(updated.get('phase_id') or '').strip() or None
+        updated['branch_semantic_review_evidence_binding'] = evidence_binding
         if not verdict:
+            stale_verdict = (
+                updated.get('semantic_review_verdict')
+                if isinstance(updated.get('semantic_review_verdict'), Mapping)
+                else {}
+            )
+            if stale_verdict:
+                updated['ignored_stale_branch_semantic_review'] = self._compact_mapping(
+                    {
+                        'kind': 'ollmo.ignored_stale_branch_semantic_review',
+                        'reason': 'no completed branch review matches the current evidence generation',
+                        'stale_evidence_sha256': previous_evidence_binding.get('sha256'),
+                        'current_evidence_sha256': evidence_sha256,
+                    }
+                )
+            for key in (
+                'semantic_review_verdict',
+                'semantic_review_verdict_status',
+                'semantic_review_recommended_transition',
+                'semantic_review_freeze_acceptance',
+                'branch_semantic_review',
+            ):
+                updated.pop(key, None)
             updated['branch_semantic_review_status'] = 'pending'
             return updated
+        required_criteria = [
+            item
+            for item in (
+                self._string_list(updated.get('semantic_review_criteria'))
+                or self._string_list(updated.get('review_criteria'))
+            )
+            if not self._review_criterion_is_deterministic(item)
+        ]
+        freeze_acceptance = semantic_review_verdict_freeze_acceptance(
+            verdict,
+            required_criteria=required_criteria,
+        )
+        verdict = dict(verdict)
+        verdict['freeze_acceptance'] = freeze_acceptance
+        accepted = freeze_acceptance.get('accepted') is True
+        branch_review_status = (
+            'fulfilled'
+            if accepted
+            else 'blocked'
+            if str(verdict.get('status') or '').strip().lower() == 'blocked'
+            else 'pending'
+        )
         updated['semantic_review_verdict'] = verdict
         updated['semantic_review_verdict_status'] = verdict.get('status')
         updated['semantic_review_recommended_transition'] = verdict.get('recommended_transition')
+        updated['semantic_review_freeze_acceptance'] = freeze_acceptance
         updated['branch_semantic_review'] = {
             'kind': 'ollmo.branch_semantic_review',
-            'status': verdict.get('status'),
+            'status': branch_review_status,
             'review_branch_id': review_branch_id,
             'review_phase_id': review_phase_id,
             'source_branch_id': updated.get('branch_id'),
             'source_phase_id': updated.get('phase_id'),
+            'semantic_review_evidence_binding': evidence_binding,
+            'semantic_review_freeze_acceptance': freeze_acceptance,
             'semantic_review_verdict': verdict,
             'authority': 'advisory_branch_review_runtime_closure_decides_truth',
         }
-        updated['branch_semantic_review_status'] = verdict.get('status')
-        transition_action = self._recovery_action_for_semantic_review_transition(verdict.get('recommended_transition'))
-        if str(verdict.get('verdict') or '').strip() == 'passed':
+        updated['branch_semantic_review_status'] = branch_review_status
+        rejected_pass = (
+            str(verdict.get('verdict') or '').strip().lower() == 'passed'
+            and not accepted
+        )
+        transition_action = (
+            RECOVERY_ACTION_MANUAL_REVIEW
+            if rejected_pass
+            else self._recovery_action_for_semantic_review_transition(
+                verdict.get('recommended_transition')
+            )
+        )
+        if accepted:
             updated['semantic_review_required'] = False
             updated['review_criteria_status'] = 'passed_semantic_review'
             updated['semantic_review_action'] = None
@@ -7192,8 +8045,14 @@ class ResponseSemanticsRuntimeOwner:
         updated['repair_required'] = True
         updated['repair_action'] = transition_action or RECOVERY_ACTION_MANUAL_REVIEW
         updated['recovery_action'] = transition_action or RECOVERY_ACTION_MANUAL_REVIEW
+        rejection_reasons = self._string_list(freeze_acceptance.get('rejection_reasons'))
         updated['repair_action_reason'] = (
-            str(verdict.get('whole_intent_fit') or verdict.get('reason') or '').strip()
+            (
+                'branch semantic review verdict did not satisfy the strict truthful-freeze contract'
+                + (f': {", ".join(rejection_reasons)}' if rejection_reasons else '')
+            )
+            if rejected_pass
+            else str(verdict.get('whole_intent_fit') or verdict.get('reason') or '').strip()
             or 'branch semantic review did not pass'
         )
         updated['branch_semantic_review_reason'] = updated['repair_action_reason']
@@ -7226,29 +8085,36 @@ class ResponseSemanticsRuntimeOwner:
                 continue
             if not self._check_is_branch_semantic_review_target(source_check):
                 continue
-            if isinstance(source_check.get('semantic_review_verdict'), Mapping):
-                continue
-            review_branch_id, review_phase_id, review_obligation_id = self._branch_semantic_review_identity(source_check)
+            evidence_payload, content_payload, evidence_binding = (
+                self._branch_semantic_review_contract(
+                    artifact_payload=artifact_payload,
+                    check=source_check,
+                    prompt=prompt,
+                    output_text=output_text,
+                )
+            )
+            review_branch_id = str(evidence_binding.get('branch_id') or '').strip()
+            review_phase_id = str(evidence_binding.get('phase_id') or '').strip()
+            review_obligation_id = str(evidence_binding.get('obligation_id') or '').strip()
+            review_task_id = str(evidence_binding.get('task_id') or '').strip()
+            evidence_sha256 = str(evidence_binding.get('sha256') or '').strip().lower()
+            projected_check = (
+                evidence_payload.get('branch_check')
+                if isinstance(evidence_payload.get('branch_check'), Mapping)
+                else {}
+            )
             if review_branch_id in existing_review_branch_ids:
                 continue
-            evidence_payload = self._branch_semantic_evidence_payload(
-                artifact_payload=artifact_payload,
-                check=source_check,
-                output_text=output_text,
-            )
-            content_payload = self._branch_semantic_review_instruction(
-                prompt=prompt,
-                check=source_check,
-                evidence_payload=evidence_payload,
-            )
             execution_contract = {
                 'kind': 'ollmo.execution_contract',
                 'branch_id': review_branch_id,
                 'phase_id': review_phase_id,
                 'capability': CAPABILITY_CHAT,
                 'output_type': 'text',
+                'visibility': _SEMANTIC_REVIEW_VISIBILITY,
+                'surface_role': _SEMANTIC_REVIEW_SURFACE_ROLE,
                 'workload_task_ref': {
-                    'task_id': f'task-{review_phase_id}',
+                    'task_id': review_task_id,
                     'phase_id': review_phase_id,
                     'branch_id': review_branch_id,
                 },
@@ -7262,14 +8128,21 @@ class ResponseSemanticsRuntimeOwner:
                     'output_type': 'text',
                     'required': True,
                     'fulfillment_policy': 'branch_semantic_review_verdict_required',
-                    'semantic_review_lens': source_check.get('semantic_review_lens'),
-                    'success_definition': source_check.get('success_definition'),
+                    'visibility': _SEMANTIC_REVIEW_VISIBILITY,
+                    'surface_role': _SEMANTIC_REVIEW_SURFACE_ROLE,
+                    'semantic_review_lens': projected_check.get('semantic_review_lens'),
+                    'success_definition': projected_check.get('success_definition'),
                 },
                 'input_refs': [
                     {'kind': 'branch_under_review', 'ref': str(source_check.get('branch_id') or source_check.get('phase_id') or '')},
                     {'kind': 'branch_review_criteria', 'ref': 'source_check.review_criteria'},
                     {'kind': 'runtime_evidence', 'ref': 'source_branch_evidence'},
+                    {
+                        'kind': 'semantic_review_evidence_sha256',
+                        'ref': evidence_sha256,
+                    },
                 ],
+                'semantic_review_evidence_binding': evidence_binding,
             }
             review_checks.append(
                 self._compact_mapping(
@@ -7281,8 +8154,11 @@ class ResponseSemanticsRuntimeOwner:
                         'obligation_id': review_obligation_id,
                         'phase_id': review_phase_id,
                         'branch_id': review_branch_id,
+                        'task_id': review_task_id,
                         'capability': CAPABILITY_CHAT,
                         'output_type': 'text',
+                        'visibility': _SEMANTIC_REVIEW_VISIBILITY,
+                        'surface_role': _SEMANTIC_REVIEW_SURFACE_ROLE,
                         'role': 'branch_semantic_review_output',
                         'depends_on': [str(source_check.get('branch_id') or source_check.get('phase_id') or '').strip()],
                         'repair_action': RECOVERY_ACTION_SEMANTIC_REVIEW,
@@ -7291,15 +8167,14 @@ class ResponseSemanticsRuntimeOwner:
                         'semantic_review_required': True,
                         'semantic_review_action': RECOVERY_ACTION_SEMANTIC_REVIEW,
                         'semantic_review_authority': 'closure_promoted_branch_semantic_review',
-                        'semantic_review_criteria': source_check.get('semantic_review_criteria') or source_check.get('review_criteria'),
-                        'semantic_review_lens': source_check.get('semantic_review_lens'),
-                        'success_definition': source_check.get('success_definition'),
-                        'failure_modes': source_check.get('failure_modes'),
-                        'semantic_lens_evidence_requirements': source_check.get('semantic_lens_evidence_requirements') or source_check.get('evidence_requirements'),
-                        'semantic_review_lens_contract': source_check.get('semantic_review_lens_contract'),
+                        'semantic_review_criteria': projected_check.get('semantic_review_criteria') or projected_check.get('review_criteria'),
+                        'semantic_review_lens': projected_check.get('semantic_review_lens'),
+                        'success_definition': projected_check.get('success_definition'),
+                        'failure_modes': projected_check.get('failure_modes'),
+                        'semantic_lens_evidence_requirements': projected_check.get('semantic_lens_evidence_requirements') or projected_check.get('evidence_requirements'),
                         'review_criteria': [
                             'runtime_text_exists_when_fulfilled',
-                            *(self._string_list(source_check.get('semantic_review_criteria')) or self._string_list(source_check.get('review_criteria'))),
+                            *(self._string_list(projected_check.get('semantic_review_criteria')) or self._string_list(projected_check.get('review_criteria'))),
                         ],
                         'branch_semantic_review': {
                             'kind': 'ollmo.branch_semantic_review',
@@ -7308,6 +8183,7 @@ class ResponseSemanticsRuntimeOwner:
                             'review_phase_id': review_phase_id,
                             'source_branch_id': source_check.get('branch_id'),
                             'source_phase_id': source_check.get('phase_id'),
+                            'semantic_review_evidence_binding': evidence_binding,
                             'authority': 'advisory_branch_review_runtime_closure_decides_truth',
                         },
                         'branch_semantic_review_branch_id': review_branch_id,
@@ -7315,8 +8191,10 @@ class ResponseSemanticsRuntimeOwner:
                         'branch_semantic_review_status': 'pending',
                         'branch_semantic_review_source_branch_id': source_check.get('branch_id'),
                         'branch_semantic_review_source_phase_id': source_check.get('phase_id'),
+                        'branch_semantic_review_evidence_binding': evidence_binding,
+                        'semantic_review_evidence_binding': evidence_binding,
                         'content_payload': content_payload,
-                        'content_payload_source': f'branch_semantic_review:{str(source_check.get("branch_id") or source_check.get("phase_id") or "").strip()}',
+                        'content_payload_source': evidence_binding.get('logical_review_id'),
                         'stage_direction': 'run_branch_semantic_review',
                         'execution_contract': execution_contract,
                         'input_refs': execution_contract['input_refs'],
@@ -7335,15 +8213,63 @@ class ResponseSemanticsRuntimeOwner:
         return normalize_recovery_suggested_action(transition, default=RECOVERY_ACTION_SEMANTIC_REVIEW)
 
     @classmethod
+    def _global_semantic_required_criteria(
+        cls,
+        checks: Sequence[Mapping[str, Any]],
+        semantic_quality_contracts: Sequence[Mapping[str, Any]],
+    ) -> list[str]:
+        required: list[str] = []
+        identities: set[str] = set()
+
+        def _add(values: Any) -> None:
+            for value in cls._string_list(values):
+                if cls._review_criterion_is_deterministic(value):
+                    continue
+                identity = cls._normalized_review_criterion(value)
+                if not identity or identity in identities:
+                    continue
+                identities.add(identity)
+                required.append(value)
+
+        for check in checks:
+            if not isinstance(check, Mapping):
+                continue
+            _add(check.get('semantic_review_criteria') or check.get('review_criteria'))
+        for contract in semantic_quality_contracts:
+            if not isinstance(contract, Mapping):
+                continue
+            _add(contract.get('semantic_review_criteria') or contract.get('review_criteria'))
+        return required
+
+    @classmethod
     def _global_semantic_verdict_proposal(cls, verdict: Mapping[str, Any]) -> dict[str, Any]:
         transition = str(verdict.get('recommended_transition') or '').strip().lower()
+        freeze_acceptance = (
+            verdict.get('freeze_acceptance')
+            if isinstance(verdict.get('freeze_acceptance'), Mapping)
+            else {}
+        )
+        rejected_pass = bool(
+            freeze_acceptance
+            and freeze_acceptance.get('accepted') is not True
+            and str(verdict.get('verdict') or '').strip().lower() == 'passed'
+            and transition == 'truthful_freeze'
+        )
+        if rejected_pass:
+            transition = RECOVERY_ACTION_MANUAL_REVIEW
         action = cls._recovery_action_for_semantic_review_transition(transition)
         defects = verdict.get('defects') if isinstance(verdict.get('defects'), list) else []
-        reason = (
-            str(verdict.get('whole_intent_fit') or '').strip()
-            or str(verdict.get('reason') or '').strip()
-            or 'semantic review verdict did not pass'
-        )
+        if rejected_pass:
+            rejection_reasons = cls._string_list(freeze_acceptance.get('rejection_reasons'))
+            reason = 'semantic review verdict did not satisfy the strict truthful-freeze contract'
+            if rejection_reasons:
+                reason = f'{reason}: {", ".join(rejection_reasons)}'
+        else:
+            reason = (
+                str(verdict.get('whole_intent_fit') or '').strip()
+                or str(verdict.get('reason') or '').strip()
+                or 'semantic review verdict did not pass'
+            )
         if defects:
             reason = f'{reason}; defects: {", ".join(str(item) for item in defects)}'
         return cls._compact_mapping(
@@ -7416,6 +8342,10 @@ class ResponseSemanticsRuntimeOwner:
             if isinstance(semantic_quality_review.get('contracts'), list)
             else []
         )
+        required_semantic_criteria = self._global_semantic_required_criteria(
+            checks,
+            semantic_quality_contracts,
+        )
         controlled_attention_review = (
             decision_contract.get('controlled_attention_review')
             if isinstance(decision_contract, Mapping) and isinstance(decision_contract.get('controlled_attention_review'), Mapping)
@@ -7439,12 +8369,6 @@ class ResponseSemanticsRuntimeOwner:
             )
             for contract in semantic_quality_contracts
         )
-        completed_status = self._late_fill_branch_status(artifact_payload, 'branch-global-semantic-closure-review')
-        completed_semantic_review_verdict = self._semantic_review_verdict_from_late_fill(
-            artifact_payload,
-            'branch-global-semantic-closure-review',
-            review_id='global-semantic-closure-review',
-        ) if completed_status == 'fulfilled' else {}
         structural_pending = (
             isinstance(intent_graph_adequacy, Mapping)
             and str(intent_graph_adequacy.get('status') or '').strip().lower() == 'pending'
@@ -7462,67 +8386,6 @@ class ResponseSemanticsRuntimeOwner:
             }
             for check in checks
         )
-        if completed_status == 'fulfilled' and str(completed_semantic_review_verdict.get('verdict') or '').strip() == 'passed':
-            return self._compact_mapping(
-                {
-                    'kind': 'ollmo.global_semantic_closure_review',
-                    'status': 'fulfilled',
-                    'authority': 'advisory_review_output_runtime_evidence',
-                    'policy': 'whole_turn_semantic_fit_checked_after_runtime_materialization',
-                    'reason': 'global semantic review branch returned a passed verdict',
-                    'proposal_count': 0,
-                    'completed_branch_id': 'branch-global-semantic-closure-review',
-                    'semantic_review_verdict': completed_semantic_review_verdict,
-                    'semantic_review_verdict_status': completed_semantic_review_verdict.get('status'),
-                    'semantic_review_recommended_transition': completed_semantic_review_verdict.get('recommended_transition'),
-                }
-            )
-        if completed_status == 'fulfilled':
-            proposal = self._global_semantic_verdict_proposal(completed_semantic_review_verdict)
-            verdict_status = str(completed_semantic_review_verdict.get('status') or '').strip().lower()
-            status = 'blocked' if verdict_status == 'blocked' else 'pending'
-            return self._compact_mapping(
-                {
-                    'kind': 'ollmo.global_semantic_closure_review',
-                    'status': status,
-                    'authority': 'advisory_until_closure_confirms_verdict_transition',
-                    'policy': 'semantic_review_completion_requires_structured_pass_verdict_before_freeze',
-                    'reason': (
-                        'global semantic review branch completed but did not return a passed verdict'
-                    ),
-                    'intent_anchor': prompt or None,
-                    'proposal_count': 1 if proposal else 0,
-                    'semantic_check_count': len(semantic_checks),
-                    'structural_adequacy_status': (
-                        str(intent_graph_adequacy.get('status') or '').strip().lower()
-                        if isinstance(intent_graph_adequacy, Mapping)
-                        else None
-                    ),
-                    'semantic_decision_proposal_count': len(semantic_decision_proposals),
-                    'controlled_attention_frame_count': int(controlled_attention_review.get('frame_count') or 0),
-                    'aspiration_frame_count': int(aspiration_review.get('frame_count') or 0),
-                    'commitment_frame_count': int(commitment_review.get('frame_count') or 0),
-                    'semantic_quality_status': str(semantic_quality_review.get('status') or '').strip() or None,
-                    'completed_branch_id': 'branch-global-semantic-closure-review',
-                    'semantic_review_verdict': completed_semantic_review_verdict,
-                    'semantic_review_verdict_status': completed_semantic_review_verdict.get('status'),
-                    'semantic_review_recommended_transition': completed_semantic_review_verdict.get('recommended_transition'),
-                    'proposals': [proposal] if proposal else [],
-                    'review_branch_id': 'branch-global-semantic-closure-review',
-                    'content_payload': self._global_semantic_review_instruction(
-                        prompt=prompt,
-                        output_text=output_text,
-                        evidence_payload=self._global_semantic_evidence_payload(
-                            artifact_payload=artifact_payload,
-                            checks=checks,
-                            intent_graph_adequacy=intent_graph_adequacy,
-                            decision_contract=decision_contract,
-                        ),
-                    ),
-                    'content_payload_source': 'global_semantic_closure_review',
-                    'stage_direction': 'run_global_semantic_closure_review',
-                }
-            )
         if not structural_pending and not semantic_pending:
             return self._compact_mapping(
                 {
@@ -7558,6 +8421,114 @@ class ResponseSemanticsRuntimeOwner:
             intent_graph_adequacy=intent_graph_adequacy,
             decision_contract=decision_contract,
         )
+        content_payload = self._global_semantic_review_instruction(
+            prompt=prompt,
+            output_text=output_text,
+            evidence_payload=evidence_payload,
+        )
+        evidence_binding = self._global_semantic_review_generation(content_payload)
+        review_branch_id = str(evidence_binding.get('branch_id') or '').strip()
+        review_phase_id = str(evidence_binding.get('phase_id') or '').strip()
+        review_obligation_id = str(evidence_binding.get('obligation_id') or '').strip()
+        review_task_id = str(evidence_binding.get('task_id') or '').strip()
+        evidence_sha256 = str(evidence_binding.get('sha256') or '').strip()
+        completed_record, completed_status = self._late_fill_branch_record(
+            artifact_payload,
+            review_branch_id,
+        )
+        if (
+            completed_status == 'fulfilled'
+            and self._semantic_review_evidence_sha256_from_record(completed_record)
+            != evidence_sha256
+        ):
+            completed_status = ''
+        completed_semantic_review_verdict = (
+            self._semantic_review_verdict_from_late_fill(
+                artifact_payload,
+                review_branch_id,
+                review_id='global-semantic-closure-review',
+                expected_evidence_sha256=evidence_sha256,
+            )
+            if completed_status == 'fulfilled'
+            else {}
+        )
+        completed_freeze_acceptance = (
+            semantic_review_verdict_freeze_acceptance(
+                completed_semantic_review_verdict,
+                required_criteria=required_semantic_criteria,
+            )
+            if completed_semantic_review_verdict
+            else {}
+        )
+        if completed_semantic_review_verdict:
+            completed_semantic_review_verdict = dict(completed_semantic_review_verdict)
+            completed_semantic_review_verdict['freeze_acceptance'] = completed_freeze_acceptance
+        if completed_status == 'fulfilled' and completed_freeze_acceptance.get('accepted') is True:
+            return self._compact_mapping(
+                {
+                    'kind': 'ollmo.global_semantic_closure_review',
+                    'status': 'fulfilled',
+                    'authority': 'advisory_review_output_runtime_evidence',
+                    'policy': 'whole_turn_semantic_fit_checked_after_runtime_materialization',
+                    'reason': 'global semantic review branch returned a passed verdict for the current evidence generation',
+                    'proposal_count': 0,
+                    'completed_branch_id': review_branch_id,
+                    'review_branch_id': review_branch_id,
+                    'review_phase_id': review_phase_id,
+                    'review_obligation_id': review_obligation_id,
+                    'review_task_id': review_task_id,
+                    'semantic_review_evidence_binding': evidence_binding,
+                    'required_semantic_criteria': required_semantic_criteria,
+                    'semantic_review_freeze_acceptance': completed_freeze_acceptance,
+                    'semantic_review_verdict': completed_semantic_review_verdict,
+                    'semantic_review_verdict_status': completed_semantic_review_verdict.get('status'),
+                    'semantic_review_recommended_transition': completed_semantic_review_verdict.get('recommended_transition'),
+                }
+            )
+        if completed_status == 'fulfilled':
+            proposal = self._global_semantic_verdict_proposal(completed_semantic_review_verdict)
+            verdict_status = str(completed_semantic_review_verdict.get('status') or '').strip().lower()
+            status = 'blocked' if verdict_status == 'blocked' else 'pending'
+            return self._compact_mapping(
+                {
+                    'kind': 'ollmo.global_semantic_closure_review',
+                    'status': status,
+                    'authority': 'advisory_until_closure_confirms_verdict_transition',
+                    'policy': 'semantic_review_completion_requires_strict_truthful_freeze_contract',
+                    'reason': (
+                        'global semantic review branch completed but did not satisfy the strict truthful-freeze contract'
+                    ),
+                    'intent_anchor': prompt or None,
+                    'proposal_count': 1 if proposal else 0,
+                    'semantic_check_count': len(semantic_checks),
+                    'structural_adequacy_status': (
+                        str(intent_graph_adequacy.get('status') or '').strip().lower()
+                        if isinstance(intent_graph_adequacy, Mapping)
+                        else None
+                    ),
+                    'semantic_decision_proposal_count': len(semantic_decision_proposals),
+                    'controlled_attention_frame_count': int(controlled_attention_review.get('frame_count') or 0),
+                    'aspiration_frame_count': int(aspiration_review.get('frame_count') or 0),
+                    'commitment_frame_count': int(commitment_review.get('frame_count') or 0),
+                    'semantic_quality_status': str(semantic_quality_review.get('status') or '').strip() or None,
+                    'completed_branch_id': review_branch_id,
+                    'required_semantic_criteria': required_semantic_criteria,
+                    'semantic_review_freeze_acceptance': completed_freeze_acceptance,
+                    'semantic_review_verdict': completed_semantic_review_verdict,
+                    'semantic_review_verdict_status': completed_semantic_review_verdict.get('status'),
+                    'semantic_review_recommended_transition': completed_semantic_review_verdict.get('recommended_transition'),
+                    'proposals': [proposal] if proposal else [],
+                    'review_branch_id': review_branch_id,
+                    'review_phase_id': review_phase_id,
+                    'review_obligation_id': review_obligation_id,
+                    'review_task_id': review_task_id,
+                    'semantic_review_evidence_binding': evidence_binding,
+                    'dependency_phase_ids': evidence_payload.get('artifact_dependency_ids'),
+                    'content_payload': content_payload,
+                    'content_payload_source': 'global_semantic_closure_review',
+                    'stage_direction': 'run_global_semantic_closure_review',
+                }
+            )
         proposals: list[dict[str, Any]] = []
         if structural_pending:
             proposals.append(
@@ -7647,12 +8618,13 @@ class ResponseSemanticsRuntimeOwner:
                 'commitment_frame_count': int(commitment_review.get('frame_count') or 0),
                 'semantic_quality_status': str(semantic_quality_review.get('status') or '').strip() or None,
                 'proposals': proposals,
-                'review_branch_id': 'branch-global-semantic-closure-review',
-                'content_payload': self._global_semantic_review_instruction(
-                    prompt=prompt,
-                    output_text=output_text,
-                    evidence_payload=evidence_payload,
-                ),
+                'review_branch_id': review_branch_id,
+                'review_phase_id': review_phase_id,
+                'review_obligation_id': review_obligation_id,
+                'review_task_id': review_task_id,
+                'semantic_review_evidence_binding': evidence_binding,
+                'dependency_phase_ids': evidence_payload.get('artifact_dependency_ids'),
+                'content_payload': content_payload,
                 'content_payload_source': 'global_semantic_closure_review',
                 'stage_direction': 'run_global_semantic_closure_review',
             }
@@ -7667,6 +8639,7 @@ class ResponseSemanticsRuntimeOwner:
         if str(global_review.get('status') or '').strip().lower() not in {'pending', 'blocked'}:
             return []
         proposals = global_review.get('proposals') if isinstance(global_review.get('proposals'), list) else []
+        dependency_phase_ids = self._string_list(global_review.get('dependency_phase_ids'))
         checks: list[dict[str, Any]] = []
         for proposal in proposals:
             if not isinstance(proposal, Mapping):
@@ -7689,16 +8662,28 @@ class ResponseSemanticsRuntimeOwner:
                 if action != RECOVERY_ACTION_SEMANTIC_REVIEW:
                     continue
             branch_id = str(global_review.get('review_branch_id') or 'branch-global-semantic-closure-review').strip()
-            phase_id = 'phase-global-semantic-closure-review'
-            obligation_id = 'obligation-global-semantic-closure-review'
+            phase_id = str(global_review.get('review_phase_id') or 'phase-global-semantic-closure-review').strip()
+            obligation_id = str(
+                global_review.get('review_obligation_id')
+                or 'obligation-global-semantic-closure-review'
+            ).strip()
+            task_id = str(global_review.get('review_task_id') or 'task-global-semantic-closure-review').strip()
+            evidence_binding = (
+                dict(global_review.get('semantic_review_evidence_binding'))
+                if isinstance(global_review.get('semantic_review_evidence_binding'), Mapping)
+                else {}
+            )
+            evidence_sha256 = str(evidence_binding.get('sha256') or '').strip().lower()
             execution_contract = {
                 'kind': 'ollmo.execution_contract',
                 'branch_id': branch_id,
                 'phase_id': phase_id,
                 'capability': CAPABILITY_CHAT,
                 'output_type': 'text',
+                'visibility': _SEMANTIC_REVIEW_VISIBILITY,
+                'surface_role': _SEMANTIC_REVIEW_SURFACE_ROLE,
                 'workload_task_ref': {
-                    'task_id': 'task-global-semantic-closure-review',
+                    'task_id': task_id,
                     'phase_id': phase_id,
                     'branch_id': branch_id,
                 },
@@ -7712,12 +8697,29 @@ class ResponseSemanticsRuntimeOwner:
                     'output_type': 'text',
                     'required': True,
                     'fulfillment_policy': 'semantic_review_text_required',
+                    'visibility': _SEMANTIC_REVIEW_VISIBILITY,
+                    'surface_role': _SEMANTIC_REVIEW_SURFACE_ROLE,
                 },
                 'input_refs': [
                     {'kind': 'intent_anchor', 'ref': 'current_user_intent'},
                     {'kind': 'closure_checks', 'ref': 'runtime.graph_closure_review.checks'},
                     {'kind': 'runtime_evidence', 'ref': 'artifacts_and_late_fill'},
+                    *(
+                        [
+                            {
+                                'kind': 'semantic_review_evidence_sha256',
+                                'ref': evidence_sha256,
+                            }
+                        ]
+                        if evidence_sha256
+                        else []
+                    ),
+                    *[
+                        {'kind': 'runtime_artifact_phase', 'ref': phase_id}
+                        for phase_id in dependency_phase_ids
+                    ],
                 ],
+                'semantic_review_evidence_binding': evidence_binding,
             }
             checks.append(
                 self._compact_mapping(
@@ -7729,8 +8731,12 @@ class ResponseSemanticsRuntimeOwner:
                         'obligation_id': obligation_id,
                         'phase_id': phase_id,
                         'branch_id': branch_id,
+                        'task_id': task_id,
+                        'depends_on': dependency_phase_ids,
                         'capability': CAPABILITY_CHAT,
                         'output_type': 'text',
+                        'visibility': _SEMANTIC_REVIEW_VISIBILITY,
+                        'surface_role': _SEMANTIC_REVIEW_SURFACE_ROLE,
                         'role': 'semantic_review_transition',
                         'repair_action': action,
                         'recovery_action': action,
@@ -7767,6 +8773,7 @@ class ResponseSemanticsRuntimeOwner:
                                 'semantic_quality_status',
                                 'semantic_review_verdict_status',
                                 'semantic_review_recommended_transition',
+                                'semantic_review_evidence_binding',
                             )
                             if global_review.get(key) not in (None, '', [], {})
                         },
@@ -7793,6 +8800,7 @@ class ResponseSemanticsRuntimeOwner:
                         'content_payload': global_review.get('content_payload'),
                         'content_payload_source': global_review.get('content_payload_source'),
                         'stage_direction': global_review.get('stage_direction'),
+                        'semantic_review_evidence_binding': evidence_binding,
                         'execution_contract': execution_contract,
                         'input_refs': execution_contract['input_refs'],
                     }
@@ -11422,7 +12430,7 @@ class ResponseSemanticsRuntimeOwner:
         if not isinstance(payload, Mapping):
             return []
         records: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str, str]] = set()
+        record_index_by_identity: dict[tuple[str, ...], int] = {}
 
         def add_record(raw_record: Any, *, defaults: Optional[Mapping[str, Any]] = None) -> None:
             if not isinstance(raw_record, Mapping):
@@ -11432,18 +12440,42 @@ class ResponseSemanticsRuntimeOwner:
             artifact_type = str(record.get('type') or record.get('kind') or '').strip().lower()
             path = _artifact_path(record)
             content = str(record.get('content') or record.get('text') or record.get('result_text') or '').strip()
-            key = (
-                artifact_type,
-                path,
-                str(record.get('branch_id') or '').strip(),
-                str(record.get('phase_id') or '').strip(),
-            )
             if not artifact_type and not path and not content:
                 return
-            if key in seen:
+            normalized_path = self._normalized_text_artifact_path_for_closure(path)
+            artifact_ref = str(record.get('artifact_ref') or record.get('ref') or '').strip()
+            if normalized_path:
+                # The saved path is the physical artifact identity.  Type,
+                # branch, and phase describe that artifact but must not turn
+                # one shared target into competing Closure owners.
+                identity = ('path', normalized_path)
+            elif artifact_ref:
+                identity = ('artifact_ref', artifact_type, artifact_ref)
+            else:
+                identity = (
+                    'unbound',
+                    artifact_type,
+                    str(record.get('branch_id') or '').strip(),
+                    str(record.get('phase_id') or '').strip(),
+                    hashlib.sha256(content.encode('utf-8')).hexdigest() if content else '',
+                )
+            existing_index = record_index_by_identity.get(identity)
+            if existing_index is not None:
+                existing = records[existing_index]
+                for key, value in record.items():
+                    if value in (None, '', [], {}):
+                        continue
+                    if existing.get(key) in (None, '', [], {}):
+                        existing[key] = value
                 return
-            seen.add(key)
-            records.append({key: value for key, value in record.items() if value not in (None, '', [], {})})
+            record_index_by_identity[identity] = len(records)
+            records.append(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if value not in (None, '', [], {})
+                }
+            )
 
         for artifact in payload.get('artifacts') or []:
             add_record(artifact)
@@ -11487,36 +12519,25 @@ class ResponseSemanticsRuntimeOwner:
 
     @staticmethod
     def _text_artifact_record_content(record: Mapping[str, Any]) -> str:
-        # A refreshed artifact may intentionally carry only a bounded preview.
-        # That preview is transport/UI data, never Closure authority.  Read the
-        # canonical saved file first whenever the record says the preview was
-        # truncated so syntax and cross-file checks see the complete bytes.
-        if record.get('content_preview_truncated') is True:
-            path = _artifact_path(record)
-            if path:
-                try:
-                    target = Path(path).expanduser()
-                    if target.is_file() and target.stat().st_size <= 512_000:
-                        return target.read_text(
-                            encoding='utf-8',
-                            errors='replace',
-                        ).strip()
-                except OSError:
-                    pass
+        # Saved files are canonical artifact bytes.  In-memory content may be
+        # a bounded preview or a target-bound repair prompt carried by the
+        # same branch, so prefer the current file whenever it is available.
+        path = _artifact_path(record)
+        if path:
+            try:
+                target = Path(path).expanduser()
+                if target.is_file() and target.stat().st_size <= 512_000:
+                    return target.read_text(
+                        encoding='utf-8',
+                        errors='replace',
+                    ).strip()
+            except OSError:
+                pass
         for key in ('content', 'text', 'result_text', 'content_payload'):
             value = record.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        path = _artifact_path(record)
-        if not path:
-            return ''
-        try:
-            target = Path(path).expanduser()
-            if not target.is_file() or target.stat().st_size > 512_000:
-                return ''
-            return target.read_text(encoding='utf-8', errors='replace').strip()
-        except OSError:
-            return ''
+        return ''
 
     @staticmethod
     def _bounded_repair_content_block(label: str, content: str, *, limit: int = _HTML_CSS_SELECTOR_BINDING_CONTENT_LIMIT) -> list[str]:
@@ -11786,6 +12807,7 @@ class ResponseSemanticsRuntimeOwner:
         if not text.strip():
             return []
         issues: list[str] = []
+        raw_text_spans = [match.span() for match in _HTML_RAW_TEXT_BLOCK_RE.finditer(text)]
         for match in _HTML_MALFORMED_CLASS_ONLY_OPEN_TAG_RE.finditer(text):
             issues.append(
                 f'HTML has malformed class-only opening tag at line {cls._line_number_for_offset(text, match.start())}'
@@ -11793,6 +12815,8 @@ class ResponseSemanticsRuntimeOwner:
             if len(issues) >= 6:
                 return issues
         for match in _HTML_MARKUP_IN_ATTRIBUTE_RE.finditer(text):
+            if cls._offset_is_inside_spans(match.start(), raw_text_spans):
+                continue
             issues.append(
                 f'HTML attribute contains markup-like closing tag at line {cls._line_number_for_offset(text, match.start())}'
             )
@@ -13632,12 +14656,11 @@ class ResponseSemanticsRuntimeOwner:
             id(record): self._text_artifact_record_content(record)
             for record in [*html_records, *css_records]
         }
-        checks: list[dict[str, Any]] = []
+        html_records_by_css_id: dict[int, list[dict[str, Any]]] = {
+            id(css_record): [] for css_record in css_records
+        }
         for html_record in html_records:
             html_content = content_by_id.get(id(html_record), '')
-            html_tokens = self._html_class_tokens(html_content)
-            if len(html_tokens) < _HTML_CSS_SELECTOR_BINDING_MIN_TOKENS:
-                continue
             linked_css_records = [
                 css_record
                 for css_record in css_records
@@ -13646,92 +14669,129 @@ class ResponseSemanticsRuntimeOwner:
             if not linked_css_records and len(css_records) == 1:
                 linked_css_records = css_records
             for css_record in linked_css_records:
-                css_content = content_by_id.get(id(css_record), '')
-                css_tokens = self._css_class_selector_tokens(css_content)
-                if len(css_tokens) < _HTML_CSS_SELECTOR_BINDING_MIN_TOKENS:
-                    continue
-                html_without_css = sorted(html_tokens - css_tokens)
-                css_without_html = sorted(css_tokens - html_tokens)
-                if (
-                    len(html_without_css) < _HTML_CSS_SELECTOR_BINDING_MIN_MISSING
-                    or len(css_without_html) < _HTML_CSS_SELECTOR_BINDING_MIN_MISSING
-                    or len(html_without_css) / max(1, len(html_tokens))
-                    < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
-                    or len(css_without_html) / max(1, len(css_tokens))
-                    < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
-                ):
-                    continue
+                html_records_by_css_id[id(css_record)].append(html_record)
 
-                css_path = _artifact_path(css_record)
-                css_name = _artifact_source_name(css_record) or 'styles'
-                css_display_path = _ollmo_relative_path(css_path) if css_path else ''
+        checks: list[dict[str, Any]] = []
+        for css_record in css_records:
+            linked_html_records = html_records_by_css_id.get(id(css_record), [])
+            if not linked_html_records:
+                continue
+            html_tokens: set[str] = set()
+            html_display_paths: list[str] = []
+            for html_record in linked_html_records:
+                html_content = content_by_id.get(id(html_record), '')
+                html_tokens.update(self._html_class_tokens(html_content))
                 html_path = _artifact_path(html_record)
                 html_display_path = (
                     _ollmo_relative_path(html_path)
                     if html_path
                     else _artifact_source_name(html_record)
                 )
-                content_payload = '\n'.join(
-                    [
-                        f'Target text artifact: {css_display_path or css_name}',
-                        f'Linked HTML artifact: {html_display_path}',
-                        'HTML/CSS selector binding drift:',
-                        '- HTML classes not targeted by linked CSS: '
-                        + ', '.join(html_without_css[:16]),
-                        '- CSS class selectors not present in linked HTML: '
-                        + ', '.join(css_without_html[:16]),
-                        *self._bounded_repair_content_block(
-                            'Current saved HTML file content', html_content
-                        ),
-                        *self._bounded_repair_content_block(
-                            'Current saved CSS target file content', css_content
-                        ),
-                        'Update only the target CSS artifact. Preserve declarations, copy, valid runtime artifact links, and visual intent. Rename or add selectors only as needed so the CSS targets the actual saved HTML classes.',
-                    ]
-                ).strip()
-                check = {
-                    'check_kind': 'html_css_selector_binding',
-                    'status': 'pending',
-                    'evidence': 'html_css_selector_drift',
-                    'reason': 'saved HTML and linked CSS use divergent class vocabularies before closure',
-                    'capability': CAPABILITY_CHAT,
-                    'output_type': 'text',
-                    'role': 'html_css_selector_binding_repair',
-                    'branch_id': str(css_record.get('branch_id') or '').strip() or None,
-                    'phase_id': str(css_record.get('phase_id') or css_record.get('branch_id') or '').strip() or None,
-                    'repair_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
-                    'recovery_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
-                    'repair_action_reason': 'linked CSS must be patched to target the saved HTML class vocabulary',
-                    'content_payload': content_payload,
-                    'content_payload_source': 'closure_html_css_selector_binding_review',
-                    'stage_direction': 'materialize_requested_text_artifact',
-                    'requires_artifact': True,
-                    'text_artifact_extension': 'css',
-                    'text_artifact_source_name': css_name,
-                    'text_artifact_source': 'closure_selector_binding_repair',
-                    'text_artifact_target_path': css_path,
-                    'artifact_request': {
-                        'extension': 'css',
-                        'source_name': css_name,
-                        'source': 'closure_selector_binding_repair',
-                        'target_path': css_path,
-                    },
-                    'review_criteria': [
-                        'html_css_selector_binding',
-                        'preserve_runtime_artifact_links',
-                    ],
-                    'html_class_tokens_missing_css_selectors': html_without_css[:24],
-                    'css_class_selectors_missing_html_usage': css_without_html[:24],
-                    'html_class_count': len(html_tokens),
-                    'css_selector_class_count': len(css_tokens),
-                }
-                checks.append(
-                    {
-                        key: value
-                        for key, value in check.items()
-                        if value not in (None, '', [], {})
-                    }
+                html_display_paths.append(
+                    html_display_path
+                    or f'linked-html-{len(html_display_paths) + 1}.html'
                 )
+            if len(html_tokens) < _HTML_CSS_SELECTOR_BINDING_MIN_TOKENS:
+                continue
+
+            css_content = content_by_id.get(id(css_record), '')
+            css_tokens = self._css_class_selector_tokens(css_content)
+            if len(css_tokens) < _HTML_CSS_SELECTOR_BINDING_MIN_TOKENS:
+                continue
+            html_without_css = sorted(html_tokens - css_tokens)
+            css_without_html = sorted(css_tokens - html_tokens)
+            if (
+                len(html_without_css) < _HTML_CSS_SELECTOR_BINDING_MIN_MISSING
+                or len(css_without_html) < _HTML_CSS_SELECTOR_BINDING_MIN_MISSING
+                or len(html_without_css) / max(1, len(html_tokens))
+                < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
+                or len(css_without_html) / max(1, len(css_tokens))
+                < _HTML_CSS_SELECTOR_BINDING_MIN_RATIO
+            ):
+                continue
+
+            css_path = _artifact_path(css_record)
+            css_name = _artifact_source_name(css_record) or 'styles'
+            css_display_path = _ollmo_relative_path(css_path) if css_path else ''
+            per_html_content_limit = max(
+                1000,
+                _HTML_CSS_SELECTOR_BINDING_CONTENT_LIMIT
+                // max(1, len(linked_html_records)),
+            )
+            html_content_lines: list[str] = []
+            for html_record, html_display_path in zip(
+                linked_html_records,
+                html_display_paths,
+            ):
+                html_content_lines.extend(
+                    self._bounded_repair_content_block(
+                        f'Current saved HTML file content ({html_display_path})',
+                        content_by_id.get(id(html_record), ''),
+                        limit=per_html_content_limit,
+                    )
+                )
+            content_payload = '\n'.join(
+                [
+                    f'Target text artifact: {css_display_path or css_name}',
+                    'Linked HTML artifacts:',
+                    *[f'- {path}' for path in html_display_paths],
+                    'HTML/CSS selector binding drift across the shared stylesheet:',
+                    '- HTML classes not targeted by linked CSS: '
+                    + ', '.join(html_without_css[:16]),
+                    '- CSS class selectors not present in linked HTML: '
+                    + ', '.join(css_without_html[:16]),
+                    *html_content_lines,
+                    *self._bounded_repair_content_block(
+                        'Current saved CSS target file content', css_content
+                    ),
+                    'Update only the target CSS artifact. Cover the combined class vocabulary of every linked HTML artifact while preserving declarations, copy, valid runtime artifact links, and visual intent. Rename or add selectors only as needed so the shared CSS targets the actual saved HTML classes.',
+                ]
+            ).strip()
+            check = {
+                'check_kind': 'html_css_selector_binding',
+                'status': 'pending',
+                'evidence': 'html_css_selector_drift',
+                'reason': 'saved HTML and linked CSS use divergent class vocabularies before closure',
+                'capability': CAPABILITY_CHAT,
+                'output_type': 'text',
+                'role': 'html_css_selector_binding_repair',
+                'branch_id': str(css_record.get('branch_id') or '').strip() or None,
+                'phase_id': str(css_record.get('phase_id') or css_record.get('branch_id') or '').strip() or None,
+                'repair_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
+                'recovery_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
+                'repair_action_reason': 'linked CSS must be patched to target the saved HTML class vocabulary',
+                'content_payload': content_payload,
+                'content_payload_source': 'closure_html_css_selector_binding_review',
+                'stage_direction': 'materialize_requested_text_artifact',
+                'requires_artifact': True,
+                'text_artifact_extension': 'css',
+                'text_artifact_source_name': css_name,
+                'text_artifact_source': 'closure_selector_binding_repair',
+                'text_artifact_target_path': css_path,
+                'artifact_request': {
+                    'extension': 'css',
+                    'source_name': css_name,
+                    'source': 'closure_selector_binding_repair',
+                    'target_path': css_path,
+                },
+                'review_criteria': [
+                    'html_css_selector_binding',
+                    'preserve_runtime_artifact_links',
+                ],
+                'html_class_tokens_missing_css_selectors': html_without_css[:24],
+                'css_class_selectors_missing_html_usage': css_without_html[:24],
+                'html_class_count': len(html_tokens),
+                'css_selector_class_count': len(css_tokens),
+                'linked_html_artifact_count': len(linked_html_records),
+                'linked_html_artifact_paths': html_display_paths,
+            }
+            checks.append(
+                {
+                    key: value
+                    for key, value in check.items()
+                    if value not in (None, '', [], {})
+                }
+            )
         return checks
 
     def _text_artifact_syntax_sanity_checks(
@@ -15199,6 +16259,10 @@ class ResponseSemanticsRuntimeOwner:
                 candidates.append(top_level)
             return dict(candidates[0]) if candidates else {}
 
+        semantic_review_prompt = self._current_request_prompt_for_review(
+            request_payload,
+            request_phase_graph,
+        )
         for raw_source in check_sources:
             if not isinstance(raw_source, Mapping):
                 continue
@@ -15589,6 +16653,8 @@ class ResponseSemanticsRuntimeOwner:
             check = self._apply_branch_semantic_verdict_to_check(
                 check,
                 artifact_payload=artifact_payload,
+                prompt=semantic_review_prompt,
+                output_text=output_text,
             )
             repair_action, repair_action_reason = self._closure_check_recovery_action(check)
             if repair_action and check.get('repair_action') in (None, '', [], {}):

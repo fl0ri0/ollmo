@@ -1,0 +1,282 @@
+{
+  "artifacts": [
+    {
+      "artifact_ref": "artifact:text_95d6008dcb360eff7bb44134",
+      "branch_id": "branch-text_artifact-1",
+      "bundle_path": "bundle/index.html",
+      "mime_type": "text/html",
+      "phase_id": "phase-5",
+      "published_path": "artifacts/documents/index.html",
+      "sha256": "2884bba7436dffcedceb2e09621089a1f3ea08f188765f1eb9d1f751fd6aea9a",
+      "size_bytes": 2395,
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:text_8b2746ad7af81ed1fca70dd6",
+      "branch_id": "branch-text_artifact-2",
+      "bundle_path": "bundle/assets/css/styles.css",
+      "mime_type": "text/css",
+      "phase_id": "phase-6",
+      "published_path": "artifacts/documents/styles.css",
+      "sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+      "size_bytes": 2446,
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:image_9441f6b58f53a33a509b7b39",
+      "branch_id": "branch-image_generation-1",
+      "bundle_path": "bundle/assets/images/image-01.png",
+      "height": 1024,
+      "mime_type": "image/png",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/images/image-01.png",
+      "sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+      "size_bytes": 978300,
+      "type": "image",
+      "width": 1024
+    },
+    {
+      "artifact_ref": "artifact:image_77cfcefa7503408c727bae93",
+      "branch_id": "branch-image_generation-2",
+      "bundle_path": "bundle/assets/images/image-02.png",
+      "height": 1024,
+      "mime_type": "image/png",
+      "phase_id": "phase-3",
+      "published_path": "artifacts/images/image-02.png",
+      "sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+      "size_bytes": 1495723,
+      "type": "image",
+      "width": 1024
+    },
+    {
+      "artifact_ref": "artifact:audio_bbeb9e3421ca62a9f4c29224",
+      "branch_id": "branch-text_to_speech-1",
+      "bundle_path": "bundle/assets/audio/narration.wav",
+      "channels": 1,
+      "duration_seconds": 5.36,
+      "mime_type": "audio/wav",
+      "phase_id": "phase-4",
+      "published_path": "artifacts/audio/narration.wav",
+      "sample_rate_hz": 24000,
+      "sample_width_bits": 16,
+      "sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+      "size_bytes": 257324,
+      "type": "audio"
+    }
+  ],
+  "bundle": {
+    "entrypoint": "index.html",
+    "files": [
+      {
+        "artifact_ref": "artifact:audio_bbeb9e3421ca62a9f4c29224",
+        "relative_path": "assets/audio/narration.wav",
+        "sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+        "size_bytes": 257324,
+        "source_sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+        "type": "audio"
+      },
+      {
+        "artifact_ref": "artifact:text_8b2746ad7af81ed1fca70dd6",
+        "relative_path": "assets/css/styles.css",
+        "sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+        "size_bytes": 2446,
+        "source_sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+        "type": "text"
+      },
+      {
+        "artifact_ref": "artifact:image_9441f6b58f53a33a509b7b39",
+        "relative_path": "assets/images/image-01.png",
+        "sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+        "size_bytes": 978300,
+        "source_sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+        "type": "image"
+      },
+      {
+        "artifact_ref": "artifact:image_77cfcefa7503408c727bae93",
+        "relative_path": "assets/images/image-02.png",
+        "sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+        "size_bytes": 1495723,
+        "source_sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+        "type": "image"
+      },
+      {
+        "artifact_ref": "artifact:text_95d6008dcb360eff7bb44134",
+        "relative_path": "index.html",
+        "sha256": "7babc53e6982e8cd895e45133f9e3572c28927b92f96fed0fb0b8c9efe3ec72d",
+        "size_bytes": 2218,
+        "source_sha256": "476bc4d56e34aeae87342efd289400671262b2a01b4fb0296671197ef23ba36c",
+        "type": "text"
+      }
+    ],
+    "link_check": {
+      "status": "passed"
+    },
+    "raw_runtime_manifest_published": false,
+    "resolved_links": [
+      {
+        "kind": "html_href",
+        "target": "assets/css/styles.css"
+      },
+      {
+        "kind": "html_src",
+        "target": "assets/images/image-01.png"
+      },
+      {
+        "kind": "html_src",
+        "target": "assets/images/image-02.png"
+      },
+      {
+        "kind": "html_src",
+        "target": "assets/audio/narration.wav"
+      }
+    ],
+    "schema": "ollmo.public_bundle_manifest.v1",
+    "source_bundle_id": "bundle:085eff9227e70b545c79f9a4",
+    "source_response_id": "resp_1788201103997_e9c5814aa9c17",
+    "status": "bundled",
+    "version": 1
+  },
+  "integrity": {
+    "frame_identity_verified": true,
+    "index_only_wire_lookup": true,
+    "ledger_fallback_used": false,
+    "observation_snapshot_digests_verified": true,
+    "source_frame_record_sha256": "ab10d371f4500a269f24a7e57b7355ddf7b63ba54d9e825757021c27457396f5",
+    "source_frame_record_size_bytes": 822157,
+    "verified_response_map": true
+  },
+  "outputs": [
+    {
+      "artifact_ref": "artifact:image_9441f6b58f53a33a509b7b39",
+      "branch_id": "branch-image_generation-1",
+      "bundle_path": "bundle/assets/images/image-01.png",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/images/image-01.png",
+      "slot_id": "output-phase-2",
+      "status": "fulfilled",
+      "type": "image"
+    },
+    {
+      "artifact_ref": "artifact:image_77cfcefa7503408c727bae93",
+      "branch_id": "branch-image_generation-2",
+      "bundle_path": "bundle/assets/images/image-02.png",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-3",
+      "published_path": "artifacts/images/image-02.png",
+      "slot_id": "output-phase-3",
+      "status": "fulfilled",
+      "type": "image"
+    },
+    {
+      "artifact_ref": "artifact:audio_bbeb9e3421ca62a9f4c29224",
+      "branch_id": "branch-text_to_speech-1",
+      "bundle_path": "bundle/assets/audio/narration.wav",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-4",
+      "published_path": "artifacts/audio/narration.wav",
+      "slot_id": "output-phase-4",
+      "status": "fulfilled",
+      "type": "audio"
+    },
+    {
+      "artifact_ref": "artifact:text_95d6008dcb360eff7bb44134",
+      "branch_id": "branch-text_artifact-1",
+      "bundle_path": "bundle/index.html",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-5",
+      "published_path": "artifacts/documents/index.html",
+      "slot_id": "output-phase-5",
+      "status": "fulfilled",
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:text_8b2746ad7af81ed1fca70dd6",
+      "branch_id": "branch-text_artifact-2",
+      "bundle_path": "bundle/assets/css/styles.css",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-6",
+      "published_path": "artifacts/documents/styles.css",
+      "slot_id": "output-phase-6",
+      "status": "fulfilled",
+      "type": "text"
+    }
+  ],
+  "provenance": {
+    "original_runtime_truth_remains_authoritative": true,
+    "raw_frame_published": false,
+    "runtime_effect": "none",
+    "source": "indexed final response frame and canonical artifact bytes"
+  },
+  "request": {
+    "prompt_path": "prompt.txt",
+    "prompt_sha256": "d82cd044e5421b5be6735b4fe97e6d5c6ca575a4fd01a5b282cae19b3de6b285",
+    "runtime_request_sha256": "939b20b2c46404e72358983173129051a55ee5a1b5d1cb8358d75e21b56ca36e",
+    "verified": true
+  },
+  "response": {
+    "frame_id": "resp_1788201103997_e9c5814aa9c17:frame-2",
+    "frame_sequence": 2,
+    "frame_version": 9,
+    "id": "resp_1788201103997_e9c5814aa9c17",
+    "lifecycle_state": "completed",
+    "status": "completed",
+    "status_semantics": {
+      "has_actionable_repair": false,
+      "has_open_continuation": false,
+      "is_terminal": true,
+      "terminal": true
+    }
+  },
+  "runtime_truth": {
+    "closure": {
+      "continuation_required": false,
+      "counts": {
+        "blocked": 0,
+        "deferred": 0,
+        "fulfilled": 6,
+        "pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "obligation_count": 6,
+      "pending_branch_count": 0,
+      "status": "fulfilled"
+    },
+    "late_fill": {
+      "counts": {
+        "cancelled": 0,
+        "completed": 5,
+        "failed": 0,
+        "pending": 0
+      },
+      "final_materialization_contract_status": "fulfilled",
+      "status": "completed"
+    },
+    "surface": {
+      "active_categories": [
+        "completed",
+        "reconsiderable",
+        "controlled_attention_advisory",
+        "aspiration_advisory",
+        "commitment_advisory"
+      ],
+      "category_counts": {
+        "aspiration_advisory": 12,
+        "blocked": 0,
+        "commitment_advisory": 24,
+        "completed": 6,
+        "controlled_attention_advisory": 142,
+        "open": 0,
+        "reconsiderable": 6,
+        "repair_pending": 0,
+        "semantic_review_pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "status": "fulfilled"
+    }
+  },
+  "schema": "ollmo.public_reference_run.v1",
+  "version": 1
+}

@@ -22,6 +22,9 @@ _QUOTED_TEXT_RE = re.compile(
 _COLON_SUFFIX_RE = re.compile(r':\s*(?P<body>[^:\n][\s\S]*?)\s*$')
 _DIRECT_SOURCE_CUE_RE = re.compile(
     r'(?:'
+    r'\b(?:say|speak|read|narrate)\s+(?:exactly|verbatim|only)\s*[.,:;-]*\s*$|'
+    r'\b(?:sag|sprich|lies|lese|narr(?:iere|ieren))\s+'
+    r'(?:genau|wortgetreu|nur)\s*[.,:;-]*\s*$|'
     r'\b(?:speak|read)\s+(?:only\s+)?(?:this|these)\s+aloud'
     r'(?:\s+in\s+sound\s+format)?\s*[.,:;-]*\s*$|'
     r'\b(?:speak|read|narrate)\b[^"“„«\n]{0,180}'

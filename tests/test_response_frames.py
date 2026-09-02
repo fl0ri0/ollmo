@@ -27,6 +27,7 @@ from ollmo_services.response_frames import (
 from ollmo_services.responses import (
     build_canonical_outputs,
     build_canonical_response_artifacts,
+    hoist_response_output_surfaces,
     merge_canonical_response_artifacts,
     select_public_output_text,
 )
@@ -2010,6 +2011,243 @@ class ResponseFrameTests(unittest.TestCase):
         self.assertEqual(frame["output"]["outputs"][-1]["artifact_ref"], "artifact:joined-json")
         self.assertEqual(frame["output"]["outputs"][-1]["value"], final_text)
 
+    def test_canonical_outputs_publish_consumed_vision_evidence_only_through_terminal_join(self):
+        vision_texts = [
+            "Image A contains a smiling dog in a kitchen.",
+            "Image B contains a cat in neon glasses.",
+            "Image C contains a lemur beside a camera marked Nikon.",
+        ]
+        final_text = "\n".join(
+            f"Image {index}: {value}"
+            for index, value in enumerate(vision_texts, start=1)
+        )
+        output_slots = [
+            {
+                "slot_id": "output-phase-1",
+                "phase_id": "phase-1",
+                "type": "text",
+                "status": "fulfilled",
+            },
+            *[
+                {
+                    "slot_id": f"output-phase-{index}",
+                    "branch_id": f"branch-image_generation-{index - 1}",
+                    "phase_id": f"phase-{index}",
+                    "type": "image",
+                    "status": "fulfilled",
+                    "artifact_ref": f"artifact:image-{index - 1}",
+                    "parent_slot_id": "output-phase-1",
+                    "follow_up_capability": "image_generation",
+                }
+                for index in range(2, 5)
+            ],
+            *[
+                {
+                    "slot_id": f"output-phase-{index}",
+                    "branch_id": f"branch-vision_analysis-{index - 4}",
+                    "phase_id": f"phase-{index}",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "parent_slot_id": "output-phase-1",
+                    "follow_up_capability": "vision_analysis",
+                }
+                for index in range(5, 8)
+            ],
+            {
+                "slot_id": "output-phase-8",
+                "branch_id": "branch-chat-1",
+                "phase_id": "phase-8",
+                "type": "text",
+                "status": "fulfilled",
+                "parent_slot_id": "output-phase-1",
+                "follow_up_capability": "chat",
+            },
+        ]
+        fill_results = [
+            *[
+                {
+                    "branch_id": f"branch-vision_analysis-{index}",
+                    "phase_id": f"phase-{index + 4}",
+                    "capability": "vision_analysis",
+                    "result_text": vision_texts[index - 1],
+                    "execution_contract": {
+                        "role": "vision_analysis_follow_up",
+                        "capability": "vision_analysis",
+                    },
+                }
+                for index in range(1, 4)
+            ],
+            {
+                "branch_id": "branch-chat-1",
+                "phase_id": "phase-8",
+                "capability": "chat",
+                "result_text": final_text,
+                "execution_contract": {
+                    "role": "post_artifact_text_follow_up",
+                    "capability": "chat",
+                    "depends_on": ["phase-5", "phase-6", "phase-7"],
+                },
+            },
+        ]
+        payload = {
+            "output_text": final_text,
+            "output_slots": output_slots,
+            "artifacts": [
+                {
+                    "type": "image",
+                    "path": f"/tmp/image-{index}.png",
+                    "artifact_ref": f"artifact:image-{index}",
+                }
+                for index in range(1, 4)
+            ],
+            "late_fill": {
+                "status": "completed",
+                "fill_results": fill_results,
+            },
+        }
+
+        outputs = build_canonical_outputs(
+            payload,
+            output_slots=output_slots,
+            artifacts=payload["artifacts"],
+        )
+        self.assertEqual(
+            [item.get("phase_id") for item in outputs],
+            ["phase-2", "phase-3", "phase-4", "phase-8"],
+        )
+        self.assertEqual(outputs[-1]["value"], final_text)
+        self.assertEqual(
+            sum(item.get("value") == final_text for item in outputs),
+            1,
+        )
+        self.assertEqual(
+            [item["result_text"] for item in payload["late_fill"]["fill_results"][:3]],
+            vision_texts,
+        )
+
+        hoisted = hoist_response_output_surfaces(payload)
+        self.assertEqual(
+            [item.get("phase_id") for item in hoisted["outputs"]],
+            ["phase-2", "phase-3", "phase-4", "phase-8"],
+        )
+        self.assertEqual(hoisted["output_text"], final_text)
+
+        frame = build_response_frame(
+            {
+                **payload,
+                "id": "resp_consumed_vision_evidence_projection",
+                "object": "response",
+                "status": "completed",
+                "capability": "chat",
+            },
+            request_payload={"prompt": "Create three images, inspect each, then report the inspections."},
+        )
+        self.assertEqual(
+            [item.get("phase_id") for item in frame["output"]["outputs"]],
+            ["phase-2", "phase-3", "phase-4", "phase-8"],
+        )
+        self.assertTrue(
+            {"phase-5", "phase-6", "phase-7"}.issubset(
+                {item.get("phase_id") for item in frame["current_state"]["output_slots"]}
+            )
+        )
+        self.assertEqual(
+            [item["result_text"] for item in frame["current_state"]["late_fill"]["fill_results"][:3]],
+            vision_texts,
+        )
+
+    def test_canonical_outputs_keep_vision_text_without_fulfilled_terminal_consumer(self):
+        evidence_text = "The image contains a fox beside a red mailbox."
+        payload = {
+            "late_fill": {
+                "status": "completed",
+                "fill_results": [
+                    {
+                        "branch_id": "branch-vision_analysis-1",
+                        "phase_id": "phase-2",
+                        "capability": "vision_analysis",
+                        "result_text": evidence_text,
+                        "execution_contract": {
+                            "role": "vision_analysis_follow_up",
+                            "capability": "vision_analysis",
+                        },
+                    }
+                ],
+            }
+        }
+        outputs = build_canonical_outputs(
+            payload,
+            output_slots=[
+                {
+                    "slot_id": "output-phase-2",
+                    "branch_id": "branch-vision_analysis-1",
+                    "phase_id": "phase-2",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "follow_up_capability": "vision_analysis",
+                }
+            ],
+        )
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["value"], evidence_text)
+
+    def test_canonical_outputs_publish_consumed_transcript_only_through_terminal_join(self):
+        transcript = "Rain moves softly across the roof."
+        final_text = f"Verified transcript: {transcript}"
+        payload = {
+            "late_fill": {
+                "status": "completed",
+                "fill_results": [
+                    {
+                        "branch_id": "branch-speech_to_text-1",
+                        "phase_id": "phase-3",
+                        "capability": "speech_to_text",
+                        "result_text": transcript,
+                        "execution_contract": {
+                            "role": "speech_to_text_follow_up",
+                            "capability": "speech_to_text",
+                        },
+                    },
+                    {
+                        "branch_id": "branch-chat-1",
+                        "phase_id": "phase-4",
+                        "capability": "chat",
+                        "result_text": final_text,
+                        "execution_contract": {
+                            "role": "post_artifact_text_follow_up",
+                            "capability": "chat",
+                            "depends_on": ["phase-3"],
+                        },
+                    },
+                ],
+            }
+        }
+        outputs = build_canonical_outputs(
+            payload,
+            output_slots=[
+                {
+                    "slot_id": "output-phase-3",
+                    "branch_id": "branch-speech_to_text-1",
+                    "phase_id": "phase-3",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "follow_up_capability": "speech_to_text",
+                },
+                {
+                    "slot_id": "output-phase-4",
+                    "branch_id": "branch-chat-1",
+                    "phase_id": "phase-4",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "follow_up_capability": "chat",
+                },
+            ],
+        )
+
+        self.assertEqual([item.get("phase_id") for item in outputs], ["phase-4"])
+        self.assertEqual(outputs[0]["value"], final_text)
+
     def test_public_text_recovers_terminal_chat_role_from_phase_graph(self):
         outputs = [
             {
@@ -2219,13 +2457,11 @@ class ResponseFrameTests(unittest.TestCase):
 
         outputs = frame["output"]["outputs"]
         root_output = next(item for item in outputs if item.get("phase_id") == "phase-1")
-        prior_vision_output = next(item for item in outputs if item.get("phase_id") == "phase-7")
         terminal_output = next(item for item in outputs if item.get("phase_id") == "phase-8")
         terminal_ref = terminal_output["artifact_ref"]
         self.assertNotIn("artifact_ref", root_output)
-        self.assertNotIn("artifact_ref", prior_vision_output)
         self.assertEqual(root_output["value"], preparation_text)
-        self.assertEqual(prior_vision_output["value"], prior_vision_text)
+        self.assertNotIn("phase-7", {item.get("phase_id") for item in outputs})
         self.assertEqual(terminal_output["value"], final_text)
         self.assertEqual(
             [item.get("artifact_ref") for item in outputs].count(terminal_ref),
@@ -2235,7 +2471,6 @@ class ResponseFrameTests(unittest.TestCase):
         for projection in (
             frame["planning"]["artifact_flow"]["output_slots"],
             frame["current_state"]["output_slots"],
-            frame["current_state"]["outputs"],
         ):
             self.assertEqual(
                 [item.get("artifact_ref") for item in projection].count(terminal_ref),
@@ -2244,6 +2479,10 @@ class ResponseFrameTests(unittest.TestCase):
             )
             prior_projection = next(item for item in projection if item.get("phase_id") == "phase-7")
             self.assertNotIn("artifact_ref", prior_projection)
+        self.assertNotIn(
+            "phase-7",
+            {item.get("phase_id") for item in frame["current_state"]["outputs"]},
+        )
 
     def test_response_frame_reprojects_stale_non_owner_ref_to_exact_late_fill_owner_once(self):
         prior_vision_text = "Visible evidence for the third image only."
@@ -2682,6 +2921,58 @@ class ResponseFrameTests(unittest.TestCase):
         self.assertEqual(outputs[1]["artifact_ref"], "artifact:index")
         self.assertEqual(outputs[2]["artifact_ref"], "artifact:styles")
 
+    def test_canonical_outputs_do_not_implicitly_bind_artifact_to_blocked_text_slot(self):
+        outputs = build_canonical_outputs(
+            {"output_text": "Prepare a landing page with HTML and CSS artifacts."},
+            output_slots=[
+                {
+                    "slot_id": "output-phase-2",
+                    "branch_id": "branch-text_artifact-1",
+                    "phase_id": "phase-2",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "role": "text_artifact_output",
+                },
+                {
+                    "slot_id": "output-phase-3",
+                    "branch_id": "branch-text_artifact-2",
+                    "phase_id": "phase-3",
+                    "type": "text",
+                    "status": "blocked",
+                    "role": "text_artifact_output",
+                    "blocked_reason": "HTML materialization was not promoted",
+                },
+                {
+                    "slot_id": "output-phase-4",
+                    "branch_id": "branch-text_artifact-css",
+                    "phase_id": "phase-4",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "role": "text_artifact_output",
+                },
+            ],
+            artifacts=[
+                {
+                    "artifact_ref": "artifact:index",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "branch_id": "branch-text_artifact-1",
+                    "path": "/tmp/artifacts/documents/index.html",
+                },
+                {
+                    "artifact_ref": "artifact:styles",
+                    "type": "text",
+                    "status": "fulfilled",
+                    "branch_id": "branch-text_artifact-css",
+                    "path": "/tmp/artifacts/documents/styles.css",
+                },
+            ],
+        )
+
+        self.assertEqual(outputs[0]["artifact_ref"], "artifact:index")
+        self.assertNotIn("artifact_ref", outputs[1])
+        self.assertEqual(outputs[2]["artifact_ref"], "artifact:styles")
+
     def test_canonical_outputs_hide_generic_chat_summary_when_text_artifact_exists(self):
         outputs = build_canonical_outputs(
             {"output_text": "Artifacts generated."},
@@ -2996,6 +3287,32 @@ class ResponseFrameTests(unittest.TestCase):
 
         self.assertEqual([output["slot_id"] for output in outputs], ["output-phase-7"])
         self.assertEqual(outputs[0]["artifact_ref"], "artifact:index")
+
+    def test_canonical_outputs_hide_branch_semantic_review_control_slot(self):
+        review_prompt = (
+            'Run a branch-local semantic review for the current Ollmo response graph.\n'
+            'Authority boundary:\n'
+            'Return exactly one JSON object and no markdown.\n'
+            '{"kind": "ollmo.semantic_review_verdict"}\n'
+            'Branch runtime evidence:\n{}'
+        )
+        payload = {'output_text': review_prompt}
+        outputs = build_canonical_outputs(
+            payload,
+            output_slots=[
+                {
+                    'slot_id': 'output-semantic-review-generation',
+                    'branch_id': 'branch-semantic-review-generation',
+                    'phase_id': 'phase-semantic-review-generation',
+                    'type': 'text',
+                    'status': 'fulfilled',
+                    'value': review_prompt,
+                }
+            ],
+        )
+
+        self.assertEqual(outputs, [])
+        self.assertEqual(select_public_output_text(payload, outputs), '')
 
     def test_canonical_outputs_hide_sectioned_artifact_handoff_text(self):
         handoff_text = (
@@ -4231,6 +4548,276 @@ class ResponseFrameTests(unittest.TestCase):
         self.assertEqual(artifact_flow["output_slots"][2]["branch_id"], "phase-image-2")
         self.assertEqual(artifact_flow["output_slots"][2]["parent_slot_id"], "output-phase-1")
         self.assertEqual(artifact_flow["output_slots"][2]["status"], "fulfilled")
+
+    def test_semantic_review_control_work_stays_out_of_public_frame_and_replay(self):
+        review_prompt = (
+            'Run a whole-turn semantic closure review for the current Ollmo response.\n'
+            'Authority boundary:\n'
+            'Return exactly one JSON object and no markdown.\n'
+            'Required schema:\n'
+            '{"kind": "ollmo.semantic_review_verdict"}\n'
+            'Runtime evidence:\n{}'
+        )
+        review_branch_id = 'branch-global-semantic-closure-review-generation'
+        review_phase_id = 'phase-global-semantic-closure-review-generation'
+        phase_graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'current_phase_id': 'phase-1',
+            'current_phase_capability': 'chat',
+            'phases': [
+                {
+                    'phase_id': 'phase-1',
+                    'capability': 'chat',
+                    'output_type': 'text',
+                    'status': 'completed',
+                },
+                {
+                    'phase_id': 'phase-2',
+                    'branch_id': 'branch-image_generation-1',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'status': 'completed',
+                },
+                {
+                    'phase_id': review_phase_id,
+                    'branch_id': review_branch_id,
+                    'capability': 'chat',
+                    'output_type': 'text',
+                    'status': 'completed',
+                    'stage_direction': 'run_global_semantic_closure_review',
+                    'visibility': 'internal',
+                    'surface_role': 'closure_evidence',
+                },
+            ],
+        }
+        image_branch = {
+            'branch_id': 'branch-image_generation-1',
+            'phase_id': 'phase-2',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'saved_image_path': '/tmp/semantic-review-public-hero.png',
+        }
+        review_branch = {
+            'branch_id': review_branch_id,
+            'phase_id': review_phase_id,
+            'capability': 'chat',
+            'output_type': 'text',
+            'content_payload': review_prompt,
+            'content_payload_source': 'global_semantic_closure_review',
+            'stage_direction': 'run_global_semantic_closure_review',
+            'visibility': 'internal',
+            'surface_role': 'closure_evidence',
+        }
+        frame = build_response_frame(
+            {
+                'id': 'resp_internal_semantic_review_projection',
+                'object': 'response',
+                'status': 'completed',
+                'capability': 'chat',
+                'output_text': review_prompt,
+                'result': review_prompt,
+                'output': [
+                    {
+                        'type': 'message',
+                        'status': 'completed',
+                        'role': 'assistant',
+                        'content': [
+                            {
+                                'type': 'output_text',
+                                'text': review_prompt,
+                                'annotations': [],
+                            }
+                        ],
+                    }
+                ],
+                'runtime': {'request_phase_graph': phase_graph},
+                'late_fill': {
+                    'status': 'completed',
+                    'final_materialization_contract_status': 'fulfilled',
+                    'completed_branches': [image_branch, review_branch],
+                    'fill_results': [
+                        image_branch,
+                        {
+                            **review_branch,
+                            'result_text': (
+                                '{"kind":"ollmo.semantic_review_verdict",'
+                                '"verdict":"failed"}'
+                            ),
+                        },
+                    ],
+                },
+                'artifacts': [
+                    {
+                        'artifact_ref': 'artifact:public-hero',
+                        'type': 'image',
+                        'path': '/tmp/semantic-review-public-hero.png',
+                        'branch_id': 'branch-image_generation-1',
+                        'phase_id': 'phase-2',
+                    },
+                    {
+                        'artifact_ref': 'artifact:internal-review-css',
+                        'type': 'text',
+                        'path': '/tmp/semantic-review-internal.css',
+                        'branch_id': review_branch_id,
+                        'phase_id': review_phase_id,
+                        'visibility': 'internal',
+                        'surface_role': 'closure_evidence',
+                    },
+                ],
+            },
+            request_payload={'prompt': 'Build a website with one local image.'},
+        )
+
+        public_slots = frame['planning']['artifact_flow']['output_slots']
+        self.assertEqual(
+            [slot.get('branch_id') for slot in public_slots],
+            [None, 'branch-image_generation-1'],
+        )
+        self.assertNotIn(review_prompt, json.dumps(frame['output']))
+        self.assertNotIn('ollmo.semantic_review_verdict', json.dumps(frame['output']))
+        current_state_public_surface = {
+            key: frame['current_state'].get(key)
+            for key in ('output_text', 'output', 'outputs', 'output_slots', 'output_branches', 'result')
+        }
+        self.assertNotIn(review_prompt, json.dumps(current_state_public_surface))
+        self.assertNotIn('result', frame['current_state'])
+        self.assertEqual(
+            [item.get('artifact_ref') for item in frame['artifacts']['output']],
+            ['artifact:public-hero'],
+        )
+        self.assertEqual(frame['output']['text'], 'Artifacts generated.')
+
+        replayed = response_payload_from_frame(frame)
+        self.assertNotIn(review_prompt, json.dumps(replayed.get('outputs') or []))
+        self.assertNotIn('ollmo.semantic_review_verdict', json.dumps(replayed.get('outputs') or []))
+        self.assertEqual(replayed['output_text'], 'Artifacts generated.')
+        self.assertEqual(
+            [item.get('artifact_ref') for item in replayed['artifacts']],
+            ['artifact:public-hero'],
+        )
+
+    def test_legacy_semantic_review_only_payload_has_no_public_text_surface(self):
+        review_prompt = (
+            'Run a branch-local semantic review for the current Ollmo response graph.\n'
+            'Authority boundary:\n'
+            '- You are a semantic reviewer for one branch, not runtime truth.\n'
+            'Return exactly one JSON object and no markdown, no prose outside JSON.\n'
+            '{"kind": "ollmo.semantic_review_verdict"}\n'
+            'Branch runtime evidence:\n{}'
+        )
+        internal_slot = {
+            'slot_id': 'output-semantic-review-generation',
+            'branch_id': 'branch-semantic-review-generation',
+            'phase_id': 'phase-semantic-review-generation',
+            'type': 'text',
+            'status': 'fulfilled',
+            'value': review_prompt,
+        }
+        frame = build_response_frame(
+            {
+                'id': 'resp_legacy_semantic_review_only',
+                'object': 'response',
+                'status': 'completed',
+                'output_text': review_prompt,
+                'result': review_prompt,
+                'output': [
+                    {
+                        'type': 'message',
+                        'status': 'completed',
+                        'role': 'assistant',
+                        'content': [
+                            {'type': 'output_text', 'text': review_prompt, 'annotations': []}
+                        ],
+                    }
+                ],
+                'output_slots': [internal_slot],
+                'output_branches': [internal_slot],
+                'outputs': [internal_slot],
+            },
+            request_payload={'prompt': 'Review runtime closure.'},
+        )
+
+        self.assertEqual(frame['output'].get('text', ''), '')
+        self.assertEqual(frame['output'].get('items') or [], [])
+        self.assertEqual(frame['output'].get('outputs') or [], [])
+        self.assertEqual(frame['planning']['artifact_flow'].get('output_slots') or [], [])
+        for key in ('output_text', 'output', 'result', 'outputs', 'output_slots', 'output_branches'):
+            self.assertNotIn(key, frame['current_state'])
+        replayed = response_payload_from_frame(frame)
+        self.assertNotIn('output_text', replayed)
+        self.assertNotIn('result', replayed)
+        self.assertEqual(replayed.get('outputs') or [], [])
+
+        hoisted = hoist_response_output_surfaces(
+            {
+                'id': 'resp_legacy_semantic_review_only',
+                'status': 'completed',
+                'output_text': review_prompt,
+                'result': review_prompt,
+                'output': [
+                    {
+                        'type': 'message',
+                        'status': 'completed',
+                        'role': 'assistant',
+                        'content': [
+                            {'type': 'output_text', 'text': review_prompt, 'annotations': []}
+                        ],
+                    }
+                ],
+                'output_slots': [internal_slot],
+                'output_branches': [internal_slot],
+                'outputs': [internal_slot],
+                'response_frame': frame,
+            }
+        )
+        for key in ('output_text', 'output', 'result', 'outputs', 'output_slots', 'output_branches'):
+            self.assertNotIn(key, hoisted)
+
+    def test_public_late_fill_result_text_wins_over_its_branch_request_input(self):
+        frame = build_response_frame(
+            {
+                'id': 'resp_public_branch_result_value',
+                'object': 'response',
+                'status': 'completed',
+                'capability': 'chat',
+                'output_text': 'Initial preparation.',
+                'late_fill': {
+                    'status': 'completed',
+                    'completed_branches': [
+                        {
+                            'branch_id': 'branch-chat-1',
+                            'phase_id': 'phase-chat-1',
+                            'capability': 'chat',
+                            'output_type': 'text',
+                            'content_payload': 'Internal branch request input.',
+                        }
+                    ],
+                    'fill_results': [
+                        {
+                            'branch_id': 'branch-chat-1',
+                            'phase_id': 'phase-chat-1',
+                            'capability': 'chat',
+                            'output_type': 'text',
+                            'result_text': 'Fresh public branch result.',
+                        }
+                    ],
+                },
+            },
+            request_payload={'prompt': 'Prepare, then answer.'},
+        )
+
+        branch_slot = next(
+            slot
+            for slot in frame['planning']['artifact_flow']['output_slots']
+            if slot.get('branch_id') == 'branch-chat-1'
+        )
+        self.assertEqual(branch_slot['value'], 'Fresh public branch result.')
+        branch_output = next(
+            output
+            for output in frame['output']['outputs']
+            if output.get('branch_id') == 'branch-chat-1'
+        )
+        self.assertEqual(branch_output['value'], 'Fresh public branch result.')
 
     def test_build_response_frame_keeps_same_capability_branches_distinct_when_only_one_sibling_is_done(self):
         frame = build_response_frame(

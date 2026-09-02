@@ -1,0 +1,147 @@
+/* Reset & Base */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background-color: #1a1c1e; /* Deep slate/charcoal */
+    color: #d1d5db; /* Soft light grey */
+    font-family: 'Georgia', serif;
+    line-height: 1.6;
+    overflow-x: hidden;
+}
+
+/* Hero Section */
+.hero {
+    position: relative;
+    height: 80vh;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.hero-image {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    z-index: 1;
+}
+
+.hero-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(to bottom, rgba(26, 28, 30, 0.4), rgba(26, 28, 30, 1));
+    z-index: 2;
+}
+
+.hero-content {
+    position: relative;
+    z-index: 3;
+    text-align: center;
+}
+
+.hero-content h1 {
+    font-size: 4rem;
+    font-weight: normal;
+    letter-spacing: 0.2rem;
+    color: #f3f4f6;
+    margin-bottom: 0.5rem;
+}
+
+.subtitle {
+    font-style: italic;
+    font-size: 1.2rem;
+    color: #9ca3af;
+}
+
+/* Main Content */
+main {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 4rem 2rem;
+}
+
+.intro {
+    text-align: center;
+    margin-bottom: 6rem;
+}
+
+.intro h2 {
+    font-size: 2rem;
+    color: #f3f4f6;
+    margin-bottom: 1.5rem;
+    font-weight: normal;
+}
+
+.intro p {
+    max-width: 600px;
+    margin: 0 auto;
+    font-size: 1.1rem;
+}
+
+/* Exhibition Section */
+.exhibition {
+    display: flex;
+    justify-content: center;
+}
+
+.audio-card {
+    background: #26292c;
+    border: 1px solid #374151;
+    border-radius: 4px;
+    overflow: hidden;
+    max-width: 500px;
+    transition: transform 0.3s ease;
+}
+
+.audio-card:hover {
+    transform: translateY(-5px);
+}
+
+.image-container img {
+    width: 100%;
+    height: 300px;
+    object-fit: cover;
+    display: block;
+    filter: grayscale(40%) brightness(80%);
+}
+
+.audio-content {
+    padding: 2rem;
+    text-align: center;
+}
+
+.audio-content h3 {
+    color: #f3f4f6;
+    margin-bottom: 0.5rem;
+}
+
+.description {
+    font-size: 0.9rem;
+    color: #9ca3af;
+    margin-bottom: 1.5rem;
+}
+
+.audio-player audio {
+    width: 100%;
+    filter: invert(90%) hue-rotate(180deg); /* Simple way to make standard player match dark theme */
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    padding: 4rem 2rem;
+    font-size: 0.8rem;
+    color: #4b5563;
+    border-top: 1px solid #2d3748;
+}

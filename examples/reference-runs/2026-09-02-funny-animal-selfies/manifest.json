@@ -1,0 +1,81 @@
+{
+  "files": [
+    {
+      "mime_type": "application/octet-stream",
+      "path": "README.md",
+      "role": "documentation",
+      "sha256": "a6892277c487c2cfc27b2ab3898e89b42fa727c896c2ffc3a467bea452178097",
+      "size_bytes": 6680
+    },
+    {
+      "mime_type": "image/png",
+      "path": "artifacts/images/image-01.png",
+      "role": "canonical_artifact_copy",
+      "sha256": "078160af9e4850f1ead5c5611e14631911bc0ab2df3e7b8ae1f98bbeb303c943",
+      "size_bytes": 1384818
+    },
+    {
+      "mime_type": "image/png",
+      "path": "artifacts/images/image-02.png",
+      "role": "canonical_artifact_copy",
+      "sha256": "974250f22425878fe564a31140c5810294f3e68589b547a632442b4d3e4db67a",
+      "size_bytes": 1780940
+    },
+    {
+      "mime_type": "image/png",
+      "path": "artifacts/images/image-03.png",
+      "role": "canonical_artifact_copy",
+      "sha256": "38510729f797b08c6718cee108dd7324c57fa0c64eb1b03e86094dbe7e139786",
+      "size_bytes": 1190413
+    },
+    {
+      "mime_type": "application/json",
+      "path": "monitor-report.json",
+      "role": "observer_evidence",
+      "sha256": "68f737bc2f36a0280f2dca2029da4df4dc22f4fcb27393b0144b2eb21bb2fff7",
+      "size_bytes": 1757
+    },
+    {
+      "mime_type": "text/plain",
+      "path": "prompt.txt",
+      "role": "request",
+      "sha256": "9db87c5dacbc6191504af3df38e9916528cda0364efaaf957bbdbbe557c3930a",
+      "size_bytes": 333
+    },
+    {
+      "mime_type": "application/json",
+      "path": "response.json",
+      "role": "response_truth",
+      "sha256": "e6a85041ded86a0c16e85925388035a3e32cc6eeaa3d718663d76554ee20fe0a",
+      "size_bytes": 7296
+    }
+  ],
+  "frame_id": "resp_1788366165828_153c2a8423dff:frame-2",
+  "frame_sequence": 2,
+  "provenance": {
+    "original_response_frame_authoritative": true,
+    "original_runtime_artifacts_authoritative": true,
+    "publication_copy_is_runtime_authority": false,
+    "raw_frame_published": false,
+    "raw_monitor_record_published": false
+  },
+  "response_id": "resp_1788366165828_153c2a8423dff",
+  "schema": "ollmo.reference_run_manifest.v1",
+  "source_frame_record_sha256": "e85e56f31c7b04e47f5bdf857f3fb6d6ea5e9d986ec31216662b6f0c888119ab",
+  "source_frame_record_size_bytes": 806857,
+  "summary": {
+    "artifact_count": 3,
+    "bundle_included": false,
+    "file_count": 7,
+    "total_bytes": 4372237
+  },
+  "validation": {
+    "artifact_checksums_verified": true,
+    "indexed_frame_verified": true,
+    "local_absolute_paths_absent": true,
+    "monitor_verdict": "clean",
+    "prompt_identity_verified": true,
+    "terminal_runtime_truth_verified": true
+  },
+  "version": 1
+}

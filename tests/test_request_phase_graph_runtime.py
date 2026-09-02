@@ -104,6 +104,135 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
         self.assertEqual(branches[1].get('depends_on'), [branches[0].get('phase_id')])
         self.assertEqual(branches[2].get('depends_on'), [branches[1].get('phase_id')])
 
+    def test_image_content_constraints_do_not_defer_or_invert_generated_image_review(self):
+        prompt = (
+            'Create exactly one local image of a weathered brass compass resting on a dark '
+            'wooden chart table beside a folded coastal map, lit by soft morning window light. '
+            'Do not include captions, logos, or readable lettering. Then inspect that generated '
+            'image and write a short, factual inventory of only what is actually visible, '
+            'including whether any readable text appears. Return the image and the inspection '
+            'together.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={
+                'capability': 'vision_analysis',
+                'route_source': 'ghost_carried',
+            },
+        )
+
+        intent = graph['prompt_intent']
+        self.assertFalse(intent['explicit_defer_materialization'])
+        self.assertFalse(intent['explicit_visual_defer_materialization'])
+        self.assertTrue(intent['requests_visual_output'])
+        self.assertEqual(intent['requested_visual_output_count'], 1)
+        self.assertEqual(graph['current_phase_capability'], 'chat')
+
+        branches = graph.get('downstream_branches') or []
+        self.assertEqual(
+            [branch.get('capability') for branch in branches],
+            ['image_generation', 'vision_analysis', 'chat'],
+        )
+        self.assertEqual(branches[0].get('depends_on'), ['phase-1'])
+        self.assertEqual(branches[1].get('depends_on'), [branches[0].get('phase_id')])
+        self.assertEqual(branches[2].get('depends_on'), [branches[1].get('phase_id')])
+        self.assertEqual(
+            branches[0].get('artifact_prompt'),
+            'a weathered brass compass resting on a dark wooden chart table beside a folded '
+            'coastal map, lit by soft morning window light. Do not include captions, logos, or '
+            'readable lettering',
+        )
+
+    def test_true_image_deferrals_remain_non_executable(self):
+        prompts = (
+            'Do not generate an image yet.',
+            'Do not show the image yet.',
+            'Do not render the image.',
+            'Do not render the final image.',
+            'Do not show the background image.',
+            'Do not display the image.',
+            'Create one image. Do not include text in the image and do not render the image yet.',
+            'Create one image. Do not show the final image, but do not display extra objects in it.',
+            'Hold off on the image for now.',
+            'Create the copy first.\nDo not generate an image yet.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+                )
+                self.assertTrue(
+                    graph['prompt_intent']['explicit_visual_defer_materialization']
+                )
+                self.assertEqual(self._executable_image_branches(graph), [])
+
+    def test_same_clause_image_content_constraint_is_not_a_deferral(self):
+        prompts = (
+            'Create one image of a lighthouse. Do not include readable text in the image. '
+            'Then inspect the generated image.',
+            'Create one image of a lighthouse. Do not show readable text in the image. '
+            'Then inspect the generated image.',
+            'Create one image of a lighthouse. Do not render captions or logos in the image. '
+            'Then inspect the generated image.',
+            'Create one image of a lighthouse. Do not display a watermark in the image. '
+            'Then inspect the generated image.',
+            'Create one image of a lighthouse. Do not display extra objects in the image. '
+            'Then inspect the generated image.',
+            'Create one image of a lighthouse. Do not render background clutter. '
+            'Then inspect the generated image.',
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True, 'prompt': prompt},
+                    route_payload={
+                        'capability': 'vision_analysis',
+                        'route_source': 'ghost_carried',
+                    },
+                )
+
+                self.assertFalse(
+                    graph['prompt_intent']['explicit_defer_materialization']
+                )
+                self.assertFalse(
+                    graph['prompt_intent']['explicit_visual_defer_materialization']
+                )
+                self.assertEqual(
+                    [
+                        branch.get('capability')
+                        for branch in graph['downstream_branches']
+                    ],
+                    ['image_generation', 'vision_analysis', 'chat'],
+                )
+
+    def test_later_in_an_earlier_sentence_does_not_defer_current_image_work(self):
+        prompt = (
+            'We can discuss alternative compositions later. '
+            'Create one image of a lighthouse now.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertFalse(graph['prompt_intent']['explicit_defer_materialization'])
+        self.assertFalse(
+            graph['prompt_intent']['explicit_visual_defer_materialization']
+        )
+        self.assertEqual(
+            [branch.get('capability') for branch in graph['downstream_branches']],
+            ['image_generation'],
+        )
+
     def test_legacy_zuerst_image_analysis_followup_still_builds_evidence_chain(self):
         prompt = (
             'Erstelle zuerst ein Bild von einem gelben Notizbuch mit der Aufschrift "Plan A". '

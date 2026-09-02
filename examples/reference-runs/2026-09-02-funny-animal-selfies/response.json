@@ -1,0 +1,177 @@
+{
+  "artifacts": [
+    {
+      "artifact_ref": "artifact:image_359a8a7d6d82b332148865c0",
+      "branch_id": "branch-image_generation-1",
+      "height": 1024,
+      "mime_type": "image/png",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/images/image-01.png",
+      "sha256": "078160af9e4850f1ead5c5611e14631911bc0ab2df3e7b8ae1f98bbeb303c943",
+      "size_bytes": 1384818,
+      "type": "image",
+      "width": 1024
+    },
+    {
+      "artifact_ref": "artifact:image_78d44a8eb9e2a7500c4d0667",
+      "branch_id": "branch-image_generation-2",
+      "height": 720,
+      "mime_type": "image/png",
+      "phase_id": "phase-3",
+      "published_path": "artifacts/images/image-02.png",
+      "sha256": "974250f22425878fe564a31140c5810294f3e68589b547a632442b4d3e4db67a",
+      "size_bytes": 1780940,
+      "type": "image",
+      "width": 1280
+    },
+    {
+      "artifact_ref": "artifact:image_b3ce89efd13b1ee8bf652cf7",
+      "branch_id": "branch-image_generation-3",
+      "height": 1024,
+      "mime_type": "image/png",
+      "phase_id": "phase-4",
+      "published_path": "artifacts/images/image-03.png",
+      "sha256": "38510729f797b08c6718cee108dd7324c57fa0c64eb1b03e86094dbe7e139786",
+      "size_bytes": 1190413,
+      "type": "image",
+      "width": 768
+    }
+  ],
+  "bundle": null,
+  "integrity": {
+    "frame_identity_verified": true,
+    "index_only_wire_lookup": true,
+    "ledger_fallback_used": false,
+    "observation_snapshot_digests_verified": true,
+    "source_frame_record_sha256": "e85e56f31c7b04e47f5bdf857f3fb6d6ea5e9d986ec31216662b6f0c888119ab",
+    "source_frame_record_size_bytes": 806857,
+    "verified_response_map": true
+  },
+  "outputs": [
+    {
+      "branch_id": "phase-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-1",
+      "slot_id": "output-phase-1",
+      "status": "fulfilled",
+      "text": "**Image 1 Prompt:**\nA funny, extreme close-up selfie of a Capybara relaxing in a hot spring spa. The capybara has two cucumber slices resting on its eyes and looks incredibly zen. Hyper-realistic macro photography, detailed wet fur, soft steam rising from the water, tranquil atmosphere.\n\n**Image 2 Prompt:**\nA chaotic wide-angle selfie taken by a lemur wearing huge, colorful 90s-style sunglasses. The background is a blurry, vibrant tropical jungle party with neon lights and disco ball reflections. High-energy composition, slight motion blur, vivid saturated colors, energetic atmosphere.\n\n**Image 3 Prompt:**\nA grumpy bulldog's funny birthday selfie. The bulldog wears a small, floppy polka-dot party hat and has a bit of white cake frosting on its snout. The background features a messy chocolate cake and colorful confetti scattered around. Warm, soft-focus cinematic portrait lighting, adorable but disgruntled expression.",
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:image_359a8a7d6d82b332148865c0",
+      "branch_id": "branch-image_generation-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/images/image-01.png",
+      "slot_id": "output-phase-2",
+      "status": "fulfilled",
+      "type": "image"
+    },
+    {
+      "artifact_ref": "artifact:image_78d44a8eb9e2a7500c4d0667",
+      "branch_id": "branch-image_generation-2",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-3",
+      "published_path": "artifacts/images/image-02.png",
+      "slot_id": "output-phase-3",
+      "status": "fulfilled",
+      "type": "image"
+    },
+    {
+      "artifact_ref": "artifact:image_b3ce89efd13b1ee8bf652cf7",
+      "branch_id": "branch-image_generation-3",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-4",
+      "published_path": "artifacts/images/image-03.png",
+      "slot_id": "output-phase-4",
+      "status": "fulfilled",
+      "type": "image"
+    },
+    {
+      "branch_id": "branch-chat-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-8",
+      "slot_id": "output-phase-8",
+      "status": "fulfilled",
+      "text": "**Image 1 Description:** A close-up shot features a brown rodent swimming in calm, light green water. The rodent has two slices of green cucumber affixed to the sides of its head. There are hints of rocks and some steam visible in the background. No readable text or obvious visual defects are present.\n\n**Image 2 Description:** A close-up photograph of a lemur facing the camera, wearing bright, multi-colored rainbow-patterned sunglasses. The background is a crowded, festive nighttime party featuring people, disco balls, colorful string lights (pink, blue, yellow), and tropical foliage. The lighting is vibrant with visible lens flares. No readable text or obvious visual defects are present.\n\n**Image 3 Description:** The image features a close-up of a bulldog wearing a red party hat with white polka dots. The dog has brown and white fur, and there is a smudge of white frosting on its snout. In the blurred background, a chocolate cake with candles is visible, and multi-colored confetti is scattered on the surface in front of the dog. No readable text or obvious visual defects are present.",
+      "type": "text"
+    }
+  ],
+  "provenance": {
+    "original_runtime_truth_remains_authoritative": true,
+    "raw_frame_published": false,
+    "runtime_effect": "none",
+    "source": "indexed final response frame and canonical artifact bytes"
+  },
+  "request": {
+    "prompt_path": "prompt.txt",
+    "prompt_sha256": "712b83cc91c0fc50c427f86887ed3306d3b8c86c2967427b3f6bffa915a43ff1",
+    "runtime_request_sha256": "3b12226f8faaeeb0f789ccf66819fee1ac812e4c77cfff6c72261feae77e696b",
+    "verified": true
+  },
+  "response": {
+    "frame_id": "resp_1788366165828_153c2a8423dff:frame-2",
+    "frame_sequence": 2,
+    "frame_version": 9,
+    "id": "resp_1788366165828_153c2a8423dff",
+    "lifecycle_state": "completed",
+    "status": "completed",
+    "status_semantics": {
+      "has_actionable_repair": false,
+      "has_open_continuation": false,
+      "is_terminal": true,
+      "terminal": true
+    }
+  },
+  "runtime_truth": {
+    "closure": {
+      "continuation_required": false,
+      "counts": {
+        "blocked": 0,
+        "deferred": 0,
+        "fulfilled": 8,
+        "pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "obligation_count": 8,
+      "pending_branch_count": 0,
+      "status": "fulfilled"
+    },
+    "late_fill": {
+      "counts": {
+        "cancelled": 0,
+        "completed": 7,
+        "failed": 0,
+        "pending": 0
+      },
+      "final_materialization_contract_status": "fulfilled",
+      "status": "completed"
+    },
+    "surface": {
+      "active_categories": [
+        "completed",
+        "reconsiderable",
+        "controlled_attention_advisory",
+        "aspiration_advisory",
+        "commitment_advisory"
+      ],
+      "category_counts": {
+        "aspiration_advisory": 16,
+        "blocked": 0,
+        "commitment_advisory": 32,
+        "completed": 8,
+        "controlled_attention_advisory": 180,
+        "open": 0,
+        "reconsiderable": 8,
+        "repair_pending": 0,
+        "semantic_review_pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "status": "fulfilled"
+    }
+  },
+  "schema": "ollmo.public_reference_run.v1",
+  "version": 1
+}

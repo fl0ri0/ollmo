@@ -1,0 +1,1 @@
+Write a short three-sentence English reflection about evening rain. Then create exactly one local audio artifact that reads the complete reflection aloud in a calm, natural voice. Return the written reflection and the finished audio together.

@@ -21,6 +21,7 @@ import tempfile
 import mimetypes
 import time
 import threading
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional, List
 from urllib.parse import quote, unquote, urlparse
@@ -814,7 +815,15 @@ def _attach_response_status_semantics(response_payload: dict[str, Any]) -> dict[
     payload['lifecycle_state'] = lifecycle_state
     has_open_continuation = _response_lifecycle_has_open_continuation(lifecycle_state)
     has_actionable_repair = _response_lifecycle_has_actionable_repair(lifecycle_state, payload)
-    is_terminal = _response_lifecycle_is_terminal(lifecycle_state)
+    late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+    late_fill_status = str(late_fill.get('status') or '').strip().lower()
+    is_terminal = bool(
+        _response_lifecycle_is_terminal(lifecycle_state)
+        or (
+            lifecycle_state == 'repair_needed'
+            and late_fill_status == 'repair_needed'
+        )
+    )
     status_compatibility = bool(
         compatibility_status
         and compatibility_status != lifecycle_state
@@ -3798,6 +3807,9 @@ _RESPONSE_SEMANTICS_RUNTIME = ResponseSemanticsRuntimeOwner(
         'normalize_late_fill_branches': lambda values: _normalize_late_fill_branches(values),
         'extract_request_meta': lambda payload: extract_request_meta(payload),
         'build_canonical_response_artifacts': lambda payload: _build_canonical_response_artifacts(payload),
+        'resolve_semantic_review_artifact_path': lambda path: _resolve_saved_viewable_artifact_path(
+            str(path or '')
+        ),
     }
 )
 
@@ -4057,6 +4069,7 @@ _LATE_FILL_RUNTIME = LateFillRuntimeOwner(
     persist_image_data_url_locally=lambda image_data_url, model_name: _persist_image_data_url_locally(image_data_url, model_name),
     review_terminal_graph_rebase=lambda *args, **kwargs: _RESPONSES_REQUEST_RUNTIME.review_terminal_graph_rebase_after_late_fill(*args, **kwargs),
     prepare_terminal_graph_patch_successor=lambda payload: _RESPONSES_REQUEST_RUNTIME.prepare_terminal_graph_patch_successor(payload),
+    project_terminal_closure_repair=lambda payload: _RESPONSES_REQUEST_RUNTIME.project_terminal_closure_repair(payload),
     load_latest_response_state=lambda response_id: _load_latest_response_state(
         response_id,
         frames_dir=RESPONSE_FRAMES_DIR,
@@ -5967,6 +5980,8 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             'contract_state',
             'promotion_source',
             'retry_wave_anchor_branch_id',
+            'terminal_closure_repair_execution_key',
+            'terminal_closure_repair_parent_frame_id',
             'reconsideration_rebuild',
             'blocked_by_dependency_input',
             'blocked_by_branch_contract',
@@ -6680,6 +6695,21 @@ def _lookup_record_artifact_path(record: Mapping[str, Any]) -> str:
     return ''
 
 
+def _lookup_unique_anonymous_compatible_record(
+    slot: Mapping[str, Any],
+    records: list[Any],
+) -> Optional[dict[str, Any]]:
+    identity_keys = ('slot_id', 'branch_id', 'phase_id', 'obligation_id')
+    matches = [
+        dict(record)
+        for record in records
+        if isinstance(record, Mapping)
+        and not any(str(record.get(key) or '').strip() for key in identity_keys)
+        and _lookup_slot_matches_record(slot, record)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _lookup_artifact_for_slot_record(
     *,
     slot: Mapping[str, Any],
@@ -6766,16 +6796,6 @@ def _reconcile_lookup_output_slots_with_late_fill_truth(payload: Mapping[str, An
         slot_type = str(raw_slot.get('type') or '').strip().lower()
         if slot_type and slot_type not in {'text', 'document'}:
             non_text_slot_type_counts[slot_type] = non_text_slot_type_counts.get(slot_type, 0) + 1
-    artifact_type_counts: dict[str, int] = {}
-    for raw_artifact in artifacts:
-        if not isinstance(raw_artifact, Mapping):
-            continue
-        artifact_type = str(
-            raw_artifact.get('type') or raw_artifact.get('kind') or ''
-        ).strip().lower()
-        if artifact_type:
-            artifact_type_counts[artifact_type] = artifact_type_counts.get(artifact_type, 0) + 1
-
     reconciled_slots: list[dict[str, Any]] = []
     changed = False
     for raw_slot in output_slots:
@@ -6783,98 +6803,70 @@ def _reconcile_lookup_output_slots_with_late_fill_truth(payload: Mapping[str, An
             continue
         slot = dict(raw_slot)
         slot_type = str(slot.get('type') or '').strip().lower()
-        slot_tokens = _lookup_slot_tokens(slot)
-        completed_record = next(
-            (
-                record
-                for record in completed_records
-                if slot_tokens and slot_tokens.intersection(_lookup_slot_tokens(record))
-            ),
-            None,
-        )
+        completed_record = _lookup_unique_slot_state_owner(slot, completed_records)
         if completed_record is None and non_text_slot_type_counts.get(slot_type, 0) <= 1:
-            completed_record = next(
-                (record for record in completed_records if _lookup_slot_matches_record(slot, record)),
-                None,
+            completed_record = _lookup_unique_anonymous_compatible_record(
+                slot,
+                completed_records,
             )
         if completed_record is not None and slot_type not in {'text', 'document'}:
-            matching_output = next(
-                (
-                    output
-                    for output in outputs
-                    if isinstance(output, Mapping)
-                    and slot_tokens
-                    and slot_tokens.intersection(_lookup_slot_tokens(output))
-                ),
-                {},
-            )
-            artifact_identity_record = (
-                completed_record
-                if _lookup_record_artifact_path(completed_record)
-                or str(
-                    completed_record.get('artifact_ref')
-                    or completed_record.get('ref')
-                    or ''
-                ).strip()
-                else matching_output
-                if isinstance(matching_output, Mapping) and matching_output
-                else slot
-            )
-            artifact = _lookup_artifact_for_slot_record(
-                slot=slot,
-                record=artifact_identity_record,
-                artifacts=artifacts,
-                allow_type_fallback=(
-                    non_text_slot_type_counts.get(slot_type, 0) <= 1
-                    and artifact_type_counts.get(slot_type, 0) <= 1
-                ),
-            )
-            path = (
-                _lookup_record_artifact_path(completed_record)
-                or _lookup_record_artifact_path(matching_output)
-                or _lookup_record_artifact_path(slot)
-                or _lookup_record_artifact_path(artifact)
-            )
+            matching_output = _lookup_unique_slot_state_owner(slot, outputs) or {}
+            for key in _LOOKUP_OUTPUT_DIAGNOSTIC_KEYS:
+                slot.pop(key, None)
             slot['status'] = 'fulfilled'
             slot['lifecycle'] = 'materialized_output'
-            if path:
-                slot['path'] = path
-                if slot_type == 'image':
-                    slot['saved_image_path'] = path
-                elif slot_type == 'audio':
-                    slot['saved_audio_path'] = path
-                elif slot_type in {'text', 'document'}:
-                    slot['saved_text_path'] = path
-            artifact_ref = str(
+            completed_ref = str(
                 completed_record.get('artifact_ref')
                 or completed_record.get('ref')
-                or matching_output.get('artifact_ref')
-                or matching_output.get('ref')
-                or slot.get('artifact_ref')
-                or slot.get('ref')
-                or artifact.get('artifact_ref')
-                or artifact.get('ref')
                 or ''
             ).strip()
-            if artifact_ref:
-                slot['artifact_ref'] = artifact_ref
+            completed_path = (
+                str(completed_record.get('artifact_path') or '').strip()
+                or _lookup_record_artifact_path(completed_record)
+            )
+            output_ref = str(
+                matching_output.get('artifact_ref')
+                or matching_output.get('ref')
+                or ''
+            ).strip()
+            output_path = (
+                str(matching_output.get('artifact_path') or '').strip()
+                or _lookup_record_artifact_path(matching_output)
+            )
+            if completed_ref:
+                binding_record = dict(completed_record)
+                if not completed_path and completed_ref == output_ref and output_path:
+                    binding_record['artifact_path'] = output_path
+            elif output_ref:
+                binding_record = dict(matching_output)
+            elif completed_path:
+                binding_record = dict(completed_record)
+            elif matching_output:
+                binding_record = dict(matching_output)
+            else:
+                binding_record = {}
+            if binding_record:
+                _lookup_bind_slot_to_exact_output(slot, binding_record, artifacts)
+            bound_path = (
+                str(slot.get('artifact_path') or '').strip()
+                or _lookup_record_artifact_path(slot)
+            )
+            if bound_path:
+                slot['path'] = bound_path
+                if slot_type == 'image':
+                    slot['saved_image_path'] = bound_path
+                elif slot_type == 'audio':
+                    slot['saved_audio_path'] = bound_path
             for key in ('lang_code', 'lang_code_source', 'response_format', 'output_format'):
                 value = completed_record.get(key)
                 if value not in (None, '', [], {}):
                     slot[key] = value
             changed = True
-        failed_record = next(
-            (
-                record
-                for record in failed_records
-                if slot_tokens and slot_tokens.intersection(_lookup_slot_tokens(record))
-            ),
-            None,
-        )
+        failed_record = _lookup_unique_slot_state_owner(slot, failed_records)
         if failed_record is None and non_text_slot_type_counts.get(slot_type, 0) <= 1:
-            failed_record = next(
-                (record for record in failed_records if _lookup_slot_matches_record(slot, record)),
-                None,
+            failed_record = _lookup_unique_anonymous_compatible_record(
+                slot,
+                failed_records,
             )
         if failed_record is not None:
             slot_status = str(slot.get('status') or '').strip().lower()
@@ -8421,6 +8413,704 @@ def _response_lookup_output_message_for_ui(value: Any) -> dict[str, Any]:
     return compact
 
 
+_LOOKUP_OUTPUT_IDENTITY_KEYS = ('slot_id', 'branch_id', 'phase_id', 'obligation_id')
+_LOOKUP_OUTPUT_STATE_KEYS = (
+    'status',
+    'lifecycle',
+    'blocked_reason',
+    'error_ref',
+    'recovery_context',
+    'recovery_state',
+)
+_LOOKUP_OUTPUT_DIAGNOSTIC_KEYS = (
+    'blocked_reason',
+    'error_ref',
+    'recovery_context',
+    'recovery_state',
+)
+_LOOKUP_ARTIFACT_BINDING_KEYS = (
+    'artifact_ref',
+    'ref',
+    'artifact_path',
+    'path',
+    'target_path',
+    'saved_image_path',
+    'saved_audio_path',
+    'saved_text_path',
+)
+
+
+def _lookup_output_lifecycle_for_status(status: Any) -> str:
+    normalized = str(status or '').strip().lower()
+    if normalized in {'fulfilled', 'completed'}:
+        return 'materialized_output'
+    if normalized in {'blocked', 'failed'}:
+        return 'blocked_output'
+    if normalized == 'waived':
+        return 'waived_output'
+    if normalized == 'superseded':
+        return 'superseded_output'
+    if normalized == 'cancelled':
+        return 'cancelled_output'
+    return 'deferred_output'
+
+
+def _lookup_records_share_exact_output_identity(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Match one output owner without guessing from list order or output type."""
+
+    shared: list[tuple[str, str, str]] = []
+    for key in _LOOKUP_OUTPUT_IDENTITY_KEYS:
+        left_value = str(left.get(key) or '').strip()
+        right_value = str(right.get(key) or '').strip()
+        if left_value and right_value:
+            shared.append((key, left_value, right_value))
+    if not shared or any(left_value != right_value for _, left_value, right_value in shared):
+        return False
+    if any(key != 'phase_id' for key, _, _ in shared):
+        return True
+    left_has_strong_identity = any(
+        str(left.get(key) or '').strip()
+        for key in ('slot_id', 'branch_id', 'obligation_id')
+    )
+    right_has_strong_identity = any(
+        str(right.get(key) or '').strip()
+        for key in ('slot_id', 'branch_id', 'obligation_id')
+    )
+    return not left_has_strong_identity and not right_has_strong_identity
+
+
+def _lookup_records_share_output_owner(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    if _lookup_records_share_exact_output_identity(left, right):
+        return True
+    for key in ('slot_id', 'branch_id', 'obligation_id'):
+        left_value = str(left.get(key) or '').strip()
+        right_value = str(right.get(key) or '').strip()
+        if left_value and left_value == right_value:
+            return True
+    left_has_strong_identity = any(
+        str(left.get(key) or '').strip()
+        for key in ('slot_id', 'branch_id', 'obligation_id')
+    )
+    right_has_strong_identity = any(
+        str(right.get(key) or '').strip()
+        for key in ('slot_id', 'branch_id', 'obligation_id')
+    )
+    left_phase = str(left.get('phase_id') or '').strip()
+    right_phase = str(right.get('phase_id') or '').strip()
+    return bool(
+        not left_has_strong_identity
+        and not right_has_strong_identity
+        and left_phase
+        and left_phase == right_phase
+    )
+
+
+def _lookup_is_ambiguous_phase_only_alias(
+    record: Mapping[str, Any],
+    owners: list[Any],
+) -> bool:
+    if any(
+        str(record.get(key) or '').strip()
+        for key in ('slot_id', 'branch_id', 'obligation_id')
+    ):
+        return False
+    phase_id = str(record.get('phase_id') or '').strip()
+    if not phase_id:
+        return False
+    return any(
+        isinstance(owner, Mapping)
+        and str(owner.get('phase_id') or '').strip() == phase_id
+        and any(
+            str(owner.get(key) or '').strip()
+            for key in ('slot_id', 'branch_id', 'obligation_id')
+        )
+        for owner in owners
+    )
+
+
+def _lookup_is_anonymous_type_alias(
+    record: Mapping[str, Any],
+    owners: list[Any],
+) -> bool:
+    if any(str(record.get(key) or '').strip() for key in _LOOKUP_OUTPUT_IDENTITY_KEYS):
+        return False
+    record_type = str(record.get('type') or record.get('output_type') or '').strip().lower()
+    if not record_type:
+        return False
+    return any(
+        isinstance(owner, Mapping)
+        and str(owner.get('type') or owner.get('output_type') or '').strip().lower()
+        == record_type
+        for owner in owners
+    )
+
+
+def _lookup_merge_duplicate_owner_records(
+    records: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not records:
+        return None
+    if len(records) == 1:
+        return copy.deepcopy(records[0])
+    if not all(
+        _lookup_records_share_exact_output_identity(left, right)
+        for index, left in enumerate(records)
+        for right in records[index + 1:]
+    ):
+        return None
+    refs = {
+        str(record.get('artifact_ref') or record.get('ref') or '').strip()
+        for record in records
+        if str(record.get('artifact_ref') or record.get('ref') or '').strip()
+    }
+    paths = {
+        str(record.get('artifact_path') or '').strip()
+        or _lookup_record_artifact_path(record)
+        for record in records
+        if (
+            str(record.get('artifact_path') or '').strip()
+            or _lookup_record_artifact_path(record)
+        )
+    }
+    if len(refs) > 1 or len(paths) > 1:
+        return None
+
+    success_states = {'fulfilled', 'completed', 'materialized_output'}
+    failure_states = {'blocked', 'failed', 'blocked_output'}
+    terminal_categories = (
+        success_states,
+        failure_states,
+        {'waived', 'waived_output'},
+        {'superseded', 'superseded_output'},
+        {'cancelled', 'cancelled_output'},
+    )
+    state_tokens = {
+        str(record.get('status') or record.get('lifecycle') or '').strip().lower()
+        for record in records
+        if str(record.get('status') or record.get('lifecycle') or '').strip()
+    }
+    matched_terminal_categories = sum(
+        bool(state_tokens.intersection(category))
+        for category in terminal_categories
+    )
+    if matched_terminal_categories > 1:
+        return None
+
+    def record_rank(record: Mapping[str, Any]) -> tuple[int, int, str]:
+        state = str(record.get('status') or record.get('lifecycle') or '').strip().lower()
+        terminal_rank = 2 if any(state in category for category in terminal_categories) else 1 if state else 0
+        populated = sum(value not in (None, '', [], {}) for value in record.values())
+        stable = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+        return terminal_rank, populated, stable
+
+    ranked = sorted(records, key=record_rank, reverse=True)
+    merged = copy.deepcopy(ranked[0])
+    for record in ranked[1:]:
+        for key, value in record.items():
+            if merged.get(key) in (None, '', [], {}) and value not in (None, '', [], {}):
+                merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _lookup_unique_output_owner(
+    slot: Mapping[str, Any],
+    records: list[Any],
+    *,
+    allow_anonymous_type_fallback: bool = False,
+) -> Optional[dict[str, Any]]:
+    exact_matches = [
+        dict(record)
+        for record in records
+        if isinstance(record, Mapping)
+        and _lookup_records_share_exact_output_identity(slot, record)
+    ]
+    if exact_matches:
+        merged_exact = _lookup_merge_duplicate_owner_records(exact_matches)
+        if merged_exact is not None:
+            return merged_exact
+    if exact_matches or not allow_anonymous_type_fallback:
+        return None
+    if any(str(slot.get(key) or '').strip() for key in _LOOKUP_OUTPUT_IDENTITY_KEYS):
+        return None
+    slot_type = str(slot.get('type') or '').strip().lower()
+    if not slot_type:
+        return None
+    type_matches = [
+        dict(record)
+        for record in records
+        if isinstance(record, Mapping)
+        and not any(
+            str(record.get(key) or '').strip()
+            for key in _LOOKUP_OUTPUT_IDENTITY_KEYS
+        )
+        and str(record.get('type') or record.get('output_type') or '').strip().lower()
+        == slot_type
+    ]
+    return type_matches[0] if len(type_matches) == 1 else None
+
+
+def _lookup_unique_slot_state_owner(
+    slot: Mapping[str, Any],
+    records: list[Any],
+) -> Optional[dict[str, Any]]:
+    exact = _lookup_unique_output_owner(
+        slot,
+        records,
+        allow_anonymous_type_fallback=True,
+    )
+    if exact is not None:
+        return exact
+    strong_keys = ('slot_id', 'branch_id', 'obligation_id')
+    for key_index, key in enumerate(strong_keys):
+        slot_value = str(slot.get(key) or '').strip()
+        if not slot_value:
+            continue
+        higher_priority_keys = strong_keys[:key_index]
+        matches = [
+            dict(record)
+            for record in records
+            if isinstance(record, Mapping)
+            and str(record.get(key) or '').strip() == slot_value
+            and not any(
+                str(slot.get(higher_key) or '').strip()
+                and str(record.get(higher_key) or '').strip()
+                and str(slot.get(higher_key) or '').strip()
+                != str(record.get(higher_key) or '').strip()
+                for higher_key in higher_priority_keys
+            )
+        ]
+        if matches:
+            merged_matches = _lookup_merge_duplicate_owner_records(matches)
+            if merged_matches is not None:
+                return merged_matches
+        if matches:
+            return None
+    if any(str(slot.get(key) or '').strip() for key in strong_keys):
+        return None
+    for key in ('phase_id',):
+        slot_value = str(slot.get(key) or '').strip()
+        if not slot_value:
+            continue
+        matches = [
+            dict(record)
+            for record in records
+            if isinstance(record, Mapping)
+            and str(record.get(key) or '').strip() == slot_value
+            and not any(
+                str(record.get(strong_key) or '').strip()
+                for strong_key in strong_keys
+            )
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return None
+    return None
+
+
+def _preserve_lookup_canonical_outputs(
+    original_outputs: list[Any],
+    projected_outputs: list[Any],
+) -> list[dict[str, Any]]:
+    """Keep existing public output owners; append only genuinely new identities."""
+
+    preserved: list[dict[str, Any]] = []
+    projected_records = [
+        dict(output)
+        for output in projected_outputs
+        if isinstance(output, Mapping)
+    ]
+    for raw_original in original_outputs:
+        if not isinstance(raw_original, Mapping):
+            continue
+        original = copy.deepcopy(dict(raw_original))
+        current = _lookup_unique_output_owner(original, projected_records)
+        if current is None:
+            current = _lookup_unique_slot_state_owner(original, projected_records)
+        if current is not None:
+            current_status = str(current.get('status') or '').strip()
+            if current_status:
+                for key in ('status', 'lifecycle', *_LOOKUP_OUTPUT_DIAGNOSTIC_KEYS):
+                    original.pop(key, None)
+                original['status'] = current_status
+                original['lifecycle'] = (
+                    str(current.get('lifecycle') or '').strip()
+                    or _lookup_output_lifecycle_for_status(current_status)
+                )
+                for key in _LOOKUP_OUTPUT_DIAGNOSTIC_KEYS:
+                    value = current.get(key)
+                    if value not in (None, '', [], {}):
+                        original[key] = copy.deepcopy(value)
+            _lookup_bind_slot_to_exact_output(original, current, [])
+            for key, value in current.items():
+                if key in _LOOKUP_OUTPUT_IDENTITY_KEYS:
+                    continue
+                if key in _LOOKUP_OUTPUT_STATE_KEYS or key in _LOOKUP_ARTIFACT_BINDING_KEYS:
+                    continue
+                if original.get(key) in (None, '', [], {}) and value not in (None, '', [], {}):
+                    original[key] = copy.deepcopy(value)
+        preserved.append(original)
+    for raw_output in projected_outputs:
+        if not isinstance(raw_output, Mapping):
+            continue
+        if not any(
+            str(raw_output.get(key) or '').strip()
+            for key in _LOOKUP_OUTPUT_IDENTITY_KEYS
+        ):
+            continue
+        if any(
+            _lookup_records_share_output_owner(existing, raw_output)
+            for existing in preserved
+        ):
+            continue
+        if _lookup_is_ambiguous_phase_only_alias(raw_output, preserved):
+            continue
+        preserved.append(copy.deepcopy(dict(raw_output)))
+    return preserved
+
+
+def _lookup_artifact_for_exact_output(
+    output: Mapping[str, Any],
+    artifacts: list[Any],
+) -> dict[str, Any]:
+    output_ref = str(output.get('artifact_ref') or output.get('ref') or '').strip()
+    output_path = (
+        str(output.get('artifact_path') or '').strip()
+        or _lookup_record_artifact_path(output)
+    )
+    if output_ref:
+        for raw_artifact in artifacts:
+            if not isinstance(raw_artifact, Mapping):
+                continue
+            artifact_ref = str(
+                raw_artifact.get('artifact_ref') or raw_artifact.get('ref') or ''
+            ).strip()
+            if artifact_ref == output_ref:
+                return dict(raw_artifact)
+        return {}
+    if output_path:
+        for raw_artifact in artifacts:
+            if not isinstance(raw_artifact, Mapping):
+                continue
+            artifact_path = (
+                str(raw_artifact.get('artifact_path') or '').strip()
+                or _lookup_record_artifact_path(raw_artifact)
+            )
+            if artifact_path == output_path:
+                return dict(raw_artifact)
+    return {}
+
+
+def _lookup_bind_slot_to_exact_output(
+    slot: dict[str, Any],
+    output: Mapping[str, Any],
+    artifacts: list[Any],
+) -> None:
+    """Replace ref and path together so a compatibility slot cannot split owners."""
+
+    artifact = _lookup_artifact_for_exact_output(output, artifacts)
+    output_ref = str(output.get('artifact_ref') or output.get('ref') or '').strip()
+    output_path = (
+        str(output.get('artifact_path') or '').strip()
+        or _lookup_record_artifact_path(output)
+    )
+    artifact_ref = str(
+        artifact.get('artifact_ref') or artifact.get('ref') or output_ref
+    ).strip()
+    artifact_path = (
+        str(artifact.get('artifact_path') or '').strip()
+        or _lookup_record_artifact_path(artifact)
+    )
+    output_path_claimed_by_other_ref = bool(
+        output_ref
+        and output_path
+        and any(
+            isinstance(raw_artifact, Mapping)
+            and (
+                str(raw_artifact.get('artifact_path') or '').strip()
+                or _lookup_record_artifact_path(raw_artifact)
+            ) == output_path
+            and str(
+                raw_artifact.get('artifact_ref') or raw_artifact.get('ref') or ''
+            ).strip()
+            not in {'', output_ref}
+            for raw_artifact in artifacts
+        )
+    )
+    if not artifact_path and not output_path_claimed_by_other_ref:
+        artifact_path = output_path
+    if not artifact_ref and not artifact_path:
+        return
+    existing_ref = str(slot.get('artifact_ref') or slot.get('ref') or '').strip()
+    existing_path = (
+        str(slot.get('artifact_path') or '').strip()
+        or _lookup_record_artifact_path(slot)
+    )
+    existing_path_claimed_by_other_ref = bool(
+        existing_ref
+        and existing_path
+        and any(
+            isinstance(raw_artifact, Mapping)
+            and (
+                str(raw_artifact.get('artifact_path') or '').strip()
+                or _lookup_record_artifact_path(raw_artifact)
+            ) == existing_path
+            and str(
+                raw_artifact.get('artifact_ref') or raw_artifact.get('ref') or ''
+            ).strip()
+            not in {'', existing_ref}
+            for raw_artifact in artifacts
+        )
+    )
+    if artifact_ref and existing_ref == artifact_ref:
+        if not artifact_path:
+            if existing_path_claimed_by_other_ref:
+                for key in _LOOKUP_ARTIFACT_BINDING_KEYS:
+                    slot.pop(key, None)
+                slot['artifact_ref'] = artifact_ref
+            return
+    elif artifact_ref and not artifact_path:
+        if existing_ref or existing_path:
+            return
+    elif not artifact_ref and artifact_path:
+        if existing_ref:
+            return
+    for key in _LOOKUP_ARTIFACT_BINDING_KEYS:
+        slot.pop(key, None)
+    if artifact_ref:
+        slot['artifact_ref'] = artifact_ref
+    if artifact_path:
+        slot['artifact_path'] = artifact_path
+    path_alias_source = artifact if artifact else output
+    for key in ('saved_image_path', 'saved_audio_path', 'saved_text_path'):
+        value = path_alias_source.get(key)
+        if value not in (None, '', [], {}) and str(value).strip() == artifact_path:
+            slot[key] = value
+
+
+def _lookup_hydrate_artifact_backed_text_value(
+    record: dict[str, Any],
+    artifacts: list[Any],
+) -> None:
+    """Project canonical saved bytes for an exactly bound public text artifact."""
+
+    record_type = str(
+        record.get('type') or record.get('output_type') or ''
+    ).strip().lower()
+    if record_type != 'text':
+        return
+    artifact = _lookup_artifact_for_exact_output(record, artifacts)
+    if not artifact:
+        return
+    artifact_path = (
+        str(artifact.get('artifact_path') or '').strip()
+        or _lookup_record_artifact_path(artifact)
+    )
+    resolved = _resolve_saved_text_artifact_path(artifact_path)
+    if resolved is None:
+        return
+    try:
+        if resolved.stat().st_size > 512_000:
+            return
+        content = resolved.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return
+    record['value'] = content
+    record['artifact_path'] = str(resolved)
+    record['path'] = str(resolved)
+
+
+def _normalize_lookup_output_artifact_bindings(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated = dict(payload or {})
+    artifacts = updated.get('artifacts') if isinstance(updated.get('artifacts'), list) else []
+    raw_outputs = updated.get('outputs') if isinstance(updated.get('outputs'), list) else []
+    normalized_outputs: list[dict[str, Any]] = []
+    for raw_output in raw_outputs:
+        if not isinstance(raw_output, Mapping):
+            continue
+        output = copy.deepcopy(dict(raw_output))
+        _lookup_bind_slot_to_exact_output(output, raw_output, artifacts)
+        public_path = (
+            str(output.get('artifact_path') or '').strip()
+            or _lookup_record_artifact_path(output)
+        )
+        if public_path:
+            output['path'] = public_path
+        _lookup_hydrate_artifact_backed_text_value(output, artifacts)
+        normalized_outputs.append(output)
+    if raw_outputs:
+        updated['outputs'] = normalized_outputs
+
+    raw_slots = updated.get('output_slots') if isinstance(updated.get('output_slots'), list) else []
+    normalized_slots: list[dict[str, Any]] = []
+    for raw_slot in raw_slots:
+        if not isinstance(raw_slot, Mapping):
+            continue
+        slot = copy.deepcopy(dict(raw_slot))
+        owner = _lookup_unique_output_owner(
+            slot,
+            normalized_outputs,
+            allow_anonymous_type_fallback=True,
+        )
+        if owner is not None:
+            _lookup_bind_slot_to_exact_output(slot, owner, artifacts)
+        elif any(
+            slot.get(key) not in (None, '', [], {})
+            for key in _LOOKUP_ARTIFACT_BINDING_KEYS
+        ):
+            _lookup_bind_slot_to_exact_output(slot, raw_slot, artifacts)
+        public_path = (
+            str(slot.get('artifact_path') or '').strip()
+            or _lookup_record_artifact_path(slot)
+        )
+        if public_path:
+            slot['path'] = public_path
+        _lookup_hydrate_artifact_backed_text_value(slot, artifacts)
+        normalized_slots.append(slot)
+    if raw_slots:
+        updated['output_slots'] = normalized_slots
+    output_container = (
+        copy.deepcopy(dict(updated.get('output') or {}))
+        if isinstance(updated.get('output'), Mapping)
+        else None
+    )
+    if output_container is not None and isinstance(output_container.get('outputs'), list):
+        nested_outputs: list[dict[str, Any]] = []
+        for raw_output in output_container.get('outputs') or []:
+            if not isinstance(raw_output, Mapping):
+                continue
+            nested_output = copy.deepcopy(dict(raw_output))
+            _lookup_bind_slot_to_exact_output(nested_output, raw_output, artifacts)
+            _lookup_hydrate_artifact_backed_text_value(nested_output, artifacts)
+            nested_outputs.append(nested_output)
+        output_container['outputs'] = nested_outputs
+        updated['output'] = output_container
+    return updated
+
+
+def _project_lookup_output_slots_onto_frozen_frame(
+    frozen_frame: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Overlay current slot state without rebuilding frozen graph or intent truth."""
+
+    frame = copy.deepcopy(dict(frozen_frame))
+    planning = frame.get('planning') if isinstance(frame.get('planning'), Mapping) else {}
+    artifact_flow = (
+        planning.get('artifact_flow')
+        if isinstance(planning.get('artifact_flow'), Mapping)
+        else {}
+    )
+    frozen_slots = (
+        artifact_flow.get('output_slots')
+        if isinstance(artifact_flow.get('output_slots'), list)
+        else []
+    )
+    state_slots = payload.get('output_slots') if isinstance(payload.get('output_slots'), list) else []
+    canonical_outputs = payload.get('outputs') if isinstance(payload.get('outputs'), list) else []
+    artifacts = payload.get('artifacts') if isinstance(payload.get('artifacts'), list) else []
+    projected_slots: list[dict[str, Any]] = []
+    for raw_slot in frozen_slots:
+        if not isinstance(raw_slot, Mapping):
+            continue
+        slot = dict(raw_slot)
+        state_owner = _lookup_unique_slot_state_owner(slot, state_slots)
+        canonical_owner = _lookup_unique_output_owner(
+            slot,
+            canonical_outputs,
+            allow_anonymous_type_fallback=True,
+        )
+        for owner in (canonical_owner,):
+            if not isinstance(owner, Mapping):
+                continue
+            for key in _LOOKUP_OUTPUT_DIAGNOSTIC_KEYS:
+                slot.pop(key, None)
+            owner_status = str(owner.get('status') or '').strip()
+            if owner_status:
+                slot.pop('status', None)
+                slot.pop('lifecycle', None)
+            for key in _LOOKUP_OUTPUT_STATE_KEYS:
+                value = owner.get(key)
+                if value not in (None, '', [], {}):
+                    slot[key] = copy.deepcopy(value)
+            if owner_status and not str(owner.get('lifecycle') or '').strip():
+                slot['lifecycle'] = _lookup_output_lifecycle_for_status(owner_status)
+        if state_owner is not None:
+            for key in _LOOKUP_OUTPUT_DIAGNOSTIC_KEYS:
+                slot.pop(key, None)
+            state_status = str(state_owner.get('status') or '').strip()
+            if state_status:
+                slot.pop('status', None)
+                slot.pop('lifecycle', None)
+            for key in _LOOKUP_OUTPUT_STATE_KEYS:
+                value = state_owner.get(key)
+                if value not in (None, '', [], {}):
+                    slot[key] = copy.deepcopy(value)
+            if state_status and not str(state_owner.get('lifecycle') or '').strip():
+                slot['lifecycle'] = _lookup_output_lifecycle_for_status(state_status)
+        if canonical_owner is not None:
+            _lookup_bind_slot_to_exact_output(slot, canonical_owner, artifacts)
+        projected_slots.append(slot)
+
+    for raw_state_slot in state_slots:
+        if not isinstance(raw_state_slot, Mapping):
+            continue
+        if any(
+            _lookup_records_share_output_owner(existing, raw_state_slot)
+            for existing in projected_slots
+        ):
+            continue
+        if _lookup_is_ambiguous_phase_only_alias(raw_state_slot, projected_slots):
+            continue
+        if _lookup_is_anonymous_type_alias(raw_state_slot, projected_slots):
+            continue
+        slot = dict(raw_state_slot)
+        canonical_owner = _lookup_unique_output_owner(
+            slot,
+            canonical_outputs,
+            allow_anonymous_type_fallback=True,
+        )
+        if canonical_owner is not None:
+            _lookup_bind_slot_to_exact_output(slot, canonical_owner, artifacts)
+        projected_slots.append(slot)
+
+    projected_planning = copy.deepcopy(dict(planning))
+    projected_artifact_flow = copy.deepcopy(dict(artifact_flow))
+    projected_artifact_flow['output_slots'] = projected_slots
+    projected_planning['artifact_flow'] = projected_artifact_flow
+    frame['planning'] = projected_planning
+    return frame
+
+
+def _lookup_frame_has_frozen_planning_authority(frame: Mapping[str, Any]) -> bool:
+    planning = frame.get('planning') if isinstance(frame.get('planning'), Mapping) else {}
+    artifact_flow = (
+        planning.get('artifact_flow')
+        if isinstance(planning.get('artifact_flow'), Mapping)
+        else {}
+    )
+    external = (
+        frame.get('external_snapshots')
+        if isinstance(frame.get('external_snapshots'), Mapping)
+        else {}
+    )
+    return bool(
+        planning.get('request_phase_graph_snapshot_ref')
+        or artifact_flow.get('request_phase_graph_snapshot_ref')
+        or artifact_flow.get('output_slots')
+        or external.get('items')
+        or frame.get('snapshot_policy')
+    )
+
+
 def _build_response_lookup_ui_source_payload(record: dict[str, Any]) -> dict[str, Any]:
     payload = dict(record.get('response_payload') or {})
     if payload:
@@ -8445,26 +9135,15 @@ def _build_response_lookup_ui_source_payload(record: dict[str, Any]) -> dict[str
         )
         if record.get('error_message'):
             payload['error'] = {'message': str(record.get('error_message') or '').strip()}
+        payload = _normalize_lookup_output_artifact_bindings(payload)
         payload = _attach_response_artifact_bundles_from_registry(payload)
         status_record = dict(record)
         status_record['response_payload'] = dict(payload)
-        original_response_frame = (
-            payload.get('response_frame')
-            if isinstance(payload.get('response_frame'), Mapping)
-            else {}
+        frozen_canonical_outputs = (
+            copy.deepcopy(payload.get('outputs'))
+            if isinstance(payload.get('outputs'), list) and payload.get('outputs')
+            else []
         )
-        original_planning = (
-            original_response_frame.get('planning')
-            if isinstance(original_response_frame.get('planning'), Mapping)
-            else {}
-        )
-        original_artifact_flow = (
-            original_planning.get('artifact_flow')
-            if isinstance(original_planning.get('artifact_flow'), Mapping)
-            else {}
-        )
-        if isinstance(original_artifact_flow.get('output_slots'), list) and original_artifact_flow.get('output_slots'):
-            payload['_lookup_original_response_frame_output_slots'] = True
         payload = _attach_response_status_semantics(payload)
         payload = _attach_lookup_replay_pending_output_slots(payload)
         payload = _reconcile_lookup_output_slots_with_late_fill_truth(payload)
@@ -8477,14 +9156,27 @@ def _build_response_lookup_ui_source_payload(record: dict[str, Any]) -> dict[str
         ):
             payload['response_frame'] = _enrich_response_frame_metadata(payload['response_frame'])
         payload = _hoist_response_output_surfaces(payload)
+        if frozen_canonical_outputs:
+            payload['outputs'] = _preserve_lookup_canonical_outputs(
+                frozen_canonical_outputs,
+                payload.get('outputs') if isinstance(payload.get('outputs'), list) else [],
+            )
+        payload = _normalize_lookup_output_artifact_bindings(payload)
         if isinstance(payload.get('response_frame'), Mapping):
             frozen_response_frame = copy.deepcopy(payload['response_frame'])
-            frame_payload = _attach_response_frame(payload, request_payload={})
-            if isinstance(frame_payload.get('response_frame'), Mapping):
-                payload['response_frame'] = _preserve_frozen_response_frame_identity(
-                    frame_payload['response_frame'],
-                    frozen_response_frame,
-                )
+            if not _lookup_frame_has_frozen_planning_authority(frozen_response_frame):
+                frame_payload = _attach_response_frame(payload, request_payload={})
+                if isinstance(frame_payload.get('response_frame'), Mapping):
+                    frozen_response_frame = _preserve_frozen_response_frame_identity(
+                        frame_payload['response_frame'],
+                        frozen_response_frame,
+                    )
+            payload['response_frame'] = _project_lookup_output_slots_onto_frozen_frame(
+                frozen_response_frame,
+                payload,
+            )
+        payload.pop('_lookup_original_response_frame_output_slots', None)
+        payload.pop('_lookup_replay_response_frame_required', None)
         return _attach_response_lookup_state_version(
             payload,
             status_record=status_record,
@@ -8580,84 +9272,23 @@ def _build_response_ui_lookup_payload(record: dict[str, Any]) -> dict[str, Any]:
     if status_lookup.get('frame_id'):
         ui_payload['frame_id'] = status_lookup.get('frame_id')
     response_frame = full_payload.get('response_frame') if isinstance(full_payload.get('response_frame'), Mapping) else {}
-    response_frame_planning = response_frame.get('planning') if isinstance(response_frame.get('planning'), Mapping) else {}
+    response_frame_planning = (
+        response_frame.get('planning')
+        if isinstance(response_frame.get('planning'), Mapping)
+        else {}
+    )
     response_frame_artifact_flow = (
         response_frame_planning.get('artifact_flow')
         if isinstance(response_frame_planning.get('artifact_flow'), Mapping)
         else {}
     )
-    response_frame_has_output_slots = isinstance(response_frame_artifact_flow.get('output_slots'), list) and bool(
+    response_frame_has_output_slots = bool(
         response_frame_artifact_flow.get('output_slots')
+        if isinstance(response_frame_artifact_flow.get('output_slots'), list)
+        else []
     )
-    if response_frame and (
-        full_payload.get('_lookup_replay_response_frame_required') is True
-        or full_payload.get('_lookup_original_response_frame_output_slots') is True
-    ):
-        frame_for_ui = dict(response_frame)
-        outputs_for_ui = full_payload.get('outputs') if isinstance(full_payload.get('outputs'), list) else []
-        if response_frame_has_output_slots and outputs_for_ui:
-            planning_for_ui = (
-                dict(frame_for_ui.get('planning'))
-                if isinstance(frame_for_ui.get('planning'), Mapping)
-                else {}
-            )
-            artifact_flow_for_ui = (
-                dict(planning_for_ui.get('artifact_flow'))
-                if isinstance(planning_for_ui.get('artifact_flow'), Mapping)
-                else {}
-            )
-            slots_for_ui: list[dict[str, Any]] = []
-            used_output_indices: set[int] = set()
-            for raw_slot in response_frame_artifact_flow.get('output_slots') or []:
-                if not isinstance(raw_slot, Mapping):
-                    continue
-                slot = dict(raw_slot)
-                matching_output = None
-                for index, raw_output in enumerate(outputs_for_ui):
-                    if index in used_output_indices or not isinstance(raw_output, Mapping):
-                        continue
-                    if any(
-                        str(slot.get(key) or '').strip()
-                        and str(slot.get(key) or '').strip() == str(raw_output.get(key) or '').strip()
-                        for key in ('slot_id', 'branch_id', 'phase_id')
-                    ):
-                        matching_output = raw_output
-                        used_output_indices.add(index)
-                        break
-                if matching_output is None:
-                    slot_type = str(slot.get('type') or '').strip().lower()
-                    for index, raw_output in enumerate(outputs_for_ui):
-                        if index in used_output_indices or not isinstance(raw_output, Mapping):
-                            continue
-                        output_type = str(raw_output.get('type') or '').strip().lower()
-                        output_status = str(raw_output.get('status') or '').strip().lower()
-                        if slot_type and slot_type == output_type and output_status in {'fulfilled', 'completed', 'blocked'}:
-                            matching_output = raw_output
-                            used_output_indices.add(index)
-                            break
-                if isinstance(matching_output, Mapping):
-                    for key in (
-                        'status',
-                        'lifecycle',
-                        'artifact_ref',
-                        'path',
-                        'saved_image_path',
-                        'saved_audio_path',
-                        'saved_text_path',
-                        'blocked_reason',
-                        'error_ref',
-                        'recovery_context',
-                        'recovery_state',
-                    ):
-                        value = matching_output.get(key)
-                        if value not in (None, '', [], {}):
-                            slot[key] = value
-                slots_for_ui.append(slot)
-            if slots_for_ui:
-                artifact_flow_for_ui['output_slots'] = slots_for_ui
-                planning_for_ui['artifact_flow'] = artifact_flow_for_ui
-                frame_for_ui['planning'] = planning_for_ui
-        ui_payload['response_frame'] = frame_for_ui
+    if response_frame and response_frame_has_output_slots:
+        ui_payload['response_frame'] = copy.deepcopy(dict(response_frame))
     for source_key, target_key in (
         ('frame_sequence', 'frame_sequence'),
         ('frame_id', 'frame_id'),
@@ -10550,6 +11181,15 @@ def _encode_saved_artifact_interactive_preview_base_root(base_root: Path) -> str
     return base64.urlsafe_b64encode(payload + b'\0' + signature).decode('ascii').rstrip('=')
 
 
+def _saved_artifact_preview_mailto_bridge_token(base_token: str) -> str:
+    payload = b'ollmo.saved-artifact-preview.mailto.v1\0' + str(base_token).encode('utf-8')
+    return hmac.new(
+        _SAVED_INTERACTIVE_PREVIEW_SIGNING_KEY,
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _decode_saved_artifact_interactive_preview_base_root(token: str) -> Optional[Path]:
     cleaned = str(token or '').strip()
     if not cleaned:
@@ -10616,11 +11256,159 @@ def _inject_saved_artifact_preview_base(html_text: str, *, base_href: str) -> st
     return f'{base_tag}\n{html_text}'
 
 
+def _inject_saved_artifact_preview_mailto_bridge(
+    html_text: str,
+    *,
+    bridge_token: str,
+) -> str:
+    """Install the trusted mailto click handoff before generated page scripts."""
+
+    token_literal = json.dumps(str(bridge_token))
+    script = (
+        '<script data-ollmo-preview-bridge="mailto">(() => {'
+        f'const bridgeToken={token_literal};'
+        'const scriptElement=document.currentScript;'
+        'const parentWindow=window.parent;'
+        'const postMessage=parentWindow.postMessage.bind(parentWindow);'
+        'const closest=Element.prototype.closest;'
+        'const getAttribute=Element.prototype.getAttribute;'
+        'const preventDefault=Event.prototype.preventDefault;'
+        'if(scriptElement)scriptElement.remove();'
+        'document.addEventListener("click",(event)=>{'
+        'if(!event.isTrusted||event.defaultPrevented||event.button!==0)return;'
+        'const target=event.target instanceof Element?event.target:null;'
+        'const anchor=target?closest.call(target,"a[href]"):null;'
+        'if(!anchor)return;'
+        'const href=String(getAttribute.call(anchor,"href")||"").trim();'
+        'if(href.length<7||href.length>4096||!/^mailto:/i.test(href))return;'
+        'preventDefault.call(event);'
+        'postMessage({kind:"ollmo.preview.mailto",href,bridge_token:bridgeToken},"*");'
+        '},true);'
+        '})();</script>'
+    )
+    head_match = re.search(r'<head\b[^>]*>', html_text, flags=re.IGNORECASE)
+    if head_match:
+        insert_at = head_match.end()
+        return f'{html_text[:insert_at]}\n    {script}{html_text[insert_at:]}'
+    html_match = re.search(r'<html\b[^>]*>', html_text, flags=re.IGNORECASE)
+    if html_match:
+        insert_at = html_match.end()
+        return f'{html_text[:insert_at]}\n<head>{script}</head>{html_text[insert_at:]}'
+    return f'{script}\n{html_text}'
+
+
+def _rewrite_mailto_anchor_start_tag(raw_tag: str, *, target: str = '_self') -> str:
+    """Set the target for mailto navigation from a real anchor tag."""
+    target_ranges: list[tuple[int, int, str]] = []
+    cursor = 2  # ``<a`` / ``<A``; the parser has already identified this tag.
+    length = len(raw_tag)
+    while cursor < length:
+        while cursor < length and raw_tag[cursor].isspace():
+            cursor += 1
+        if cursor >= length or raw_tag[cursor] in {'>', '/'}:
+            break
+        name_start = cursor
+        while cursor < length and not raw_tag[cursor].isspace() and raw_tag[cursor] not in {'=', '>', '/'}:
+            cursor += 1
+        name_end = cursor
+        if name_start == name_end:
+            cursor += 1
+            continue
+        attribute_name = raw_tag[name_start:name_end]
+        while cursor < length and raw_tag[cursor].isspace():
+            cursor += 1
+        value_start = value_end = None
+        if cursor < length and raw_tag[cursor] == '=':
+            cursor += 1
+            while cursor < length and raw_tag[cursor].isspace():
+                cursor += 1
+            if cursor < length and raw_tag[cursor] in {'"', "'"}:
+                quote = raw_tag[cursor]
+                cursor += 1
+                value_start = cursor
+                while cursor < length and raw_tag[cursor] != quote:
+                    cursor += 1
+                value_end = cursor
+                if cursor < length:
+                    cursor += 1
+            else:
+                value_start = cursor
+                while cursor < length and not raw_tag[cursor].isspace() and raw_tag[cursor] != '>':
+                    cursor += 1
+                value_end = cursor
+        if attribute_name.casefold() == 'target':
+            if value_start is None or value_end is None:
+                target_ranges.append((name_end, name_end, f'="{target}"'))
+            else:
+                target_ranges.append((value_start, value_end, target))
+
+    if target_ranges:
+        rewritten = raw_tag
+        for start, end, replacement in reversed(target_ranges):
+            rewritten = f'{rewritten[:start]}{replacement}{rewritten[end:]}'
+        return rewritten
+
+    insert_at = raw_tag.rfind('/>') if raw_tag.rstrip().endswith('/>') else raw_tag.rfind('>')
+    if insert_at < 0:
+        return raw_tag
+    return f'{raw_tag[:insert_at]} target="{target}"{raw_tag[insert_at:]}'
+
+
+class _MailtoAnchorTargetParser(HTMLParser):
+    """Collect source offsets for real anchor start tags without reserializing HTML."""
+
+    def __init__(self, source: str, *, target: str = '_self'):
+        super().__init__(convert_charrefs=False)
+        self.source = source
+        self.target = target
+        self.line_offsets = [0]
+        self.line_offsets.extend(match.end() for match in re.finditer(r'\n', source))
+        self.replacements: list[tuple[int, int, str]] = []
+
+    def _handle_anchor(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        raw_tag = self.get_starttag_text() or ''
+        if not raw_tag or tag.casefold() != 'a':
+            return
+        line_number, column = self.getpos()
+        if line_number < 1 or line_number > len(self.line_offsets):
+            return
+        start = self.line_offsets[line_number - 1] + column
+        if self.source[start:start + len(raw_tag)] != raw_tag:
+            return
+        href = next((value for name, value in attrs if name.casefold() == 'href'), None)
+        if not href or not href.lstrip().casefold().startswith('mailto:'):
+            return
+        rewritten = _rewrite_mailto_anchor_start_tag(raw_tag, target=self.target)
+        if rewritten != raw_tag:
+            self.replacements.append((start, start + len(raw_tag), rewritten))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        self._handle_anchor(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        self._handle_anchor(tag, attrs)
+
+
+def _rewrite_mailto_anchor_targets(html_text: str, *, target: str = '_self') -> str:
+    """Rewrite only actual mailto anchor tags, preserving every other source byte."""
+    parser = _MailtoAnchorTargetParser(html_text, target=target)
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except (AssertionError, UnicodeError, ValueError):
+        return html_text
+    rewritten = html_text
+    for start, end, replacement in reversed(parser.replacements):
+        rewritten = f'{rewritten[:start]}{replacement}{rewritten[end:]}'
+    return rewritten
+
+
 def _html_saved_artifact_preview_response(resolved: Path, *, mimetype: str):
     try:
         html_text = resolved.read_text(encoding='utf-8')
     except UnicodeDecodeError:
         html_text = resolved.read_text(encoding='utf-8', errors='replace')
+    html_text = _rewrite_mailto_anchor_targets(html_text, target='_top')
     body = _inject_saved_artifact_preview_base(
         html_text,
         base_href=_saved_artifact_preview_base_href(resolved),
@@ -10656,10 +11444,18 @@ def _apply_saved_artifact_interactive_preview_headers(response, *, asset_prefix:
 
 
 def _html_saved_artifact_interactive_preview_wrapper_response(resolved: Path):
-    frame_src, asset_prefix = _saved_artifact_interactive_preview_urls(resolved)
+    base_root = _saved_artifact_interactive_preview_base_root_for_path(resolved)
+    base_token = _encode_saved_artifact_interactive_preview_base_root(base_root)
+    frame_src, asset_prefix = _saved_artifact_interactive_preview_urls(
+        resolved,
+        base_token=base_token,
+    )
+    bridge_token = _saved_artifact_preview_mailto_bridge_token(base_token)
+    script_nonce = secrets.token_urlsafe(18)
     escaped_frame_src = html_lib.escape(frame_src, quote=True)
     escaped_title_text = html_lib.escape(resolved.name, quote=False)
     escaped_title_attribute = html_lib.escape(resolved.name, quote=True)
+    bridge_token_literal = json.dumps(bridge_token)
     body = (
         '<!doctype html><html><head><meta charset="utf-8">'
         f'<title>Preview — {escaped_title_text}</title>'
@@ -10667,15 +11463,31 @@ def _html_saved_artifact_interactive_preview_wrapper_response(resolved: Path):
         '<style>html,body,iframe{width:100%;height:100%;margin:0;border:0}'
         'body{overflow:hidden;background:#111}iframe{display:block}</style>'
         '</head><body>'
-        f'<iframe src="{escaped_frame_src}" '
+        f'<iframe src="{escaped_frame_src}" id="ollmo-preview-frame" '
         'sandbox="allow-scripts allow-top-navigation-to-custom-protocols" '
         f'title="Preview of {escaped_title_attribute}" referrerpolicy="no-referrer"></iframe>'
+        f'<script nonce="{script_nonce}">(() => {{'
+        f'const bridgeToken={bridge_token_literal};'
+        'const frame=document.getElementById("ollmo-preview-frame");'
+        'window.addEventListener("message",(event)=>{'
+        'if(!frame||event.source!==frame.contentWindow)return;'
+        'const data=event.data;'
+        'if(!data||data.kind!=="ollmo.preview.mailto"||data.bridge_token!==bridgeToken)return;'
+        'if(!navigator.userActivation||navigator.userActivation.isActive!==true)return;'
+        'const href=typeof data.href==="string"?data.href.trim():"";'
+        'if(href.length<7||href.length>4096)return;'
+        'let target;try{target=new URL(href);}catch(_error){return;}'
+        'if(target.protocol!=="mailto:")return;'
+        'window.location.assign(target.href);'
+        '});'
+        '})();</script>'
         '</body></html>'
     )
     response = Response(body, mimetype='text/html')
     response.headers.set('Content-Disposition', 'inline', filename=resolved.name)
     response.headers['Content-Security-Policy'] = (
-        f"default-src 'none'; style-src 'unsafe-inline'; frame-src {asset_prefix}; "
+        f"default-src 'none'; style-src 'unsafe-inline'; "
+        f"script-src 'nonce-{script_nonce}'; frame-src {asset_prefix}; "
         "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
     )
     response.headers['Permissions-Policy'] = (
@@ -10697,6 +11509,15 @@ def _html_saved_artifact_interactive_preview_response(
         html_text = resolved.read_text(encoding='utf-8')
     except UnicodeDecodeError:
         html_text = resolved.read_text(encoding='utf-8', errors='replace')
+    html_text = _rewrite_mailto_anchor_targets(html_text)
+    if not base_token:
+        base_root = _saved_artifact_interactive_preview_base_root_for_path(resolved)
+        base_token = _encode_saved_artifact_interactive_preview_base_root(base_root)
+    bridge_token = _saved_artifact_preview_mailto_bridge_token(base_token)
+    html_text = _inject_saved_artifact_preview_mailto_bridge(
+        html_text,
+        bridge_token=bridge_token,
+    )
     base_href, asset_prefix = _saved_artifact_interactive_preview_urls(
         resolved,
         base_token=base_token,

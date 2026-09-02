@@ -75,6 +75,7 @@ Do not overthink. Just map the issue.
 - dependent STT runs without a digest-bound direct TTS producer result, or typed mismatch evidence disappears after frame normalization → dependency evidence fail-open/durability regression
 - dependency artifact missing → `repair_dependency_chain`, not same-branch retry
 - file artifact contains router JSON → text artifact payload extraction
+- saved text syntax failure loses the target path/current bytes/issues or repeatedly regenerates the whole artifact → target-bound saved-text syntax recovery regression
 - Ghost route preview starts a model → start-source policy regression
 - duplicate, placeholder, or template-variable links such as `{{IMG_PATH_1}}` survive in final HTML/CSS/media → linked-artifact closure regression
 - optional generated-image `image_state_enrichment` disappears without `pending_existing`, `skipped`, or a suppression reason → image-state enrichment transparency regression

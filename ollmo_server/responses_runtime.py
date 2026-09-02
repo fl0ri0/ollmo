@@ -383,6 +383,11 @@ def derive_response_lifecycle_state(
     derived_lifecycle = ''
     if recovery_candidates:
         derived_lifecycle = 'repair_needed'
+    elif late_fill_status == 'repair_needed':
+        # A blocked terminal repair may retain the exact pending branch shape
+        # as diagnostics even though no continuation was queued. The explicit
+        # terminal status is authoritative; schedulable work uses `pending`.
+        derived_lifecycle = 'repair_needed'
     elif late_fill_status in {'blocked'}:
         derived_lifecycle = 'blocked'
     elif late_fill_status in {'failed', 'partial_failed'} or failed_branches:

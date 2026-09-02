@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from flask import Response, jsonify, request, stream_with_context
 
@@ -5419,6 +5419,463 @@ class ResponsesRequestRuntimeOwner:
         runtime['developer_diagnostics'] = developer_diagnostics
         updated['runtime'] = runtime
         return updated
+
+    def project_terminal_closure_repair(
+        self,
+        response_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project only new executable terminal Closure work into the graph."""
+
+        if not isinstance(response_payload, dict):
+            return {'status': 'not_applicable', 'reason': 'response_payload_invalid'}
+        runtime = response_payload.get('runtime') if isinstance(response_payload.get('runtime'), dict) else {}
+        closure_review = (
+            runtime.get('graph_closure_review')
+            if isinstance(runtime.get('graph_closure_review'), dict)
+            else {}
+        )
+        late_fill = response_payload.get('late_fill') if isinstance(response_payload.get('late_fill'), dict) else {}
+        repair_gap = self._ghost_repair_feedback_gap(closure_review, prior_gap=None)
+
+        def _repair_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+            artifact_request = (
+                item.get('artifact_request')
+                if isinstance(item.get('artifact_request'), Mapping)
+                else {}
+            )
+            return (
+                str(item.get('branch_id') or item.get('phase_id') or '').strip(),
+                str(
+                    item.get('text_artifact_target_path')
+                    or artifact_request.get('target_path')
+                    or ''
+                ).strip(),
+            )
+
+        def _projection_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+            branch_id, target_path = _repair_identity(item)
+            return ('target', target_path) if target_path else ('branch', branch_id)
+
+        def _promoted_contract_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
+            contract_id = str(
+                item.get('contract_id') or item.get('repair_contract_id') or ''
+            ).strip()
+            if contract_id:
+                return ('contract', contract_id)
+            branch_id, target_path = _repair_identity(item)
+            phase_id = str(item.get('phase_id') or '').strip()
+            obligation_id = str(item.get('obligation_id') or '').strip()
+            if branch_id or phase_id or obligation_id or target_path:
+                return (
+                    'repair',
+                    branch_id,
+                    phase_id,
+                    obligation_id,
+                    target_path,
+                )
+            return (
+                'payload',
+                hashlib.sha256(
+                    json.dumps(
+                        dict(item),
+                        ensure_ascii=True,
+                        separators=(',', ':'),
+                        sort_keys=True,
+                        default=str,
+                    ).encode('utf-8')
+                ).hexdigest(),
+            )
+
+        def _terminal_promoted_contract(branch: Mapping[str, Any]) -> dict[str, Any]:
+            embedded = (
+                dict(branch.get('repair_contract') or {})
+                if isinstance(branch.get('repair_contract'), Mapping)
+                else {}
+            )
+            contract_id = str(
+                branch.get('repair_contract_id')
+                or embedded.get('contract_id')
+                or ''
+            ).strip()
+            contract = {
+                **embedded,
+                **{
+                    key: branch.get(key)
+                    for key in (
+                        'branch_id',
+                        'phase_id',
+                        'obligation_id',
+                        'capability',
+                        'output_type',
+                        'repair_action',
+                        'content_payload',
+                        'content_payload_source',
+                        'stage_direction',
+                        'requires_artifact',
+                        'text_artifact_extension',
+                        'text_artifact_source_name',
+                        'text_artifact_source',
+                        'text_artifact_target_path',
+                        'artifact_request',
+                    )
+                    if branch.get(key) not in (None, '', [], {})
+                },
+            }
+            contract.update(
+                {
+                    'kind': str(contract.get('kind') or '').strip()
+                    or 'ollmo.repair_rebuild_contract',
+                    'contract_id': contract_id,
+                    'status': 'promoted',
+                    'authority': str(contract.get('authority') or '').strip()
+                    or 'terminal_materialization_contract',
+                    'promotion_source': 'terminal_materialization_contract',
+                    'execution_policy': str(
+                        branch.get('repair_execution_policy')
+                        or branch.get('execution_policy')
+                        or contract.get('execution_policy')
+                        or ''
+                    ).strip(),
+                    'auto_execute': branch.get('auto_execute') is True,
+                    'repair_work_available': (
+                        branch.get('repair_work_available') is True
+                    ),
+                    'materialization_blocked': (
+                        branch.get('materialization_blocked') is True
+                    ),
+                    'needs_external_input': (
+                        branch.get('needs_external_input') is True
+                    ),
+                }
+            )
+            return _compact_payload(contract)
+
+        current_demoted_identities = {
+            _repair_identity(branch)
+            for branch in (
+                late_fill.get('materialization_contract_current_demoted_branches')
+                or []
+            )
+            if isinstance(branch, Mapping)
+            and all(_repair_identity(branch))
+        }
+
+        terminal_materialization_branches: list[dict[str, Any]] = []
+        for raw_branch in late_fill.get('pending_branches') or []:
+            if not isinstance(raw_branch, Mapping):
+                continue
+            branch = dict(raw_branch)
+            if branch.get('materialization_contract_unmet') is not True:
+                continue
+            identity = _repair_identity(branch)
+            if identity not in current_demoted_identities:
+                continue
+            if (
+                str(branch.get('promotion_source') or '').strip()
+                == 'terminal_materialization_contract'
+            ):
+                # Reconsideration/Rebuild permits one bounded repair round.
+                # Backend retries inside that round retain their separate
+                # auto-executable attempt policy; Closure must not mint an
+                # unbounded chain of fresh successor identities.
+                continue
+            policy = classify_repair_execution_policy(branch)
+            if (
+                str(policy.get('execution_policy') or '').strip().lower()
+                != 'schedule_late_fill_branch'
+                or policy.get('auto_execute') is not True
+                or policy.get('materialization_blocked') is True
+                or policy.get('needs_external_input') is True
+            ):
+                continue
+            owner_branch_id = str(
+                branch.get('branch_id') or branch.get('phase_id') or ''
+            ).strip()
+            repair_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        'owner_branch_id': owner_branch_id,
+                        'target_path': identity[1],
+                        'evidence': branch.get('evidence'),
+                        'content_payload': branch.get('content_payload'),
+                    },
+                    ensure_ascii=True,
+                    separators=(',', ':'),
+                    sort_keys=True,
+                ).encode('utf-8')
+            ).hexdigest()[:12]
+            repair_owner_slug = re.sub(
+                r'[^a-z0-9]+',
+                '-',
+                owner_branch_id.lower(),
+            ).strip('-') or 'text-artifact'
+            repair_branch_id = (
+                f'branch-repair-{repair_owner_slug}-{repair_fingerprint}'
+            )
+            branch['repair_owner_branch_id'] = owner_branch_id
+            branch['repair_owner_phase_id'] = str(
+                branch.get('phase_id') or owner_branch_id
+            ).strip()
+            branch['branch_id'] = repair_branch_id
+            branch['phase_id'] = repair_branch_id
+            branch['obligation_id'] = f'obligation-{repair_branch_id}'
+            branch['repair_contract_id'] = f'repair-contract-{repair_branch_id}'
+            branch['contract_state'] = 'promoted'
+            branch['promotion_source'] = 'terminal_materialization_contract'
+            branch['status'] = 'pending'
+            branch.pop('materialization_contract_open_checks', None)
+            branch.setdefault(
+                'repair_execution_policy',
+                policy.get('execution_policy'),
+            )
+            for key in (
+                'auto_execute',
+                'materialization_blocked',
+                'repair_work_available',
+                'needs_external_input',
+            ):
+                branch.setdefault(key, policy.get(key))
+            terminal_materialization_branches.append(branch)
+
+        if terminal_materialization_branches:
+            merged_gap = dict(repair_gap or {})
+            merged_branches = [
+                dict(branch)
+                for branch in (merged_gap.get('pending_branches') or [])
+                if isinstance(branch, Mapping)
+            ]
+            branch_index_by_identity = {
+                _projection_identity(branch): index
+                for index, branch in enumerate(merged_branches)
+            }
+            promoted_terminal_branches: list[dict[str, Any]] = []
+            for branch in terminal_materialization_branches:
+                identity = _projection_identity(branch)
+                existing_index = branch_index_by_identity.get(identity)
+                if existing_index is not None:
+                    existing_branch = merged_branches[existing_index]
+                    existing_branch_id = str(
+                        existing_branch.get('branch_id')
+                        or existing_branch.get('phase_id')
+                        or ''
+                    ).strip()
+                    owner_branch_id = str(
+                        branch.get('repair_owner_branch_id') or ''
+                    ).strip()
+                    if existing_branch_id and existing_branch_id == owner_branch_id:
+                        # Closure can describe a materialization repair with the
+                        # already-completed owner phase. Prefer the equivalent
+                        # fresh bounded identity or graph projection will
+                        # correctly reject the reserved original phase.
+                        merged_branches[existing_index] = branch
+                        promoted_terminal_branches.append(branch)
+                    continue
+                branch_index_by_identity[identity] = len(merged_branches)
+                merged_branches.append(branch)
+                promoted_terminal_branches.append(branch)
+            pending_capabilities = list(
+                dict.fromkeys(
+                    str(branch.get('capability') or '').strip()
+                    for branch in merged_branches
+                    if str(branch.get('capability') or '').strip()
+                )
+            )
+            repair_loop = (
+                dict(merged_gap.get('repair_loop') or {})
+                if isinstance(merged_gap.get('repair_loop'), Mapping)
+                else {}
+            )
+            promoted_contracts: list[dict[str, Any]] = []
+            promoted_contract_identities: set[tuple[str, ...]] = set()
+            for raw_contract in [
+                *(repair_loop.get('promoted_contracts') or []),
+                *[
+                    _terminal_promoted_contract(branch)
+                    for branch in promoted_terminal_branches
+                ],
+            ]:
+                if not isinstance(raw_contract, Mapping):
+                    continue
+                contract = dict(raw_contract)
+                identity = _promoted_contract_identity(contract)
+                if identity in promoted_contract_identities:
+                    continue
+                promoted_contract_identities.add(identity)
+                promoted_contracts.append(contract)
+            executable_contract_count = 0
+            for contract in promoted_contracts:
+                policy = classify_repair_execution_policy(contract)
+                if (
+                    str(policy.get('execution_policy') or '').strip().lower()
+                    == 'schedule_late_fill_branch'
+                    and policy.get('auto_execute') is True
+                    and policy.get('materialization_blocked') is not True
+                    and policy.get('needs_external_input') is not True
+                ):
+                    executable_contract_count += 1
+            repair_loop.update(
+                {
+                    'status': 'promoted',
+                    'auto_execute': bool(executable_contract_count),
+                    'repair_work_available': bool(executable_contract_count),
+                    'repair_work_available_count': executable_contract_count,
+                    'executable_contract_count': executable_contract_count,
+                    'promoted_contract_count': len(promoted_contracts),
+                    'promoted_contracts': promoted_contracts,
+                }
+            )
+            merged_gap.update(
+                {
+                    'code': str(merged_gap.get('code') or '').strip()
+                    or 'closure_review_repair',
+                    'trigger': str(merged_gap.get('trigger') or '').strip()
+                    or 'terminal_materialization_contract',
+                    'pending_branches': merged_branches,
+                    'pending_capabilities': pending_capabilities,
+                    'expected_capability': (
+                        merged_gap.get('expected_capability')
+                        or (pending_capabilities[0] if pending_capabilities else None)
+                    ),
+                    'repair_loop': repair_loop,
+                    'reconsideration_rebuild': merged_gap.get('reconsideration_rebuild')
+                    or {
+                        'status': 'promoted',
+                        'auto_execute': True,
+                        'repair_work_available': True,
+                    },
+                }
+            )
+            repair_gap = merged_gap
+
+        if not isinstance(repair_gap, dict) or not repair_gap:
+            return {'status': 'not_applicable', 'reason': 'no_terminal_closure_repair_gap'}
+        completed_contracts_by_branch: dict[str, set[str]] = {}
+        completed_without_contract: set[str] = set()
+        for record in late_fill.get('completed_branches') or []:
+            if isinstance(record, Mapping):
+                branch_id = str(record.get('branch_id') or record.get('phase_id') or '').strip()
+                contract_id = str(record.get('repair_contract_id') or '').strip()
+            else:
+                branch_id = str(record or '').strip()
+                contract_id = ''
+            if not branch_id:
+                continue
+            if contract_id:
+                completed_contracts_by_branch.setdefault(branch_id, set()).add(contract_id)
+            else:
+                completed_without_contract.add(branch_id)
+        exhausted_contracts_by_branch: dict[str, set[str]] = {}
+        exhausted_without_contract: set[str] = set()
+        for key in ('failed_branches', 'cancelled_branches'):
+            for record in late_fill.get(key) or []:
+                if isinstance(record, Mapping):
+                    branch_id = str(record.get('branch_id') or record.get('phase_id') or '').strip()
+                    contract_id = str(record.get('repair_contract_id') or '').strip()
+                else:
+                    branch_id = str(record or '').strip()
+                    contract_id = ''
+                if not branch_id:
+                    continue
+                if contract_id:
+                    exhausted_contracts_by_branch.setdefault(branch_id, set()).add(contract_id)
+                else:
+                    exhausted_without_contract.add(branch_id)
+
+        executable_branches: list[dict[str, Any]] = []
+        seen_branch_ids: set[str] = set()
+        for record in repair_gap.get('pending_branches') or []:
+            if not isinstance(record, dict):
+                continue
+            branch = dict(record)
+            branch_id = str(branch.get('branch_id') or branch.get('phase_id') or '').strip()
+            contract_id = str(branch.get('repair_contract_id') or '').strip()
+            completed_contract_ids = completed_contracts_by_branch.get(branch_id, set())
+            contract_already_completed = (
+                branch_id in completed_without_contract
+                or (bool(contract_id) and contract_id in completed_contract_ids)
+                or (not contract_id and bool(completed_contract_ids))
+            )
+            exhausted_contract_ids = exhausted_contracts_by_branch.get(branch_id, set())
+            contract_attempt_exhausted = (
+                branch_id in exhausted_without_contract
+                or (bool(contract_id) and contract_id in exhausted_contract_ids)
+                or (not contract_id and bool(exhausted_contract_ids))
+            )
+            if (
+                not branch_id
+                or contract_already_completed
+                or contract_attempt_exhausted
+                or branch_id in seen_branch_ids
+            ):
+                continue
+            policy_input = dict(branch)
+            execution_policy = str(
+                policy_input.get('repair_execution_policy')
+                or policy_input.get('execution_policy')
+                or ''
+            ).strip().lower()
+            if execution_policy and not policy_input.get('execution_policy'):
+                policy_input['execution_policy'] = execution_policy
+            policy = classify_repair_execution_policy(policy_input)
+            if (
+                str(policy.get('execution_policy') or '').strip().lower()
+                != 'schedule_late_fill_branch'
+                or policy.get('auto_execute') is not True
+                or policy.get('materialization_blocked') is True
+                or policy.get('needs_external_input') is True
+            ):
+                continue
+            seen_branch_ids.add(branch_id)
+            executable_branches.append(branch)
+
+        if not executable_branches:
+            return {
+                'status': 'not_applicable',
+                'reason': 'no_new_executable_terminal_closure_contract',
+            }
+
+        pending_capabilities = list(
+            dict.fromkeys(
+                str(branch.get('capability') or '').strip().lower()
+                for branch in executable_branches
+                if str(branch.get('capability') or '').strip()
+            )
+        )
+        repair_gap = dict(repair_gap)
+        repair_gap.update(
+            {
+                'pending_branches': executable_branches,
+                'pending_capabilities': pending_capabilities,
+                'expected_capability': pending_capabilities[0] if pending_capabilities else None,
+                'active_capability': pending_capabilities[0] if pending_capabilities else None,
+                'authoritative_pending_branches': True,
+                'pending_branch_scope': 'exact_terminal_closure_repair',
+            }
+        )
+        updated = self._attach_repair_gap_to_request_phase_graph(response_payload, repair_gap)
+        updated_runtime = updated.get('runtime') if isinstance(updated.get('runtime'), dict) else {}
+        updated_graph = (
+            updated_runtime.get('request_phase_graph')
+            if isinstance(updated_runtime.get('request_phase_graph'), dict)
+            else {}
+        )
+        graph_branch_ids = {
+            str(item.get('branch_id') or item.get('phase_id') or '').strip()
+            for item in updated_graph.get('downstream_branches') or []
+            if isinstance(item, Mapping)
+        }
+        if not seen_branch_ids.issubset(graph_branch_ids):
+            return {
+                'status': 'blocked',
+                'reason': 'terminal_closure_repair_graph_projection_rejected',
+                'response_payload': updated,
+            }
+        return {
+            'status': 'queued',
+            'response_payload': updated,
+            'artifact_gap': _compact_payload(repair_gap),
+            'branch_ids': sorted(seen_branch_ids),
+        }
 
     def attach_pre_freeze_closure_review(
         self,

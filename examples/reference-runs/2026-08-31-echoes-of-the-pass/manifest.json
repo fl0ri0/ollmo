@@ -1,0 +1,137 @@
+{
+  "files": [
+    {
+      "mime_type": "application/octet-stream",
+      "path": "README.md",
+      "role": "documentation",
+      "sha256": "f076499c0c7eecffa1eb362e0ed821b10d4867ed2896225659e9a935fb337fa0",
+      "size_bytes": 5774
+    },
+    {
+      "mime_type": "audio/x-wav",
+      "path": "artifacts/audio/narration.wav",
+      "role": "canonical_artifact_copy",
+      "sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+      "size_bytes": 257324
+    },
+    {
+      "mime_type": "text/html",
+      "path": "artifacts/documents/index.html",
+      "role": "canonical_artifact_copy",
+      "sha256": "2884bba7436dffcedceb2e09621089a1f3ea08f188765f1eb9d1f751fd6aea9a",
+      "size_bytes": 2395
+    },
+    {
+      "mime_type": "text/css",
+      "path": "artifacts/documents/styles.css",
+      "role": "canonical_artifact_copy",
+      "sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+      "size_bytes": 2446
+    },
+    {
+      "mime_type": "image/png",
+      "path": "artifacts/images/image-01.png",
+      "role": "canonical_artifact_copy",
+      "sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+      "size_bytes": 978300
+    },
+    {
+      "mime_type": "image/png",
+      "path": "artifacts/images/image-02.png",
+      "role": "canonical_artifact_copy",
+      "sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+      "size_bytes": 1495723
+    },
+    {
+      "mime_type": "audio/x-wav",
+      "path": "bundle/assets/audio/narration.wav",
+      "role": "openable_bundle",
+      "sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+      "size_bytes": 257324
+    },
+    {
+      "mime_type": "text/css",
+      "path": "bundle/assets/css/styles.css",
+      "role": "openable_bundle",
+      "sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+      "size_bytes": 2446
+    },
+    {
+      "mime_type": "image/png",
+      "path": "bundle/assets/images/image-01.png",
+      "role": "openable_bundle",
+      "sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+      "size_bytes": 978300
+    },
+    {
+      "mime_type": "image/png",
+      "path": "bundle/assets/images/image-02.png",
+      "role": "openable_bundle",
+      "sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+      "size_bytes": 1495723
+    },
+    {
+      "mime_type": "text/html",
+      "path": "bundle/index.html",
+      "role": "openable_bundle",
+      "sha256": "7babc53e6982e8cd895e45133f9e3572c28927b92f96fed0fb0b8c9efe3ec72d",
+      "size_bytes": 2218
+    },
+    {
+      "mime_type": "application/json",
+      "path": "bundle/manifest.json",
+      "role": "openable_bundle",
+      "sha256": "41a1b53a31116d8cc26ec1d9c82fb229e457e1f51bb872571073e6e17c4021a2",
+      "size_bytes": 2452
+    },
+    {
+      "mime_type": "application/json",
+      "path": "monitor-report.json",
+      "role": "observer_evidence",
+      "sha256": "b885d71f39fe4eaf868a677d65ad3e6ade266a46051e165259819034381b4cd2",
+      "size_bytes": 1797
+    },
+    {
+      "mime_type": "text/plain",
+      "path": "prompt.txt",
+      "role": "request",
+      "sha256": "5bc547a0fb159f8a07501750cf631b7e0499e633e493b2cd012e6f696c0ef48f",
+      "size_bytes": 534
+    },
+    {
+      "mime_type": "application/json",
+      "path": "response.json",
+      "role": "response_truth",
+      "sha256": "d9703478e22f8b7d7c31592b21ba6041442fc01796568b40f6431bfd1c003fa4",
+      "size_bytes": 9424
+    }
+  ],
+  "frame_id": "resp_1788201103997_e9c5814aa9c17:frame-2",
+  "frame_sequence": 2,
+  "provenance": {
+    "original_response_frame_authoritative": true,
+    "original_runtime_artifacts_authoritative": true,
+    "publication_copy_is_runtime_authority": false,
+    "raw_frame_published": false,
+    "raw_monitor_record_published": false
+  },
+  "response_id": "resp_1788201103997_e9c5814aa9c17",
+  "schema": "ollmo.reference_run_manifest.v1",
+  "source_frame_record_sha256": "ab10d371f4500a269f24a7e57b7355ddf7b63ba54d9e825757021c27457396f5",
+  "source_frame_record_size_bytes": 822157,
+  "summary": {
+    "artifact_count": 5,
+    "bundle_included": true,
+    "file_count": 15,
+    "total_bytes": 5492180
+  },
+  "validation": {
+    "artifact_checksums_verified": true,
+    "indexed_frame_verified": true,
+    "local_absolute_paths_absent": true,
+    "monitor_verdict": "clean",
+    "prompt_identity_verified": true,
+    "terminal_runtime_truth_verified": true
+  },
+  "version": 1
+}

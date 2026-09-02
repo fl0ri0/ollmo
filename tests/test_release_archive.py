@@ -189,6 +189,21 @@ def _make_release_source(tmp_path: Path) -> Path:
         source / 'site' / 'fonts' / 'README.md',
         '# Checkout-only font source note\n',
     )
+    for relative_path in release.RELEASE_REFERENCE_EXAMPLE_FILES:
+        target = source / relative_path
+        if target.suffix.lower() in {'.png', '.wav'}:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b'curated reference artifact fixture\n')
+        elif target.suffix.lower() == '.json':
+            _write(target, '{}\n')
+        elif target.name == 'README.md':
+            _write(target, f'# Curated example: {relative_path.parent.name}\n')
+        else:
+            _write(target, f'Curated example data: {relative_path.name}\n')
+    _write(
+        source / 'examples' / 'reference-runs' / 'private-note.md',
+        '# Unreviewed example: excluded\n',
+    )
     _write(source / 'tests' / 'test_smoke.py', 'def test_smoke():\n    assert True\n')
     _write(
         source
@@ -294,6 +309,15 @@ def test_build_stages_only_allowlisted_clean_release_files(tmp_path: Path) -> No
     assert staged_skill_files == set(release.RELEASE_SKILL_FILES)
     assert not (staged_root / 'skills' / 'ollmo' / 'private-note.md').exists()
     assert not (staged_root / 'skills' / 'ollmo-run-monitor').exists()
+    staged_example_files = {
+        path.relative_to(staged_root)
+        for path in (staged_root / 'examples').rglob('*')
+        if path.is_file()
+    }
+    assert staged_example_files == set(release.RELEASE_REFERENCE_EXAMPLE_FILES)
+    assert not (
+        staged_root / 'examples' / 'reference-runs' / 'private-note.md'
+    ).exists()
 
     verified = release.verify_archive(
         archive_path,
@@ -319,10 +343,21 @@ def test_manifest_exactly_covers_release_files_and_hashes(tmp_path: Path) -> Non
     }
     assert set(records) == actual
     assert Path('docs/VISION_ALIGNMENT.md') in records
+    assert release.RELEASE_REFERENCE_EXAMPLE_FILES <= set(records)
     assert all(
         release.sha256_file(staged_root / relative_path) == digest
         for relative_path, digest in records.items()
     )
+
+
+def test_public_reference_allowlist_matches_repository_files() -> None:
+    repository_root = Path(__file__).resolve().parent.parent
+    actual = {
+        path.relative_to(repository_root)
+        for path in (repository_root / 'examples').rglob('*')
+        if path.is_file()
+    }
+    assert actual == set(release.RELEASE_REFERENCE_EXAMPLE_FILES)
 
 
 @pytest.mark.parametrize(
@@ -336,6 +371,20 @@ def test_each_release_ollmo_skill_file_is_required(
 ) -> None:
     source = _make_release_source(tmp_path)
     (source / relative_path).unlink()
+
+    with pytest.raises(release.ReleaseArchiveError, match='missing'):
+        release.build_release_archive(
+            source_root=source,
+            output_dir=tmp_path / 'dist',
+        )
+
+
+def test_missing_required_reference_example_is_rejected(tmp_path: Path) -> None:
+    source = _make_release_source(tmp_path)
+    missing = Path(
+        'examples/reference-runs/2026-08-31-evening-rain/response.json'
+    )
+    (source / missing).unlink()
 
     with pytest.raises(release.ReleaseArchiveError, match='missing'):
         release.build_release_archive(
@@ -515,6 +564,31 @@ def test_verify_only_rejects_non_public_skill_path(
     with pytest.raises(
         release.ReleaseArchiveError,
         match='non-public skill path',
+    ):
+        release.verify_archive(archive_path)
+
+
+def test_verify_only_rejects_non_public_reference_example_path(
+    tmp_path: Path,
+) -> None:
+    source = _make_release_source(tmp_path)
+    result = release.build_release_archive(
+        source_root=source,
+        output_dir=tmp_path / 'dist',
+    )
+    staged_root = Path(str(result['staging_root']))
+    (staged_root / release.MANIFEST_NAME).unlink()
+    _write(
+        staged_root / 'examples' / 'reference-runs' / 'private-note.md',
+        '# Unreviewed reference material\n',
+    )
+    release.write_manifest(staged_root)
+    archive_path = tmp_path / 'unexpected-reference-example.tar.gz'
+    release.write_deterministic_archive(staged_root, archive_path)
+
+    with pytest.raises(
+        release.ReleaseArchiveError,
+        match='non-public reference example path',
     ):
         release.verify_archive(archive_path)
 

@@ -27,6 +27,8 @@ from ollmo_services.responses import (
     extract_responses_current_turn_prompt,
     filter_public_response_artifacts,
     merge_canonical_response_artifacts,
+    response_item_is_internal_control_work,
+    response_text_is_internal_control_protocol,
     select_public_output_text as select_canonical_public_output_text,
 )
 
@@ -965,8 +967,6 @@ def _select_public_output_text(
     outputs: Any,
 ) -> str:
     fallback = str(response_payload.get('output_text') or '').strip()
-    if _response_truth_guard_requires_clarification(response_payload):
-        return fallback
     return select_canonical_public_output_text(response_payload, outputs, fallback_text=fallback)
 
 
@@ -1469,10 +1469,27 @@ def _output_slots_should_refresh_from_plan(
 
 def _project_output_items_text(output_items: Any, output_text: str) -> list[dict[str, Any]]:
     text = str(output_text or '').strip()
-    if not text:
-        return _json_safe(output_items) if isinstance(output_items, list) else []
     items = _json_safe(output_items) if isinstance(output_items, list) else []
-    items = [dict(item) for item in items if isinstance(item, Mapping)]
+    public_items: list[dict[str, Any]] = []
+    for raw_item in items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        if response_item_is_internal_control_work(raw_item):
+            continue
+        content = raw_item.get('content') if isinstance(raw_item.get('content'), list) else []
+        content_texts = [
+            str(part.get('text') or '').strip()
+            for part in content
+            if isinstance(part, Mapping)
+            and str(part.get('type') or '').strip() == 'output_text'
+            and str(part.get('text') or '').strip()
+        ]
+        if content_texts and all(response_text_is_internal_control_protocol(value) for value in content_texts):
+            continue
+        public_items.append(dict(raw_item))
+    items = public_items
+    if not text:
+        return items
     for item in items:
         content = item.get('content')
         if not isinstance(content, list):
@@ -1501,7 +1518,14 @@ def _reconcile_output_branches_with_slots(
     output_slots: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if not output_slots:
-        return _json_safe(output_branches) if isinstance(output_branches, list) else []
+        return _json_safe(
+            [
+                dict(branch)
+                for branch in output_branches
+                if isinstance(branch, Mapping)
+                and not response_item_is_internal_control_work(branch)
+            ]
+        ) if isinstance(output_branches, list) else []
     slot_lookup: dict[str, Mapping[str, Any]] = {}
     for slot in output_slots:
         if not isinstance(slot, Mapping):
@@ -1519,6 +1543,8 @@ def _reconcile_output_branches_with_slots(
     reconciled: list[dict[str, Any]] = []
     for raw_branch in raw_branches:
         if not isinstance(raw_branch, Mapping):
+            continue
+        if response_item_is_internal_control_work(raw_branch):
             continue
         branch = dict(raw_branch)
         matching_slot = None
@@ -1575,15 +1601,37 @@ def _build_current_state_frame(
     payload = _select_frame_keys(response_payload, _CURRENT_STATE_FRAME_KEYS)
     payload['id'] = str(response_payload.get('id') or response_payload.get('response_id') or '').strip() or None
     payload['status'] = str(response_payload.get('status') or '').strip() or None
+    projected_output_items = _project_output_items_text(
+        response_payload.get('output'),
+        public_output_text or '',
+    )
     if public_output_text:
         payload['output_text'] = public_output_text
-        payload['output'] = _project_output_items_text(response_payload.get('output'), public_output_text)
+    else:
+        payload.pop('output_text', None)
+    if projected_output_items:
+        payload['output'] = projected_output_items
+    else:
+        payload.pop('output', None)
     if output_slots:
         payload['output_slots'] = _json_safe(output_slots)
+    else:
+        payload.pop('output_slots', None)
     if output_branches:
         payload['output_branches'] = _json_safe(output_branches)
+    else:
+        payload.pop('output_branches', None)
     if outputs:
         payload['outputs'] = _json_safe(outputs)
+    else:
+        payload.pop('outputs', None)
+    result_value = payload.get('result')
+    if (
+        response_item_is_internal_control_work(result_value)
+        if isinstance(result_value, Mapping)
+        else response_text_is_internal_control_protocol(result_value)
+    ):
+        payload.pop('result', None)
     if isinstance(response_payload.get('artifacts'), list):
         public_artifacts = filter_public_response_artifacts(
             response_payload,
@@ -6319,6 +6367,12 @@ def build_response_frame(
     else:
         output_slots = payload_output_slots or plan_output_slots
     output_slots = _apply_truth_guard_to_output_slots(response_payload, output_slots)
+    output_slots = [
+        dict(slot)
+        for slot in output_slots
+        if isinstance(slot, Mapping)
+        and not response_item_is_internal_control_work(slot)
+    ]
     output_slots = _reconcile_output_slots_with_late_fill_artifacts(
         response_payload,
         output_slots,
@@ -6366,7 +6420,12 @@ def build_response_frame(
         output_branches=output_branches,
     )
     if not outputs and isinstance(response_payload.get('outputs'), list):
-        outputs = response_payload.get('outputs')
+        outputs = [
+            dict(output)
+            for output in response_payload.get('outputs') or []
+            if isinstance(output, Mapping)
+            and not response_item_is_internal_control_work(output)
+        ]
     outputs = _apply_artifact_identity_to_outputs(
         outputs,
         artifact_identity=artifact_identity,

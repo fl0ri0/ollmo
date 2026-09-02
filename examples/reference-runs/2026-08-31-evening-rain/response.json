@@ -1,0 +1,126 @@
+{
+  "artifacts": [
+    {
+      "artifact_ref": "artifact:audio_69482822e01269b6e380af89",
+      "branch_id": "branch-text_to_speech-1",
+      "channels": 1,
+      "duration_seconds": 20.16,
+      "mime_type": "audio/wav",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/audio/narration.wav",
+      "sample_rate_hz": 24000,
+      "sample_width_bits": 16,
+      "sha256": "2127c8d635e3e224f0ddd27eed3b57de47a5c3859e67530255265baa54e465f7",
+      "size_bytes": 967724,
+      "type": "audio"
+    }
+  ],
+  "bundle": null,
+  "integrity": {
+    "frame_identity_verified": true,
+    "index_only_wire_lookup": true,
+    "ledger_fallback_used": false,
+    "observation_snapshot_digests_verified": true,
+    "source_frame_record_sha256": "eb805a3bea91028b38bd0f8c8fad5490a095dc318821893678773c4a05d06d9c",
+    "source_frame_record_size_bytes": 748312,
+    "verified_response_map": true
+  },
+  "outputs": [
+    {
+      "branch_id": "phase-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-1",
+      "slot_id": "output-phase-1",
+      "status": "fulfilled",
+      "text": "The rhythmic tapping of raindrops against the windowpane signals the day's gentle end. As the world dims, a cool mist settles over the thirsty earth, bringing a sense of profound stillness. In this quiet twilight, the scent of damp pavement and renewal invites deep reflection.",
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:audio_69482822e01269b6e380af89",
+      "branch_id": "branch-text_to_speech-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/audio/narration.wav",
+      "slot_id": "output-phase-2",
+      "status": "fulfilled",
+      "type": "audio"
+    }
+  ],
+  "provenance": {
+    "original_runtime_truth_remains_authoritative": true,
+    "raw_frame_published": false,
+    "runtime_effect": "none",
+    "source": "indexed final response frame and canonical artifact bytes"
+  },
+  "request": {
+    "prompt_path": "prompt.txt",
+    "prompt_sha256": "b52d91c9bfef110029b29ca7c8698069a9a61253c59b9bdc01d4742253e40379",
+    "runtime_request_sha256": "5c643c0a59aaddd09939addcf274c0ee056cf6bdc18bee68e7ad28a6ca99e1a4",
+    "verified": true
+  },
+  "response": {
+    "frame_id": "resp_1788205433158_c474d99f6aa9e:frame-2",
+    "frame_sequence": 2,
+    "frame_version": 9,
+    "id": "resp_1788205433158_c474d99f6aa9e",
+    "lifecycle_state": "completed",
+    "status": "completed",
+    "status_semantics": {
+      "has_actionable_repair": false,
+      "has_open_continuation": false,
+      "is_terminal": true,
+      "terminal": true
+    }
+  },
+  "runtime_truth": {
+    "closure": {
+      "continuation_required": false,
+      "counts": {
+        "blocked": 0,
+        "deferred": 0,
+        "fulfilled": 2,
+        "pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "obligation_count": 2,
+      "pending_branch_count": 0,
+      "status": "fulfilled"
+    },
+    "late_fill": {
+      "counts": {
+        "cancelled": 0,
+        "completed": 1,
+        "failed": 0,
+        "pending": 0
+      },
+      "final_materialization_contract_status": "fulfilled",
+      "status": "completed"
+    },
+    "surface": {
+      "active_categories": [
+        "completed",
+        "reconsiderable",
+        "controlled_attention_advisory",
+        "aspiration_advisory",
+        "commitment_advisory"
+      ],
+      "category_counts": {
+        "aspiration_advisory": 4,
+        "blocked": 0,
+        "commitment_advisory": 8,
+        "completed": 2,
+        "controlled_attention_advisory": 60,
+        "open": 0,
+        "reconsiderable": 2,
+        "repair_pending": 0,
+        "semantic_review_pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "status": "fulfilled"
+    }
+  },
+  "schema": "ollmo.public_reference_run.v1",
+  "version": 1
+}

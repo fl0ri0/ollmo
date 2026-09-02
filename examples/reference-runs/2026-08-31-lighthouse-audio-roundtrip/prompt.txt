@@ -1,0 +1,1 @@
+Write a short two-sentence English field note about fog surrounding a coastal lighthouse. Create one local WAV audio artifact that reads the complete note in a calm, natural voice. Then transcribe that generated audio back into text. Return the original note, the audio, and the transcription together.

@@ -10,6 +10,7 @@ from helpers.model_capabilities import normalize_capability
 from ollmo_server.late_fill_runtime import LateFillRuntimeOwner
 from ollmo_server.response_semantics_runtime import (
     ResponseSemanticsRuntimeOwner,
+    _inline_labeled_image_prompt_body,
     _request_requires_current_source_for_transform,
     _route_phase_graph_has_artifact_consumer_edge,
     classify_phase_output_text,
@@ -43,6 +44,11 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                 'extract_responses_prompt': lambda payload: str(
                     (payload or {}).get('prompt') or (payload or {}).get('input') or ''
                 ),
+                'resolve_semantic_review_artifact_path': lambda path: (
+                    Path(path).expanduser().resolve()
+                    if Path(path).expanduser().is_file()
+                    else None
+                ),
                 'load_running_instances': lambda: [],
                 'merge_instances_with_runtime_status': lambda instances, **kwargs: instances,
             }
@@ -61,6 +67,209 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             for item in (value if isinstance(value, list) else [])
             if isinstance(item, dict)
         ]
+
+    def test_late_fill_graph_branch_overlay_does_not_inherit_sibling_publication(self):
+        graph_branch = {
+            'branch_id': 'branch-text_artifact-2',
+            'phase_id': 'phase-3',
+            'capability': 'chat',
+            'saved_text_path': '/tmp/index.html',
+            'artifact_ref': 'artifact:index',
+            'content_payload': 'Styles body',
+        }
+        runtime_branch = {
+            'branch_id': 'branch-text_artifact-2',
+            'status': 'pending',
+        }
+
+        overlaid = self.late_fill_owner.overlay_graph_branch_with_runtime_state(
+            graph_branch,
+            runtime_branch,
+        )
+
+        self.assertEqual(overlaid['content_payload'], 'Styles body')
+        self.assertEqual(overlaid['status'], 'pending')
+        self.assertNotIn('saved_text_path', overlaid)
+        self.assertNotIn('artifact_ref', overlaid)
+
+    def test_late_fill_request_branch_overlay_clears_root_materialization_authority(self):
+        self.late_fill_owner.normalize_request_payload = lambda payload: dict(payload or {})
+        self.late_fill_owner.extract_request_meta = lambda payload: dict(payload.get('request_meta') or {})
+        self.late_fill_owner.attach_request_meta = lambda payload: payload
+        self.late_fill_owner.extract_responses_prompt = lambda payload: str(payload.get('prompt') or '')
+        self.late_fill_owner.parse_bool = lambda value, default=False: default if value is None else bool(value)
+
+        prepared = self.late_fill_owner.prepare_late_fill_request_payload(
+            {
+                'prompt': 'original root request',
+                'requires_artifact': True,
+                'artifact_request': {'target_path': '/tmp/index.html'},
+                'text_artifact_request': {'target_path': '/tmp/index.html'},
+                'text_artifact_requests': [{'target_path': '/tmp/index.html'}],
+                'saved_text_path': '/tmp/index.html',
+                'saved_text_artifacts': [{'path': '/tmp/index.html'}],
+            },
+            expected_capability='chat',
+            assistant_message='',
+            artifact_gap={
+                'branch_id': 'branch-text_artifact-2',
+                'phase_id': 'phase-3',
+                'artifact_request': {'target_path': '/tmp/styles.css'},
+                'text_artifact_request': {'target_path': '/tmp/styles.css'},
+            },
+        )
+
+        self.assertEqual(
+            prepared['artifact_request'],
+            {'target_path': '/tmp/styles.css'},
+        )
+        self.assertEqual(
+            prepared['text_artifact_request'],
+            {'target_path': '/tmp/styles.css'},
+        )
+        self.assertNotIn('requires_artifact', prepared)
+        self.assertNotIn('text_artifact_requests', prepared)
+        self.assertNotIn('saved_text_path', prepared)
+        self.assertNotIn('saved_text_artifacts', prepared)
+
+    def test_internal_semantic_review_keeps_verdict_text_without_artifact_publication(self):
+        projected = self.late_fill_owner.project_internal_semantic_review_result(
+            {
+                'result_text': '{"verdict":"passed"}',
+                'saved_text_path': '/tmp/review.txt',
+                'saved_text_artifacts': [{'path': '/tmp/review.txt'}],
+                'artifact_ref': 'artifact:review',
+                'artifacts': [{'type': 'text', 'path': '/tmp/review.txt'}],
+                'execution_contract': {'output_type': 'text'},
+            }
+        )
+
+        self.assertEqual(projected['result_text'], '{"verdict":"passed"}')
+        self.assertEqual(projected['visibility'], 'internal')
+        self.assertEqual(projected['surface_role'], 'closure_evidence')
+        self.assertNotIn('saved_text_path', projected)
+        self.assertNotIn('saved_text_artifacts', projected)
+        self.assertNotIn('artifact_ref', projected)
+        self.assertNotIn('artifacts', projected)
+        self.assertEqual(projected['execution_contract']['visibility'], 'internal')
+        self.assertEqual(projected['execution_contract']['surface_role'], 'closure_evidence')
+
+    def test_internal_semantic_review_execution_projects_result_before_merge(self):
+        self.late_fill_owner.invoke_internal_api_json_route = lambda **kwargs: (
+            {
+                'result_text': '{"verdict":"passed"}',
+                'saved_text_path': '/tmp/review.txt',
+                'artifact_ref': 'artifact:review',
+                'artifacts': [{'type': 'text', 'path': '/tmp/review.txt'}],
+            },
+            200,
+        )
+        self.late_fill_owner.filter_responses_infer_result = lambda result, **kwargs: result
+
+        execution = self.late_fill_owner.execute_prepared_late_fill_branch(
+            {
+                'capability': 'chat',
+                'branch_id': 'branch-global-semantic-closure-review',
+                'phase_id': 'phase-global-semantic-closure-review',
+                'infer_payload': {
+                    'stage_direction': 'run_global_semantic_closure_review',
+                },
+                'effective_data': {},
+                'execution_contract': {
+                    'branch_id': 'branch-global-semantic-closure-review',
+                    'phase_id': 'phase-global-semantic-closure-review',
+                    'output_type': 'text',
+                },
+            }
+        )
+        result = execution['infer_result']
+
+        self.assertEqual(result['result_text'], '{"verdict":"passed"}')
+        self.assertEqual(result['visibility'], 'internal')
+        self.assertEqual(result['surface_role'], 'closure_evidence')
+        self.assertNotIn('saved_text_path', result)
+        self.assertNotIn('artifact_ref', result)
+        self.assertNotIn('artifacts', result)
+        self.assertEqual(result['execution_contract']['visibility'], 'internal')
+        self.assertEqual(result['execution_contract']['surface_role'], 'closure_evidence')
+
+    def test_external_semantic_review_skips_artifact_materialization(self):
+        self.late_fill_owner.execute_external_chat_phase = lambda **kwargs: {
+            'status': 'completed',
+            'output_text': '{"verdict":"passed"}',
+        }
+        self.late_fill_owner._materialize_external_chat_text_artifact_outputs = lambda *args, **kwargs: self.fail(
+            'semantic review must not materialize a text artifact'
+        )
+
+        execution = self.late_fill_owner.execute_prepared_late_fill_branch(
+            {
+                'capability': 'chat',
+                'branch_id': 'branch-global-semantic-closure-review',
+                'phase_id': 'phase-global-semantic-closure-review',
+                'instance': {'target_kind': 'external'},
+                'external_chat_phase': {'bounded_task_prompt': 'Review the bounded evidence.'},
+                'execution_contract': {
+                    'branch_id': 'branch-global-semantic-closure-review',
+                    'phase_id': 'phase-global-semantic-closure-review',
+                    'stage_direction': 'run_global_semantic_closure_review',
+                    'output_type': 'text',
+                },
+                'effective_data': {},
+            }
+        )
+        result = execution['infer_result']
+
+        self.assertEqual(result['result_text'], '{"verdict":"passed"}')
+        self.assertEqual(result['visibility'], 'internal')
+        self.assertEqual(result['surface_role'], 'closure_evidence')
+        self.assertNotIn('saved_text_path', result)
+
+    def _complete_current_global_semantic_review(
+        self,
+        artifact_payload,
+        preliminary_review,
+        result_text,
+    ):
+        if isinstance(preliminary_review.get('checks'), list):
+            review_check = next(
+                item
+                for item in preliminary_review['checks']
+                if item.get('check_kind') == 'global_semantic_closure'
+            )
+        else:
+            review_check = self.owner._global_semantic_closure_checks(
+                preliminary_review
+            )[0]
+        completed_record = dict(review_check)
+        completed_record['status'] = 'fulfilled'
+        completed_record['result_text'] = result_text
+        late_fill = artifact_payload.setdefault('late_fill', {})
+        late_fill.setdefault('completed_branches', []).append(completed_record)
+        late_fill['status'] = 'completed'
+        return review_check
+
+    @staticmethod
+    def _passing_global_semantic_verdict(criterion):
+        return json.dumps(
+            {
+                'kind': 'ollmo.semantic_review_verdict',
+                'verdict': 'passed',
+                'overall_status': 'fulfilled',
+                'whole_intent_fit': 'Current runtime evidence fulfills the whole intent.',
+                'criterion_results': [
+                    {
+                        'criterion': criterion,
+                        'status': 'passed',
+                        'evidence_refs': ['current-runtime-evidence'],
+                    },
+                ],
+                'evidence_refs': ['current-runtime-evidence'],
+                'defects': [],
+                'confidence': 0.9,
+                'recommended_transition': 'truthful_freeze',
+            }
+        )
 
     @staticmethod
     def _structured_dependency_join_fixture(
@@ -1655,6 +1864,36 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             ],
         )
 
+    def test_extract_batch_image_prompts_stops_inline_labels_before_tts_payload(self):
+        output_text = (
+            '### Image Generation Prompts\n\n'
+            '**Image 1 (Hero):**\n'
+            'A wide cinematic view of a quiet listening room at blue hour,\n'
+            'with warm timber walls and no visible lettering.\n\n'
+            '**Image 2 (Detail / Listening Section):**\n'
+            'A close detail of a handcrafted speaker cone in soft window light,\n'
+            'photorealistic, tactile, and free of typography.\n\n'
+            '### Text-to-Speech Payload\n\n'
+            '**Text:**\n'
+            'At dusk, the room becomes an instrument for attentive listening.\n\n'
+            '**Voice Direction / Style:**\n'
+            'Warm, measured English narration with restrained pacing.'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(output_text, expected_count=2)
+
+        self.assertEqual(
+            prompts,
+            [
+                'A wide cinematic view of a quiet listening room at blue hour, '
+                'with warm timber walls and no visible lettering.',
+                'A close detail of a handcrafted speaker cone in soft window light, '
+                'photorealistic, tactile, and free of typography.',
+            ],
+        )
+        self.assertNotIn('Text-to-Speech', ' '.join(prompts))
+        self.assertNotIn('narration', ' '.join(prompts).lower())
+
     def test_numbered_image_prompt_section_stops_before_arbitrary_named_text_artifact(self):
         output_text = (
             '### Image Generation Prompts\n\n'
@@ -2762,6 +3001,44 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             self.assertNotIn('Hero Image', prompt)
             self.assertNotIn('HTML Materialization Payload', prompt)
             self.assertNotIn('CSS Design Specification', prompt)
+
+    def test_underscore_image_prompt_labels_outrank_html_card_copy(self):
+        content = (
+            '<section class="hero"><img src="workshop.png" '
+            'alt="The Alder & Stone workshop interior"></section>\n'
+            '<div class="product-preview"><img src="chair.png" '
+            'alt="Customizable sculptural lounge chair"></div>\n'
+            '<div class="price-display"><p>Estimated Investment</p>'
+            '<span>$0.00</span></div>\n\n'
+            'IMAGE_PROMPT_1: (Workshop Interior)\n'
+            'Cinematic, high-detail interior of an heirloom furniture workshop at dawn, '
+            'walnut benches, hand tools, and warm angled window light.\n\n'
+            'IMAGE_PROMPT_2: (Lounge Chair)\n'
+            'Professional studio product photograph of a sculptural walnut lounge chair '
+            'with deep green wool upholstery on a warm neutral backdrop.'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(content, expected_count=2)
+
+        self.assertEqual(
+            prompts,
+            [
+                'Cinematic, high-detail interior of an heirloom furniture workshop at dawn, '
+                'walnut benches, hand tools, and warm angled window light.',
+                'Professional studio product photograph of a sculptural walnut lounge chair '
+                'with deep green wool upholstery on a warm neutral backdrop.',
+            ],
+        )
+        self.assertFalse(any('Estimated Investment' in prompt for prompt in prompts))
+
+    def test_underscore_image_prompt_labels_reject_near_misses(self):
+        for line in (
+            'CONFIG_IMAGE_PROMPT_1: Ignore this control field.',
+            'IMAGE_PROMPT_COUNT: 2',
+            'prefix IMAGE_PROMPT_1: Embedded prose is not a field.',
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(_inline_labeled_image_prompt_body(line))
 
     def test_extract_batch_image_prompts_uses_artifact_heading_bodies_before_text_artifacts(self):
         content = (
@@ -4610,6 +4887,14 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                 )
 
     def test_truth_gate_guards_reverse_and_plural_missing_artifact_references(self):
+        recognized_same_turn_producers = {
+            'Generate an image of a lighthouse in a violent winter storm with dark clouds, '
+            'white spray, sharp rocks, and a distant rescue boat, then analyze it.',
+            'Paint an image of a lighthouse and analyze it.',
+            'Male ein Bild von einem Leuchtturm und analysiere es.',
+            'Synthesize a voice clip and transcribe it.',
+            'Produce an audio warning and transcribe it.',
+        }
         prompts = (
             'In this image, analyze the visible objects.',
             'On this image, inspect the visible objects.',
@@ -4651,6 +4936,13 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                     request_payload={'prompt': prompt},
                 )
 
+                if prompt in recognized_same_turn_producers:
+                    self.assertEqual(
+                        updated['output_text'],
+                        'Invented evidence from an absent source.',
+                    )
+                    self.assertNotIn('truth_guard', updated.get('runtime') or {})
+                    continue
                 self.assertIn('need the source/content', updated['output_text'])
                 self.assertEqual(
                     updated['runtime']['truth_guard']['status'],
@@ -6611,6 +6903,26 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertEqual(error['code'], 'DEPENDENCY_CHAIN_REPAIR_REQUIRED')
 
+    def test_semantic_review_output_is_not_misclassified_as_missing_dependency(self):
+        error = self.late_fill_owner.dependency_evidence_error_for_branch_result(
+            {
+                'branch_id': 'branch-global-semantic-closure-review',
+                'phase_id': 'phase-global-semantic-closure-review',
+                'capability': 'chat',
+                'depends_on': ['phase-2', 'phase-3', 'phase-4', 'phase-5', 'phase-6'],
+                'stage_direction': 'run_global_semantic_closure_review',
+            },
+            {
+                'capability': 'chat',
+                'output_text': (
+                    'I cannot access enough generated artifact evidence to mark the '
+                    'whole-turn fit as passed.'
+                ),
+            },
+        )
+
+        self.assertIsNone(error)
+
     def test_tts_source_evidence_retains_exact_focused_payload_and_digest(self):
         evidence = self.late_fill_owner.tts_source_evidence_from_effective_data(
             {
@@ -8353,6 +8665,109 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             ]
         )
 
+    def test_selector_binding_uses_union_of_shared_css_consumers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = root / 'index.html'
+            commissions_path = root / 'commissions.html'
+            css_path = root / 'styles.css'
+            index_path.write_text(
+                '<link rel="stylesheet" href="styles.css">'
+                '<main class="alpha-shell alpha-title alpha-copy alpha-grid alpha-card alpha-meta"></main>',
+                encoding='utf-8',
+            )
+            commissions_path.write_text(
+                '<link rel="stylesheet" href="styles.css">'
+                '<main class="bravo-shell bravo-title bravo-copy bravo-grid bravo-card bravo-meta"></main>',
+                encoding='utf-8',
+            )
+            css_path.write_text(
+                ' '.join(
+                    f'.bravo-{name} {{ display: block; }}'
+                    for name in ('shell', 'title', 'copy', 'grid', 'card', 'meta')
+                ),
+                encoding='utf-8',
+            )
+            payload = {
+                'artifacts': [
+                    {'type': 'text', 'path': str(index_path), 'text_artifact_extension': 'html'},
+                    {'type': 'text', 'path': str(commissions_path), 'text_artifact_extension': 'html'},
+                    {'type': 'text', 'path': str(css_path), 'text_artifact_extension': 'css'},
+                ]
+            }
+
+            checks = self.owner._html_css_selector_binding_checks(
+                artifact_payload=payload,
+            )
+
+        self.assertFalse(checks)
+
+    def test_selector_binding_emits_one_shared_css_repair_with_all_consumers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = root / 'index.html'
+            commissions_path = root / 'commissions.html'
+            css_path = root / 'styles.css'
+            index_path.write_text(
+                '<link rel="stylesheet" href="styles.css">'
+                '<main class="alpha-shell alpha-title alpha-copy alpha-grid alpha-card alpha-meta"></main>',
+                encoding='utf-8',
+            )
+            commissions_path.write_text(
+                '<link rel="stylesheet" href="styles.css">'
+                '<main class="bravo-shell bravo-title bravo-copy bravo-grid bravo-card bravo-meta"></main>',
+                encoding='utf-8',
+            )
+            css_path.write_text(
+                ' '.join(
+                    f'.charlie-{name} {{ display: block; }}'
+                    for name in ('shell', 'title', 'copy', 'grid', 'card', 'meta')
+                ),
+                encoding='utf-8',
+            )
+            payload = {
+                'artifacts': [
+                    {'type': 'text', 'path': str(index_path), 'text_artifact_extension': 'html'},
+                    {'type': 'text', 'path': str(commissions_path), 'text_artifact_extension': 'html'},
+                    {
+                        'type': 'text',
+                        'path': str(css_path),
+                        'text_artifact_extension': 'css',
+                        'branch_id': 'branch-styles',
+                    },
+                    {
+                        'kind': 'css',
+                        'path': str(css_path),
+                        'text_artifact_extension': 'css',
+                        'branch_id': 'repair-chat',
+                    },
+                ]
+            }
+
+            records = self.owner._artifact_records_for_link_binding(payload)
+            checks = self.owner._html_css_selector_binding_checks(
+                artifact_payload=payload,
+            )
+
+        css_records = [
+            record
+            for record in records
+            if str(record.get('path') or '').endswith('styles.css')
+        ]
+        self.assertEqual(len(css_records), 1)
+        self.assertEqual(len(checks), 1)
+        check = checks[0]
+        self.assertEqual(check['text_artifact_target_path'], str(css_path))
+        self.assertEqual(check['linked_html_artifact_count'], 2)
+        self.assertEqual(
+            {Path(path).name for path in check['linked_html_artifact_paths']},
+            {'index.html', 'commissions.html'},
+        )
+        self.assertIn('alpha-shell', check['html_class_tokens_missing_css_selectors'])
+        self.assertIn('bravo-shell', check['html_class_tokens_missing_css_selectors'])
+        self.assertIn('index.html', check['content_payload'])
+        self.assertIn('commissions.html', check['content_payload'])
+
     def test_closure_uses_full_saved_text_when_transport_preview_is_truncated(self):
         html_classes = [
             'hero-shell',
@@ -9665,6 +10080,36 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         )
 
         self.assertIn('stray opening angle bracket', '\n'.join(issues))
+
+    def test_syntax_sanity_ignores_markup_looking_attribute_text_in_script_and_style(self):
+        content = (
+            '<!doctype html><html><head><style>'
+            'select[data-template="<option>Preview</option>"] { color: inherit; }'
+            '</style><script>'
+            'const markup = \'<option>Preview</option>\';'
+            '</script></head><body></body></html>'
+        )
+
+        issues = ResponseSemanticsRuntimeOwner.text_artifact_syntax_sanity_issues_for_extension(
+            'html',
+            content,
+        )
+
+        self.assertNotIn('attribute contains markup-like closing tag', '\n'.join(issues))
+
+    def test_syntax_sanity_still_flags_markup_looking_closing_tag_in_html_attribute(self):
+        content = (
+            '<!doctype html><html><body>'
+            '<div class="show</strong>case-text">Copy</div>'
+            '</body></html>'
+        )
+
+        issues = ResponseSemanticsRuntimeOwner.text_artifact_syntax_sanity_issues_for_extension(
+            'html',
+            content,
+        )
+
+        self.assertIn('attribute contains markup-like closing tag', '\n'.join(issues))
 
     def test_deterministic_syntax_repair_normalizes_observed_css_property_typos(self):
         content = (
@@ -11497,6 +11942,537 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(review['ghost_repair_feedback']['repair_loop']['auto_execute'])
 
+    def test_branch_semantic_review_requires_current_strict_verdict(self):
+        criterion = 'final comparison is concise and visually grounded'
+        source_check = {
+            'check_kind': 'output_obligation',
+            'status': 'fulfilled',
+            'evidence': 'current_phase_output_text',
+            'phase_id': 'phase-final',
+            'branch_id': 'branch-final',
+            'semantic_review_required': True,
+            'review_criteria_status': 'semantic_review_required',
+            'semantic_review_criteria': [criterion],
+        }
+        prompt = 'Write the final comparison from current evidence.'
+        output_text = 'The comparison uses the current visual evidence.'
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        review_check = self.owner._branch_semantic_review_checks(
+            checks=[source_check],
+            request_payload={'prompt': prompt},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            output_text=output_text,
+        )[0]
+        completed = dict(review_check)
+        completed.update(
+            status='fulfilled',
+            result_text=self._passing_global_semantic_verdict(criterion),
+        )
+        artifact_payload['late_fill']['completed_branches'].append(completed)
+
+        updated = self.owner._apply_branch_semantic_verdict_to_check(
+            source_check,
+            artifact_payload=artifact_payload,
+            prompt=prompt,
+            output_text=output_text,
+        )
+
+        self.assertFalse(updated['semantic_review_required'])
+        self.assertEqual(updated['review_criteria_status'], 'passed_semantic_review')
+        self.assertTrue(updated['semantic_review_freeze_acceptance']['accepted'])
+        self.assertEqual(updated['branch_semantic_review_status'], 'fulfilled')
+        self.assertEqual(
+            updated['branch_semantic_review_evidence_binding']['sha256'],
+            review_check['semantic_review_evidence_binding']['sha256'],
+        )
+        self.assertEqual(
+            review_check['execution_contract']['semantic_review_evidence_binding']['sha256'],
+            review_check['semantic_review_evidence_binding']['sha256'],
+        )
+        self.assertEqual(review_check['visibility'], 'internal')
+        self.assertEqual(review_check['surface_role'], 'closure_evidence')
+        self.assertEqual(review_check['execution_contract']['visibility'], 'internal')
+        self.assertEqual(
+            review_check['execution_contract']['surface_role'],
+            'closure_evidence',
+        )
+        self.assertEqual(
+            review_check['execution_contract']['output_contract']['visibility'],
+            'internal',
+        )
+        self.assertEqual(
+            review_check['execution_contract']['output_contract']['surface_role'],
+            'closure_evidence',
+        )
+        self.assertIn(
+            {
+                'kind': 'semantic_review_evidence_sha256',
+                'ref': review_check['semantic_review_evidence_binding']['sha256'],
+            },
+            review_check['input_refs'],
+        )
+
+    def test_branch_semantic_review_status_only_payload_cannot_freeze(self):
+        source_check = {
+            'check_kind': 'output_obligation',
+            'status': 'fulfilled',
+            'evidence': 'current_phase_output_text',
+            'phase_id': 'phase-final',
+            'branch_id': 'branch-final',
+            'semantic_review_required': True,
+            'semantic_review_criteria': ['final comparison is visually grounded'],
+        }
+        prompt = 'Write the final comparison.'
+        output_text = 'Comparison text.'
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        review_check = self.owner._branch_semantic_review_checks(
+            checks=[source_check],
+            request_payload={'prompt': prompt},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            output_text=output_text,
+        )[0]
+        artifact_payload['late_fill']['completed_branches'].append(
+            dict(review_check, status='fulfilled', result_text='{"status":"completed"}')
+        )
+
+        updated = self.owner._apply_branch_semantic_verdict_to_check(
+            source_check,
+            artifact_payload=artifact_payload,
+            prompt=prompt,
+            output_text=output_text,
+        )
+
+        self.assertEqual(updated['status'], 'pending')
+        self.assertEqual(updated['repair_action'], 'manual_review')
+        self.assertEqual(updated['branch_semantic_review_status'], 'pending')
+        self.assertFalse(updated['semantic_review_freeze_acceptance']['accepted'])
+        self.assertIn(
+            'kind_not_explicit_or_invalid',
+            updated['semantic_review_freeze_acceptance']['rejection_reasons'],
+        )
+
+    def test_branch_semantic_review_is_bounded_and_generation_bound(self):
+        criterion = 'final comparison is visually grounded'
+        recursive_blob = 'recursive-branch-contract-' * 30_000
+        source_check = {
+            'check_kind': 'output_obligation',
+            'status': 'fulfilled',
+            'evidence': 'current_phase_output_text',
+            'phase_id': 'phase-final',
+            'branch_id': 'branch-final',
+            'semantic_review_required': True,
+            'semantic_review_criteria': [criterion],
+            'semantic_review_lens': recursive_blob,
+            'semantic_review_lens_contract': {'recursive': recursive_blob},
+            'execution_contract': {'recursive': recursive_blob},
+        }
+        prompt = f'prompt head\n{recursive_blob}\nprompt tail'
+        output_text = f'output head\n{recursive_blob}\noutput tail'
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        old_check = self.owner._branch_semantic_review_checks(
+            checks=[source_check],
+            request_payload={'prompt': prompt},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            output_text=output_text,
+        )[0]
+        self.assertLess(len(old_check['content_payload']), 80_000)
+        self.assertNotIn(recursive_blob, old_check['content_payload'])
+        self.assertRegex(old_check['branch_id'], r'^branch-branch-semantic-review-branch-final-[0-9a-f]{64}$')
+        artifact_payload['late_fill']['completed_branches'].append(
+            dict(
+                old_check,
+                status='fulfilled',
+                result_text=self._passing_global_semantic_verdict(criterion),
+            )
+        )
+        accepted_source = self.owner._apply_branch_semantic_verdict_to_check(
+            source_check,
+            artifact_payload=artifact_payload,
+            prompt=prompt,
+            output_text=output_text,
+        )
+        stale_source = dict(
+            accepted_source,
+            semantic_review_required=True,
+            review_criteria_status='semantic_review_required',
+        )
+        changed_output = f'{output_text}\nchanged current evidence'
+
+        changed = self.owner._apply_branch_semantic_verdict_to_check(
+            stale_source,
+            artifact_payload=artifact_payload,
+            prompt=prompt,
+            output_text=changed_output,
+        )
+
+        self.assertTrue(changed['semantic_review_required'])
+        self.assertEqual(changed['branch_semantic_review_status'], 'pending')
+        self.assertNotEqual(
+            changed['branch_semantic_review_branch_id'],
+            old_check['branch_id'],
+        )
+        self.assertNotIn('semantic_review_verdict', changed)
+        self.assertIn('ignored_stale_branch_semantic_review', changed)
+        replacement_check = self.owner._branch_semantic_review_checks(
+            checks=[changed],
+            request_payload={'prompt': prompt},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            output_text=changed_output,
+        )[0]
+        self.assertEqual(replacement_check['branch_id'], changed['branch_semantic_review_branch_id'])
+        self.assertNotEqual(replacement_check['branch_id'], old_check['branch_id'])
+
+        branch_artifacts = [
+            {
+                'type': 'image',
+                'path': f'/not-readable/image-{index}.png',
+                'branch_id': 'branch-final',
+                'phase_id': 'phase-final',
+            }
+            for index in range(70)
+        ]
+        many_artifact_owner = ResponseSemanticsRuntimeOwner(
+            hooks={
+                'build_canonical_response_artifacts': lambda _payload: branch_artifacts,
+                'resolve_semantic_review_artifact_path': lambda _path: None,
+            }
+        )
+        bounded_evidence = many_artifact_owner._branch_semantic_evidence_payload(
+            artifact_payload={'artifacts': branch_artifacts},
+            check=source_check,
+            output_text=output_text,
+        )
+        self.assertEqual(bounded_evidence['artifact_ref_count'], 70)
+        self.assertEqual(len(bounded_evidence['artifact_refs']), 64)
+        self.assertTrue(bounded_evidence['artifact_refs_truncated'])
+
+    def test_semantic_review_bounds_intent_checks_and_rejects_unapproved_paths(self):
+        huge_reason = 'recursive-intent-check-' * 2_000
+        adequacy = {
+            'status': 'pending',
+            'reason': huge_reason,
+            'checks': [
+                {
+                    'check_kind': 'intent_graph_adequacy',
+                    'status': 'pending',
+                    'branch_id': f'branch-{index}',
+                    'reason': f'{huge_reason}-{index}',
+                }
+                for index in range(140)
+            ],
+        }
+        first = self.owner._global_semantic_evidence_payload(
+            artifact_payload={},
+            checks=[],
+            intent_graph_adequacy=adequacy,
+            decision_contract={},
+        )['intent_graph_adequacy']
+        changed_adequacy = dict(adequacy)
+        changed_adequacy['checks'] = [dict(item) for item in adequacy['checks']]
+        changed_adequacy['checks'][-1]['status'] = 'blocked'
+        second = self.owner._global_semantic_evidence_payload(
+            artifact_payload={},
+            checks=[],
+            intent_graph_adequacy=changed_adequacy,
+            decision_contract={},
+        )['intent_graph_adequacy']
+        self.assertEqual(len(first['checks']), 128)
+        self.assertEqual(first['check_count'], 140)
+        self.assertTrue(first['checks_truncated'])
+        self.assertNotEqual(first['check_manifest_sha256'], second['check_manifest_sha256'])
+        self.assertLess(len(json.dumps(first)), 100_000)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_path = Path(temp_dir) / 'index.html'
+            artifact_path.write_text('<main>private path</main>', encoding='utf-8')
+            fail_closed_owner = ResponseSemanticsRuntimeOwner(
+                hooks={'build_canonical_response_artifacts': build_canonical_response_artifacts}
+            )
+            evidence = fail_closed_owner._global_semantic_evidence_payload(
+                artifact_payload={
+                    'saved_text_artifacts': [
+                        {
+                            'path': str(artifact_path),
+                            'source_name': 'index.html',
+                            'phase_id': 'phase-html',
+                            'branch_id': 'branch-html',
+                        }
+                    ]
+                },
+                checks=[],
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+        artifact = evidence['artifact_refs'][0]
+        self.assertEqual(
+            artifact['current_file_status'],
+            'outside_allowed_artifact_roots',
+        )
+        self.assertNotIn('content_excerpt', artifact)
+
+    def test_global_semantic_evidence_is_bounded_and_binds_all_artifact_phases(self):
+        recursive_blob = 'recursive-planning-state-' * 25000
+        artifact_payload = {
+            'id': 'resp-bounded-global-review',
+            'saved_text_artifacts': [
+                {
+                    'path': '/tmp/index.html',
+                    'source_name': 'index.html',
+                    'phase_id': 'phase-5',
+                    'branch_id': 'branch-text-artifact-1',
+                },
+                {
+                    'path': '/tmp/styles.css',
+                    'source_name': 'styles.css',
+                    'phase_id': 'phase-6',
+                    'branch_id': 'branch-text-artifact-2',
+                },
+            ],
+            'late_fill': {
+                'status': 'completed',
+                'fill_results': [
+                    {
+                        'saved_image_path': f'/tmp/image-{index}.png',
+                        'phase_id': f'phase-{index + 1}',
+                        'branch_id': f'branch-image-generation-{index}',
+                        'capability': 'image_generation',
+                    }
+                    for index in range(1, 4)
+                ],
+            },
+        }
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': phase_id,
+                'branch_id': f'branch-{phase_id}',
+                'semantic_review_required': True,
+                'semantic_review_criteria': ['whole_turn_output_fits_current_user_intent'],
+            }
+            for phase_id in ('phase-2', 'phase-3', 'phase-4', 'phase-5', 'phase-6')
+        ]
+        decision_contract = {
+            'semantic_decision_review': {
+                'status': 'required',
+                'proposal_count': 1,
+                'proposals': [
+                    {
+                        'proposal_id': 'whole-turn-fit',
+                        'status': 'pending',
+                        'recommended_transition': 'semantic_review',
+                        'reason': 'Review the complete local bundle.',
+                        'semantic_review_criteria': ['whole_turn_output_fits_current_user_intent'],
+                        'semantic_review_lens_contract': {'recursive': recursive_blob},
+                    }
+                ],
+            },
+            'controlled_attention_review': {
+                'status': 'active',
+                'frame_count': 142,
+                'frames': [{'recursive': recursive_blob} for _ in range(3)],
+            },
+            'aspiration_review': {'status': 'active', 'frames': [{'recursive': recursive_blob}]},
+            'commitment_review': {'status': 'active', 'frames': [{'recursive': recursive_blob}]},
+            'semantic_quality_review': {
+                'status': 'required',
+                'contracts': [
+                    {
+                        'contract_id': 'quality-1',
+                        'status': 'pending',
+                        'review_criteria': ['whole_turn_output_fits_current_user_intent'],
+                        'recursive': recursive_blob,
+                    }
+                ],
+            },
+        }
+
+        evidence = self.owner._global_semantic_evidence_payload(
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract=decision_contract,
+        )
+        serialized = json.dumps(evidence, ensure_ascii=False)
+
+        self.assertLess(len(serialized), 50000)
+        self.assertNotIn('recursive-planning-state-', serialized)
+        self.assertEqual(
+            evidence['artifact_dependency_ids'],
+            ['phase-5', 'phase-6', 'phase-2', 'phase-3', 'phase-4'],
+        )
+        self.assertEqual(evidence['controlled_attention_review']['frame_count'], 142)
+        self.assertEqual(
+            evidence['semantic_quality_review']['contracts'][0]['review_criteria'],
+            ['whole_turn_output_fits_current_user_intent'],
+        )
+
+        global_checks = self.owner._global_semantic_closure_checks(
+            {
+                'status': 'pending',
+                'reason': 'whole-turn review required',
+                'review_branch_id': 'branch-global-semantic-closure-review',
+                'dependency_phase_ids': evidence['artifact_dependency_ids'],
+                'content_payload': 'bounded review prompt',
+                'content_payload_source': 'global_semantic_closure_review',
+                'stage_direction': 'run_global_semantic_closure_review',
+                'proposals': [
+                    {
+                        'decision_action': 'semantic_review',
+                        'reason': 'Review the complete local bundle.',
+                    }
+                ],
+            }
+        )
+        self.assertEqual(global_checks[0]['depends_on'], evidence['artifact_dependency_ids'])
+        artifact_input_refs = [
+            item['ref']
+            for item in global_checks[0]['input_refs']
+            if item.get('kind') == 'runtime_artifact_phase'
+        ]
+        self.assertEqual(artifact_input_refs, evidence['artifact_dependency_ids'])
+
+    def test_global_semantic_review_bounds_live_carriers_and_reads_text_artifact_excerpt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            html_path = Path(temp_dir) / 'index.html'
+            html_path.write_text(
+                '<main id="review-head">reviewable head</main>\n'
+                + ('middle-content-that-must-not-expand-evidence\n' * 1200)
+                + '<footer id="review-tail">reviewable footer</footer>\n',
+                encoding='utf-8',
+            )
+            unbounded_history = 'unbounded-late-fill-history-' * 20_000
+            artifact_payload = {
+                'id': 'resp-bounded-live-review-carriers',
+                'saved_text_artifacts': [
+                    {
+                        'path': str(html_path),
+                        'source_name': 'index.html',
+                        'phase_id': 'phase-html',
+                        'branch_id': 'branch-html',
+                    },
+                ],
+                'late_fill': {
+                    'status': 'completed',
+                    'completed_branches': [
+                        {
+                            'branch_id': 'branch-html',
+                            'phase_id': 'phase-html',
+                            'capability': 'chat',
+                            'output_type': 'text',
+                            'saved_text_path': str(html_path),
+                            'result_text': unbounded_history,
+                            'execution_contract': {'recursive': unbounded_history},
+                            'ghost_messages': [{'content': unbounded_history}],
+                        },
+                        *[
+                            {
+                                'branch_id': f'branch-{index}',
+                                'phase_id': f'phase-{index}',
+                                'capability': f'capability-{index}',
+                                'status': 'fulfilled',
+                            }
+                            for index in range(1, 140)
+                        ],
+                        {
+                            'branch_id': 'branch-global-semantic-closure-review',
+                            'phase_id': 'phase-global-semantic-closure-review',
+                            'capability': 'chat',
+                            'stage_direction': 'run_global_semantic_closure_review',
+                            'result_text': unbounded_history,
+                        },
+                    ],
+                    'failed_branches': [],
+                    'pending_branches': [],
+                },
+            }
+
+            evidence = self.owner._global_semantic_evidence_payload(
+                artifact_payload=artifact_payload,
+                checks=[],
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+            serialized = json.dumps(evidence, ensure_ascii=False)
+            text_artifact = evidence['artifact_refs'][0]
+
+            self.assertNotIn('unbounded-late-fill-history-', serialized)
+            self.assertNotIn('result_text', evidence['late_fill']['completed_branches'][0])
+            self.assertNotIn('global-semantic-closure-review', serialized)
+            self.assertEqual(len(evidence['late_fill']['completed_branches']), 128)
+            self.assertEqual(evidence['late_fill']['completed_branch_count'], 140)
+            self.assertTrue(evidence['late_fill']['completed_branches_truncated'])
+            self.assertTrue(evidence['late_fill']['completed_capabilities_truncated'])
+            self.assertEqual(len(evidence['late_fill']['completed_capabilities']), 32)
+            self.assertIn('reviewable head', text_artifact['content_excerpt'])
+            self.assertIn('reviewable footer', text_artifact['content_excerpt'])
+            self.assertEqual(text_artifact['content_excerpt_mode'], 'head_tail')
+            self.assertTrue(text_artifact['content_excerpt_truncated'])
+            self.assertEqual(
+                text_artifact['current_content_sha256'],
+                hashlib.sha256(html_path.read_bytes()).hexdigest(),
+            )
+            self.assertLess(len(serialized), 100_000)
+
+            prompt_middle = 'prompt-middle-must-be-omitted-' * 2_000
+            output_middle = 'output-middle-must-be-omitted-' * 2_000
+            instruction = self.owner._global_semantic_review_instruction(
+                prompt=f'prompt head\n{prompt_middle}\nprompt tail',
+                output_text=f'output head\n{output_middle}\noutput tail',
+                evidence_payload=evidence,
+            )
+            self.assertIn('prompt head', instruction)
+            self.assertIn('prompt tail', instruction)
+            self.assertIn('output head', instruction)
+            self.assertIn('output tail', instruction)
+            self.assertNotIn(prompt_middle, instruction)
+            self.assertNotIn(output_middle, instruction)
+            self.assertLess(len(instruction), 80_000)
+
+    def test_semantic_review_late_fill_request_drops_conversation_carriers(self):
+        self.late_fill_owner.normalize_request_payload = lambda payload: dict(payload or {})
+        self.late_fill_owner.extract_request_meta = lambda payload: dict(payload.get('request_meta') or {})
+        self.late_fill_owner.attach_request_meta = lambda payload: payload
+        self.late_fill_owner.extract_responses_prompt = lambda payload: str(payload.get('prompt') or '')
+        self.late_fill_owner.parse_bool = lambda value, default=False: default if value is None else bool(value)
+        self.late_fill_owner.extract_ghost_route_messages = lambda payload: self.fail(
+            'semantic-review stages must not extract recent Ghost messages'
+        )
+        self.late_fill_owner.response_registry_now_iso = lambda: '2026-08-23T00:00:00Z'
+        self.late_fill_owner.max_recent_messages = 14
+
+        for stage_direction in (
+            'run_global_semantic_closure_review',
+            'run_branch_semantic_review',
+        ):
+            with self.subTest(stage_direction=stage_direction):
+                prepared = self.late_fill_owner.prepare_late_fill_request_payload(
+                    {
+                        'prompt': 'original root request',
+                        'input': 'original root input',
+                        'messages': [{'role': 'user', 'content': 'old message'}],
+                        'ghost_messages': [{'role': 'assistant', 'content': 'old reply'}],
+                        'batch_prompts': ['old batch prompt'],
+                        'ghost_route': True,
+                    },
+                    expected_capability='chat',
+                    assistant_message='old assistant surface',
+                    artifact_gap={
+                        'stage_direction': stage_direction,
+                        'content_payload': 'bounded explicit semantic-review packet',
+                    },
+                )
+
+                self.assertEqual(prepared['prompt'], 'bounded explicit semantic-review packet')
+                self.assertEqual(prepared['_prompt_hint'], 'bounded explicit semantic-review packet')
+                self.assertTrue(prepared['suppress_reference_file_context'])
+                for carrier in ('input', 'messages', 'ghost_messages', 'batch_prompts'):
+                    self.assertNotIn(carrier, prepared)
+
     def test_global_semantic_review_completion_allows_truthful_freeze(self):
         phase_graph = {
             'current_phase_id': 'phase-2',
@@ -11528,64 +12504,365 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             },
         }
 
-        review = self.owner.build_graph_closure_review(
-            'The generated visual is ready for a compact deployment plan.',
-            request_payload={'ghost_route': True, 'prompt': 'Write the final deployment plan from available evidence.'},
-            artifact_payload={
-                'output_text': 'The generated visual is ready for a compact deployment plan.',
-                'runtime': {'request_phase_graph': phase_graph},
-                'late_fill': {
-                    'status': 'completed',
-                    'completed_branches': [
-                        {'branch_id': 'phase-1', 'phase_id': 'phase-1', 'capability': 'image_generation'},
-                        {
-                            'branch_id': 'branch-semantic-review-branch-final-review',
-                            'phase_id': 'phase-semantic-review-branch-final-review',
-                            'capability': 'chat',
-                            'result_text': (
-                                '{'
-                                '"kind":"ollmo.semantic_review_verdict",'
-                                '"verdict":"passed",'
-                                '"overall_status":"fulfilled",'
-                                '"whole_intent_fit":"The final branch uses the generated visual evidence.",'
-                                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"passed","evidence_refs":["phase-1","branch-final-review"]}],'
-                                '"evidence_refs":["phase-1","branch-final-review"],'
-                                '"defects":[],'
-                                '"confidence":0.9,'
-                                '"recommended_transition":"truthful_freeze"'
-                                '}'
-                            ),
-                        },
-                        {
-                            'branch_id': 'branch-global-semantic-closure-review',
-                            'phase_id': 'phase-global-semantic-closure-review',
-                            'capability': 'chat',
-                            'result_text': (
-                                '{'
-                                '"kind":"ollmo.semantic_review_verdict",'
-                                '"verdict":"passed",'
-                                '"overall_status":"fulfilled",'
-                                '"whole_intent_fit":"The final deployment plan is grounded in the generated visual evidence.",'
-                                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"passed","evidence_refs":["phase-1","branch-final-review"]}],'
-                                '"evidence_refs":["phase-1","branch-final-review"],'
-                                '"defects":[],'
-                                '"confidence":0.9,'
-                                '"recommended_transition":"truthful_freeze"'
-                                '}'
-                            ),
-                        },
-                    ],
-                },
+        output_text = 'The generated visual is ready for a compact deployment plan.'
+        request_payload = {'prompt': 'Write the final deployment plan from available evidence.'}
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': 'phase-2',
+                'branch_id': 'branch-final-review',
+                'semantic_review_required': True,
+                'review_criteria_status': 'semantic_review_required',
+                'semantic_review_criteria': ['final comparison is concise and visually grounded'],
             },
+        ]
+        preliminary = self.owner.build_global_semantic_closure_review(
+            output_text=output_text,
+            request_payload=request_payload,
+            request_phase_graph=phase_graph,
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+        review_check = self._complete_current_global_semantic_review(
+            artifact_payload,
+            preliminary,
+            (
+                '{'
+                '"kind":"ollmo.semantic_review_verdict",'
+                '"verdict":"passed",'
+                '"overall_status":"fulfilled",'
+                '"whole_intent_fit":"The final deployment plan is grounded in the generated visual evidence.",'
+                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"passed","evidence_refs":["phase-1","branch-final-review"]}],'
+                '"evidence_refs":["phase-1","branch-final-review"],'
+                '"defects":[],'
+                '"confidence":0.9,'
+                '"recommended_transition":"truthful_freeze"'
+                '}'
+            ),
+        )
+        review = self.owner.build_global_semantic_closure_review(
+            output_text=output_text,
+            request_payload=request_payload,
+            request_phase_graph=phase_graph,
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
         )
 
         self.assertEqual(review['status'], 'fulfilled')
-        self.assertEqual(review['global_semantic_closure_review']['status'], 'fulfilled')
         self.assertEqual(
-            review['global_semantic_closure_review']['semantic_review_verdict']['verdict'],
+            review['semantic_review_verdict']['verdict'],
             'passed',
         )
-        self.assertNotIn('ghost_repair_feedback', review)
+        self.assertEqual(
+            review['review_branch_id'],
+            review_check['branch_id'],
+        )
+        self.assertEqual(
+            review['semantic_review_evidence_binding']['sha256'],
+            preliminary['semantic_review_evidence_binding']['sha256'],
+        )
+        self.assertEqual(
+            review['semantic_review_evidence_binding']['policy'],
+            'global_semantic_review_instruction_sha256_v1',
+        )
+        self.assertEqual(
+            review_check['execution_contract']['semantic_review_evidence_binding']['sha256'],
+            preliminary['semantic_review_evidence_binding']['sha256'],
+        )
+        self.assertEqual(review_check['visibility'], 'internal')
+        self.assertEqual(review_check['surface_role'], 'closure_evidence')
+        self.assertEqual(review_check['execution_contract']['visibility'], 'internal')
+        self.assertEqual(
+            review_check['execution_contract']['surface_role'],
+            'closure_evidence',
+        )
+        self.assertEqual(
+            review_check['execution_contract']['output_contract']['visibility'],
+            'internal',
+        )
+        self.assertEqual(
+            review_check['execution_contract']['output_contract']['surface_role'],
+            'closure_evidence',
+        )
+        self.assertIn(
+            {
+                'kind': 'semantic_review_evidence_sha256',
+                'ref': preliminary['semantic_review_evidence_binding']['sha256'],
+            },
+            review_check['input_refs'],
+        )
+
+    def test_global_semantic_review_status_only_payload_cannot_freeze(self):
+        required_criterion = 'whole_turn_output_fits_current_user_intent'
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': 'phase-text-artifact',
+                'branch_id': 'branch-text-artifact',
+                'semantic_review_required': True,
+                'semantic_review_criteria': [required_criterion],
+            },
+        ]
+        preliminary = self.owner.build_global_semantic_closure_review(
+            output_text='The local bundle is ready.',
+            request_payload={'prompt': 'Create the local bundle.'},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+        current_check = self.owner._global_semantic_closure_checks(preliminary)[0]
+        completed_record = dict(current_check)
+        completed_record['status'] = 'fulfilled'
+        completed_record['result_text'] = '{"status":"completed"}'
+        artifact_payload['late_fill']['completed_branches'].append(completed_record)
+        review = self.owner.build_global_semantic_closure_review(
+            output_text='The local bundle is ready.',
+            request_payload={'prompt': 'Create the local bundle.'},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+
+        acceptance = review['semantic_review_freeze_acceptance']
+        self.assertEqual(review['status'], 'pending')
+        self.assertFalse(acceptance['accepted'])
+        self.assertEqual(review['required_semantic_criteria'], [required_criterion])
+        self.assertIn('kind_not_explicit_or_invalid', acceptance['rejection_reasons'])
+        self.assertIn('required_criteria_missing', acceptance['rejection_reasons'])
+        self.assertEqual(review['proposals'][0]['recommended_transition'], 'manual_review')
+
+        global_checks = self.owner._global_semantic_closure_checks(review)
+        self.assertEqual(global_checks[0]['repair_action'], 'manual_review')
+
+    def test_global_semantic_review_file_change_invalidates_passed_generation(self):
+        criterion = 'whole_turn_output_fits_current_user_intent'
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': 'phase-artifact',
+                'branch_id': 'branch-artifact',
+                'semantic_review_required': True,
+                'review_criteria_status': 'semantic_review_required',
+                'semantic_review_criteria': [criterion],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_path = Path(temp_dir) / 'index.html'
+            artifact_path.write_text('<main>first generation</main>', encoding='utf-8')
+            artifact_payload = {
+                'saved_text_artifacts': [
+                    {
+                        'path': str(artifact_path),
+                        'source_name': 'index.html',
+                        'phase_id': 'phase-artifact',
+                        'branch_id': 'branch-artifact',
+                    },
+                ],
+                'late_fill': {'status': 'completed', 'completed_branches': []},
+            }
+            preliminary = self.owner.build_global_semantic_closure_review(
+                output_text='The local site is ready.',
+                request_payload={'prompt': 'Create the local site.'},
+                request_phase_graph={},
+                artifact_payload=artifact_payload,
+                checks=checks,
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+            old_check = self._complete_current_global_semantic_review(
+                artifact_payload,
+                preliminary,
+                self._passing_global_semantic_verdict(criterion),
+            )
+            accepted = self.owner.build_global_semantic_closure_review(
+                output_text='The local site is ready.',
+                request_payload={'prompt': 'Create the local site.'},
+                request_phase_graph={},
+                artifact_payload=artifact_payload,
+                checks=checks,
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+            self.assertEqual(accepted['status'], 'fulfilled')
+
+            artifact_path.write_text('<main>changed after review</main>', encoding='utf-8')
+            changed = self.owner.build_global_semantic_closure_review(
+                output_text='The local site is ready.',
+                request_payload={'prompt': 'Create the local site.'},
+                request_phase_graph={},
+                artifact_payload=artifact_payload,
+                checks=checks,
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+
+        self.assertEqual(changed['status'], 'pending')
+        self.assertNotEqual(changed['review_branch_id'], old_check['branch_id'])
+        self.assertNotEqual(
+            changed['semantic_review_evidence_binding']['sha256'],
+            preliminary['semantic_review_evidence_binding']['sha256'],
+        )
+
+    def test_global_semantic_review_check_change_invalidates_passed_generation(self):
+        criterion = 'whole_turn_output_fits_current_user_intent'
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': 'phase-artifact',
+                'branch_id': 'branch-artifact',
+                'reason': 'initial closure evidence',
+                'semantic_review_required': True,
+                'review_criteria_status': 'semantic_review_required',
+                'semantic_review_criteria': [criterion],
+            },
+        ]
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        preliminary = self.owner.build_global_semantic_closure_review(
+            output_text='The local site is ready.',
+            request_payload={'prompt': 'Create the local site.'},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+        old_check = self._complete_current_global_semantic_review(
+            artifact_payload,
+            preliminary,
+            self._passing_global_semantic_verdict(criterion),
+        )
+        changed_checks = [dict(checks[0], reason='updated closure evidence')]
+        changed = self.owner.build_global_semantic_closure_review(
+            output_text='The local site is ready.',
+            request_payload={'prompt': 'Create the local site.'},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            checks=changed_checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+
+        self.assertEqual(changed['status'], 'pending')
+        self.assertNotEqual(changed['review_branch_id'], old_check['branch_id'])
+        self.assertNotEqual(
+            changed['semantic_review_evidence_binding']['sha256'],
+            preliminary['semantic_review_evidence_binding']['sha256'],
+        )
+
+    def test_legacy_fixed_global_semantic_review_pass_does_not_close_current_generation(self):
+        criterion = 'whole_turn_output_fits_current_user_intent'
+        artifact_payload = {
+            'late_fill': {
+                'status': 'completed',
+                'completed_branches': [
+                    {
+                        'branch_id': 'branch-global-semantic-closure-review',
+                        'phase_id': 'phase-global-semantic-closure-review',
+                        'capability': 'chat',
+                        'result_text': self._passing_global_semantic_verdict(criterion),
+                    },
+                ],
+            },
+        }
+        review = self.owner.build_global_semantic_closure_review(
+            output_text='The local site is ready.',
+            request_payload={'prompt': 'Create the local site.'},
+            request_phase_graph={},
+            artifact_payload=artifact_payload,
+            checks=[
+                {
+                    'check_kind': 'output_obligation',
+                    'status': 'fulfilled',
+                    'phase_id': 'phase-artifact',
+                    'branch_id': 'branch-artifact',
+                    'semantic_review_required': True,
+                    'review_criteria_status': 'semantic_review_required',
+                    'semantic_review_criteria': [criterion],
+                },
+            ],
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+
+        self.assertEqual(review['status'], 'pending')
+        self.assertNotEqual(
+            review['review_branch_id'],
+            'branch-global-semantic-closure-review',
+        )
+        self.assertRegex(
+            review['review_branch_id'],
+            r'^branch-global-semantic-closure-review-[0-9a-f]{64}$',
+        )
+
+    def test_global_semantic_manifests_cover_records_beyond_prompt_caps(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_records = []
+            for index in range(129):
+                artifact_path = Path(temp_dir) / f'artifact-{index}.txt'
+                artifact_path.write_text(f'artifact {index}', encoding='utf-8')
+                artifact_records.append(
+                    {
+                        'path': str(artifact_path),
+                        'source_name': artifact_path.name,
+                        'phase_id': f'phase-{index}',
+                        'branch_id': f'branch-{index}',
+                    }
+                )
+            checks = [
+                {
+                    'check_kind': 'output_obligation',
+                    'status': 'fulfilled',
+                    'phase_id': f'phase-{index}',
+                    'branch_id': f'branch-{index}',
+                    'reason': f'check {index}',
+                }
+                for index in range(129)
+            ]
+            artifact_payload = {'saved_text_artifacts': artifact_records}
+            first = self.owner._global_semantic_evidence_payload(
+                artifact_payload=artifact_payload,
+                checks=checks,
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+            Path(artifact_records[-1]['path']).write_text(
+                'artifact 128 changed beyond display cap',
+                encoding='utf-8',
+            )
+            changed_checks = [*checks[:-1], dict(checks[-1], reason='check 128 changed')]
+            second = self.owner._global_semantic_evidence_payload(
+                artifact_payload=artifact_payload,
+                checks=changed_checks,
+                intent_graph_adequacy={'status': 'fulfilled'},
+                decision_contract={},
+            )
+
+        self.assertEqual(len(first['artifact_refs']), 128)
+        self.assertEqual(len(first['closure_checks']), 128)
+        self.assertTrue(first['artifact_refs_truncated'])
+        self.assertTrue(first['closure_checks_truncated'])
+        self.assertNotEqual(
+            first['artifact_manifest_sha256'],
+            second['artifact_manifest_sha256'],
+        )
+        self.assertNotEqual(
+            first['closure_check_manifest_sha256'],
+            second['closure_check_manifest_sha256'],
+        )
 
     def test_global_semantic_review_failed_verdict_blocks_freeze(self):
         phase_graph = {
@@ -11618,67 +12895,64 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             },
         }
 
-        review = self.owner.build_graph_closure_review(
-            'The generated visual is ready for a compact deployment plan.',
-            request_payload={'ghost_route': True, 'prompt': 'Write the final deployment plan from available evidence.'},
-            artifact_payload={
-                'output_text': 'The generated visual is ready for a compact deployment plan.',
-                'runtime': {'request_phase_graph': phase_graph},
-                'late_fill': {
-                    'status': 'completed',
-                    'completed_branches': [
-                        {'branch_id': 'phase-1', 'phase_id': 'phase-1', 'capability': 'image_generation'},
-                        {
-                            'branch_id': 'branch-semantic-review-branch-final-review',
-                            'phase_id': 'phase-semantic-review-branch-final-review',
-                            'capability': 'chat',
-                            'result_text': (
-                                '{'
-                                '"kind":"ollmo.semantic_review_verdict",'
-                                '"verdict":"passed",'
-                                '"overall_status":"fulfilled",'
-                                '"whole_intent_fit":"The final branch uses the generated visual evidence.",'
-                                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"passed","evidence_refs":["phase-1","branch-final-review"]}],'
-                                '"evidence_refs":["phase-1","branch-final-review"],'
-                                '"defects":[],'
-                                '"confidence":0.9,'
-                                '"recommended_transition":"truthful_freeze"'
-                                '}'
-                            ),
-                        },
-                        {
-                            'branch_id': 'branch-global-semantic-closure-review',
-                            'phase_id': 'phase-global-semantic-closure-review',
-                            'capability': 'chat',
-                            'result_text': (
-                                '{'
-                                '"kind":"ollmo.semantic_review_verdict",'
-                                '"verdict":"failed",'
-                                '"overall_status":"blocked",'
-                                '"whole_intent_fit":"The final text does not use the generated image evidence.",'
-                                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"failed","evidence_refs":["branch-final-review"]}],'
-                                '"evidence_refs":["branch-final-review"],'
-                                '"defects":["generated image evidence was not used"],'
-                                '"confidence":0.86,'
-                                '"recommended_transition":"repair_dependency_chain"'
-                                '}'
-                            ),
-                        },
-                    ],
-                },
+        output_text = 'The generated visual is ready for a compact deployment plan.'
+        request_payload = {'prompt': 'Write the final deployment plan from available evidence.'}
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': 'phase-2',
+                'branch_id': 'branch-final-review',
+                'semantic_review_required': True,
+                'review_criteria_status': 'semantic_review_required',
+                'semantic_review_criteria': ['final comparison is concise and visually grounded'],
             },
+        ]
+        preliminary = self.owner.build_global_semantic_closure_review(
+            output_text=output_text,
+            request_payload=request_payload,
+            request_phase_graph=phase_graph,
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+        self._complete_current_global_semantic_review(
+            artifact_payload,
+            preliminary,
+            (
+                '{'
+                '"kind":"ollmo.semantic_review_verdict",'
+                '"verdict":"failed",'
+                '"overall_status":"blocked",'
+                '"whole_intent_fit":"The final text does not use the generated image evidence.",'
+                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"failed","evidence_refs":["branch-final-review"]}],'
+                '"evidence_refs":["branch-final-review"],'
+                '"defects":["generated image evidence was not used"],'
+                '"confidence":0.86,'
+                '"recommended_transition":"repair_dependency_chain"'
+                '}'
+            ),
+        )
+        review = self.owner.build_global_semantic_closure_review(
+            output_text=output_text,
+            request_payload=request_payload,
+            request_phase_graph=phase_graph,
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
         )
 
-        global_check = next(item for item in review['checks'] if item.get('check_kind') == 'global_semantic_closure')
+        global_check = self.owner._global_semantic_closure_checks(review)[0]
         self.assertEqual(review['status'], 'blocked')
-        self.assertEqual(review['global_semantic_closure_review']['status'], 'blocked')
         self.assertEqual(
-            review['global_semantic_closure_review']['semantic_review_verdict']['verdict'],
+            review['semantic_review_verdict']['verdict'],
             'failed',
         )
         self.assertEqual(global_check['repair_action'], 'repair_dependency_chain')
         self.assertEqual(global_check['semantic_review_verdict_status'], 'blocked')
-        self.assertIn('ghost_repair_feedback', review)
 
     def test_global_semantic_review_unparseable_output_keeps_manual_review_open(self):
         phase_graph = {
@@ -11711,54 +12985,51 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
             },
         }
 
-        review = self.owner.build_graph_closure_review(
-            'The generated visual is ready for a compact deployment plan.',
-            request_payload={'ghost_route': True, 'prompt': 'Write the final deployment plan from available evidence.'},
-            artifact_payload={
-                'output_text': 'The generated visual is ready for a compact deployment plan.',
-                'runtime': {'request_phase_graph': phase_graph},
-                'late_fill': {
-                    'status': 'completed',
-                    'completed_branches': [
-                        {'branch_id': 'phase-1', 'phase_id': 'phase-1', 'capability': 'image_generation'},
-                        {
-                            'branch_id': 'branch-semantic-review-branch-final-review',
-                            'phase_id': 'phase-semantic-review-branch-final-review',
-                            'capability': 'chat',
-                            'result_text': (
-                                '{'
-                                '"kind":"ollmo.semantic_review_verdict",'
-                                '"verdict":"passed",'
-                                '"overall_status":"fulfilled",'
-                                '"whole_intent_fit":"The final branch uses the generated visual evidence.",'
-                                '"criterion_results":[{"criterion":"final comparison is concise and visually grounded","status":"passed","evidence_refs":["phase-1","branch-final-review"]}],'
-                                '"evidence_refs":["phase-1","branch-final-review"],'
-                                '"defects":[],'
-                                '"confidence":0.9,'
-                                '"recommended_transition":"truthful_freeze"'
-                                '}'
-                            ),
-                        },
-                        {
-                            'branch_id': 'branch-global-semantic-closure-review',
-                            'phase_id': 'phase-global-semantic-closure-review',
-                            'capability': 'chat',
-                            'result_text': 'The review looks okay overall.',
-                        },
-                    ],
-                },
+        output_text = 'The generated visual is ready for a compact deployment plan.'
+        request_payload = {'prompt': 'Write the final deployment plan from available evidence.'}
+        artifact_payload = {'late_fill': {'status': 'completed', 'completed_branches': []}}
+        checks = [
+            {
+                'check_kind': 'output_obligation',
+                'status': 'fulfilled',
+                'phase_id': 'phase-2',
+                'branch_id': 'branch-final-review',
+                'semantic_review_required': True,
+                'review_criteria_status': 'semantic_review_required',
+                'semantic_review_criteria': ['final comparison is concise and visually grounded'],
             },
+        ]
+        preliminary = self.owner.build_global_semantic_closure_review(
+            output_text=output_text,
+            request_payload=request_payload,
+            request_phase_graph=phase_graph,
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
+        )
+        self._complete_current_global_semantic_review(
+            artifact_payload,
+            preliminary,
+            'The review looks okay overall.',
+        )
+        review = self.owner.build_global_semantic_closure_review(
+            output_text=output_text,
+            request_payload=request_payload,
+            request_phase_graph=phase_graph,
+            artifact_payload=artifact_payload,
+            checks=checks,
+            intent_graph_adequacy={'status': 'fulfilled'},
+            decision_contract={},
         )
 
-        global_check = next(item for item in review['checks'] if item.get('check_kind') == 'global_semantic_closure')
+        global_check = self.owner._global_semantic_closure_checks(review)[0]
         self.assertEqual(review['status'], 'pending')
-        self.assertEqual(review['global_semantic_closure_review']['status'], 'pending')
         self.assertEqual(
-            review['global_semantic_closure_review']['semantic_review_verdict']['parse_status'],
+            review['semantic_review_verdict']['parse_status'],
             'missing_structured_verdict',
         )
         self.assertEqual(global_check['repair_action'], 'manual_review')
-        self.assertFalse(review['ghost_repair_feedback']['repair_loop']['auto_execute'])
 
     def test_closure_review_treats_superseded_obligation_as_closed(self):
         phase_graph = {

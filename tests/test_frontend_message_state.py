@@ -1150,6 +1150,149 @@ class FrontendMessageStateTests(unittest.TestCase):
         )
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for frontend message-state tests")
+    def test_semantic_review_projection_is_hidden_structurally_and_by_protocol(self):
+        script = r"""
+            const assert = require('assert');
+            const fs = require('fs');
+            const vm = require('vm');
+
+            const context = {
+              console,
+              window: {},
+              state: {},
+              elements: {},
+              normalizeCapability: (value) => String(value || '').trim().toLowerCase() || null,
+              normalizeBackend: (value) => String(value || '').trim().toLowerCase() || null,
+              basenameFromPath: (value) => String(value || '').split(/[\\/]/).filter(Boolean).pop() || '',
+              assistantPreviewTextIsWorthPreserving: () => true,
+            };
+            vm.createContext(context);
+            vm.runInContext(fs.readFileSync('static/ui/message-state.js', 'utf8'), context);
+
+            const baseReviewOutput = {
+              type: 'text',
+              status: 'fulfilled',
+              value: 'Internal semantic verdict payload.',
+            };
+            const structuralSignals = [
+              { visibility: 'internal' },
+              { surface_role: 'closure_evidence' },
+              { stage_direction: 'run_global_semantic_closure_review' },
+              { role: 'semantic_review_transition' },
+              { check_kind: 'branch_semantic_review' },
+              { content_payload_source: 'global_semantic_closure_review' },
+              { content_payload_source: 'branch-semantic-review:branch-page-copy' },
+              { semantic_review_authority: 'closure_promoted_branch_semantic_review' },
+              { fulfillment_policy: 'semantic_review_text_required' },
+              { branch_id: 'branch-global-semantic-closure-review-deadbeef' },
+              { phase_id: 'phase-branch-semantic-review-branch-page-copy-deadbeef' },
+              { task_id: 'task-global-semantic-closure-review-deadbeef' },
+              { obligation_id: 'obligation-branch-semantic-review-branch-page-copy-deadbeef' },
+            ];
+            const structuralOutputs = structuralSignals.map((signal) => ({
+              ...baseReviewOutput,
+              ...signal,
+            }));
+            structuralOutputs.forEach((output) => {
+              assert.strictEqual(context.responseWorkItemIsSemanticReviewProjection(output), true);
+              assert.strictEqual(context.responseWorkItemIsInternalProjection(output), true);
+              assert.strictEqual(context.shouldRenderAssistantOutputText(output, structuralOutputs, null), false);
+            });
+
+            const sanitizedStructuralOutputs = context.sanitizeResponseOutputs(structuralOutputs);
+            assert.strictEqual(sanitizedStructuralOutputs.length, structuralOutputs.length);
+            assert.strictEqual(
+              sanitizedStructuralOutputs.every((output) => context.responseWorkItemIsSemanticReviewProjection(output)),
+              true
+            );
+            assert.strictEqual(
+              context.filterUserVisibleResponseWorkItems(structuralOutputs, { keepActionableInternal: true }).length,
+              0
+            );
+            assert.strictEqual(
+              structuralOutputs.every((output) => !context.isPublicArtifactOutputItem({
+                ...output,
+                artifact_ref: `artifact:${output.branch_id || output.phase_id || 'review'}`,
+              })),
+              true
+            );
+
+            const protocolPrompt = [
+              'Run a whole-turn semantic closure review for the current Ollmo response.',
+              '',
+              'Authority boundary:',
+              '- You are a semantic reviewer, not runtime truth.',
+              '',
+              'Return exactly one JSON object and no markdown, no prose outside JSON, no chain-of-thought.',
+              'Required schema:',
+              '{',
+              '  "kind": "ollmo.semantic_review_verdict",',
+              '  "verdict": "passed | failed | uncertain"',
+              '}',
+            ].join('\n');
+            const protocolOutput = {
+              type: 'text',
+              status: 'fulfilled',
+              value: protocolPrompt,
+            };
+            assert.strictEqual(context.assistantOutputTextHasSemanticReviewProtocol(protocolPrompt), true);
+            assert.strictEqual(context.assistantOutputTextHasInternalMarker(protocolPrompt), true);
+            assert.strictEqual(context.responseWorkItemIsInternalProjection(protocolOutput), true);
+            assert.strictEqual(context.shouldRenderAssistantOutputText(protocolOutput, [protocolOutput], null), false);
+            assert.strictEqual(
+              context.getAssistantDisplayContent(
+                { output_text: protocolPrompt, outputs: [protocolOutput] },
+                protocolPrompt
+              ),
+              'Received empty response.'
+            );
+
+            const verdictText = '{"kind":"ollmo.semantic_review_verdict","verdict":"passed"}';
+            const structurallyInternalVerdict = {
+              branch_id: 'branch-global-semantic-closure-review-feedface',
+              type: 'text',
+              status: 'fulfilled',
+              stage_direction: 'run_global_semantic_closure_review',
+              value: verdictText,
+            };
+            assert.strictEqual(
+              context.getAssistantDisplayContent(
+                { output_text: verdictText, outputs: [structurallyInternalVerdict] },
+                verdictText
+              ),
+              'Received empty response.'
+            );
+
+            const publicChatOutput = {
+              slot_id: 'output-phase-2',
+              branch_id: 'branch-chat-1',
+              phase_id: 'phase-2',
+              type: 'text',
+              status: 'fulfilled',
+              visibility: 'public',
+              surface_role: 'final_output',
+              role: 'post_artifact_text_follow_up',
+              content_payload_source: 'late_fill_infer_result',
+              value: 'Here is the public semantic review you requested.',
+            };
+            assert.strictEqual(context.assistantOutputTextHasSemanticReviewProtocol(publicChatOutput.value), false);
+            assert.strictEqual(context.responseWorkItemIsSemanticReviewProjection(publicChatOutput), false);
+            assert.strictEqual(context.responseWorkItemIsInternalProjection(publicChatOutput), false);
+            assert.strictEqual(context.shouldRenderAssistantOutputText(publicChatOutput, [publicChatOutput], null), true);
+            assert.strictEqual(
+              context.filterUserVisibleResponseWorkItems([...structuralOutputs, publicChatOutput]).length,
+              1
+            );
+        """
+        subprocess.run(
+            ["node", "-e", textwrap.dedent(script)],
+            cwd=".",
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for frontend message-state tests")
     def test_same_path_audio_artifacts_dedupe_with_partial_mime(self):
         script = r"""
             const assert = require('assert');

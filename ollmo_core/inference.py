@@ -2303,6 +2303,8 @@ _QWEN3_TTS_TOP_K = 50
 _QWEN3_TTS_REPETITION_PENALTY = 1.05
 _QWEN3_TTS_CHUNKING_POLICY_ID = 'qwen3_tts_sentence_chunks_v1'
 _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS = 16.0
+_QWEN3_TTS_BASE_CHUNK_TRIGGER_SPEECH_SECONDS = 56.0
+_QWEN3_TTS_DESIGNED_VOICE_CHUNK_TRIGGER_SPEECH_SECONDS = 28.0
 _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS = 10.0
 _QWEN3_TTS_GENERATION_LIMIT_RECOVERY_POLICY_ID = (
     'qwen3_tts_single_sequence_generation_limit_retry_v2'
@@ -2665,6 +2667,16 @@ def build_qwen3_tts_generation_budget(spoken_text: Any) -> dict[str, Any]:
     }
 
 
+def _qwen3_tts_base_segments(spoken_text: Any) -> list[str]:
+    """Return the nonempty newline segments generated independently by Base."""
+
+    return [
+        line.strip()
+        for line in str(spoken_text or '').splitlines()
+        if line.strip()
+    ]
+
+
 def _build_qwen3_tts_sampling_profile() -> dict[str, Any]:
     """Return the explicit Qwen3 sampling contract sent to MLX Audio."""
 
@@ -2769,12 +2781,46 @@ def _split_qwen3_tts_span_to_target(
     return spans
 
 
-def build_qwen3_tts_chunk_plan(spoken_text: Any) -> dict[str, Any]:
+def build_qwen3_tts_chunk_plan(
+    spoken_text: Any,
+    *,
+    tts_model_type: Optional[str] = None,
+) -> dict[str, Any]:
     """Return deterministic ordered sentence/clause spans for long Qwen speech."""
 
     text = str(spoken_text or '')
     source_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
     full_estimated_seconds = _qwen3_tts_estimated_speech_seconds(text)
+    normalized_model_type = str(tts_model_type or '').strip().lower()
+    chunk_trigger_speech_seconds = {
+        'base': _QWEN3_TTS_BASE_CHUNK_TRIGGER_SPEECH_SECONDS,
+        'custom_voice': _QWEN3_TTS_DESIGNED_VOICE_CHUNK_TRIGGER_SPEECH_SECONDS,
+        'voice_design': _QWEN3_TTS_DESIGNED_VOICE_CHUNK_TRIGGER_SPEECH_SECONDS,
+    }.get(
+        normalized_model_type,
+        _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS,
+    )
+    base_segments = (
+        _qwen3_tts_base_segments(text)
+        if normalized_model_type == 'base'
+        else []
+    )
+    trigger_basis = (
+        'longest_backend_segment'
+        if normalized_model_type == 'base'
+        else 'full_source'
+    )
+    trigger_estimated_speech_seconds = (
+        max(
+            (
+                _qwen3_tts_estimated_speech_seconds(segment)
+                for segment in base_segments
+            ),
+            default=full_estimated_seconds,
+        )
+        if normalized_model_type == 'base'
+        else full_estimated_seconds
+    )
     sentence_spans: list[tuple[int, int]] = []
     cursor = 0
     for boundary in _TTS_SENTENCE_END_RE.finditer(text):
@@ -2825,7 +2871,7 @@ def build_qwen3_tts_chunk_plan(spoken_text: Any) -> dict[str, Any]:
         ordered_span_coverage = False
 
     applied = bool(
-        full_estimated_seconds > _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS
+        trigger_estimated_speech_seconds > chunk_trigger_speech_seconds
         and len(chunk_spans) > 1
         and ordered_span_coverage
     )
@@ -2858,13 +2904,23 @@ def build_qwen3_tts_chunk_plan(spoken_text: Any) -> dict[str, Any]:
             'estimated speech exceeds the single-request long-form threshold'
             if applied
             else 'source remains within the single-request long-form threshold'
-            if full_estimated_seconds <= _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS
+            if trigger_estimated_speech_seconds <= chunk_trigger_speech_seconds
             else 'safe ordered multi-chunk coverage was not available'
         ),
         'source_sha256': source_sha256,
         'source_character_count': len(text),
         'estimated_speech_seconds': round(full_estimated_seconds, 6),
-        'trigger_speech_seconds': _QWEN3_TTS_CHUNK_TRIGGER_SPEECH_SECONDS,
+        'trigger_speech_seconds': chunk_trigger_speech_seconds,
+        'trigger_basis': trigger_basis,
+        'trigger_estimated_speech_seconds': round(
+            trigger_estimated_speech_seconds,
+            6,
+        ),
+        'backend_segment_count': (
+            len(base_segments)
+            if normalized_model_type == 'base'
+            else 1
+        ),
         'target_chunk_speech_seconds': _QWEN3_TTS_CHUNK_TARGET_SPEECH_SECONDS,
         'ordered_span_coverage': ordered_span_coverage,
         'chunk_count': len(chunks) if applied else 1,
@@ -2988,8 +3044,48 @@ def _qwen3_tts_budget_with_scope(
     tts_model_type: str,
     generation_scope: str,
 ) -> dict[str, Any]:
-    budget = dict(build_qwen3_tts_generation_budget(spoken_text))
-    budget['tts_model_type'] = str(tts_model_type or '').strip().lower() or 'unknown'
+    normalized_model_type = str(tts_model_type or '').strip().lower() or 'unknown'
+    base_segments = (
+        _qwen3_tts_base_segments(spoken_text)
+        if normalized_model_type == 'base'
+        and generation_scope == 'segmented_sequence'
+        else []
+    )
+    if base_segments:
+        segment_budgets = [
+            build_qwen3_tts_generation_budget(segment)
+            for segment in base_segments
+        ]
+        budget = dict(
+            max(
+                segment_budgets,
+                key=lambda item: int(
+                    item.get('calculated_tokens_before_clamp') or 0
+                ),
+            )
+        )
+        aggregate_budget = build_qwen3_tts_generation_budget(spoken_text)
+        budget.update(
+            {
+                'budget_scope': 'longest_backend_segment',
+                'max_tokens_application': 'per_backend_segment',
+                'backend_segment_count': len(base_segments),
+                'aggregate_source_word_count': aggregate_budget[
+                    'source_word_count'
+                ],
+                'aggregate_source_visible_character_count': aggregate_budget[
+                    'source_visible_character_count'
+                ],
+                'aggregate_estimated_speech_seconds': aggregate_budget[
+                    'estimated_speech_seconds'
+                ],
+            }
+        )
+    else:
+        budget = dict(build_qwen3_tts_generation_budget(spoken_text))
+        budget['budget_scope'] = 'full_source'
+        budget['max_tokens_application'] = 'single_backend_sequence'
+    budget['tts_model_type'] = normalized_model_type
     budget['generation_scope'] = generation_scope
     return budget
 
@@ -3003,9 +3099,7 @@ def _qwen3_tts_generation_scope(
     if model_type in {'voice_design', 'custom_voice'}:
         return 'single_sequence'
     if model_type == 'base':
-        nonempty_line_count = len(
-            [line for line in str(spoken_text or '').splitlines() if line.strip()]
-        )
+        nonempty_line_count = len(_qwen3_tts_base_segments(spoken_text))
         return (
             'segmented_sequence'
             if nonempty_line_count > 1
@@ -3209,7 +3303,10 @@ def _run_text_to_speech(ctx: InferContext, artifacts: InferArtifacts, ops: Dict[
     chunk_failure_bytes = b''
     chunk_failure_content_type = 'audio/wav'
     chunk_plan = (
-        build_qwen3_tts_chunk_plan(prompt)
+        build_qwen3_tts_chunk_plan(
+            prompt,
+            tts_model_type=tts_model_type,
+        )
         if is_qwen3_tts
         and tts_model_type in {'base', 'voice_design', 'custom_voice'}
         and resolved_response_format in {'wav', 'wave', 'x-wav'}

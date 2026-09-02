@@ -101,6 +101,54 @@ RELEASE_SKILL_DIRECTORIES = frozenset(
         Path('skills/ollmo/references'),
     }
 )
+RELEASE_REFERENCE_EXAMPLE_FILES = frozenset(
+    {
+        Path('examples/README.md'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/README.md'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/audio/narration.wav'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/documents/index.html'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/documents/styles.css'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/images/image-01.png'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/images/image-02.png'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/bundle/assets/audio/narration.wav'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/bundle/assets/css/styles.css'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/bundle/assets/images/image-01.png'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/bundle/assets/images/image-02.png'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/bundle/index.html'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/bundle/manifest.json'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/manifest.json'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/monitor-report.json'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/prompt.txt'),
+        Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/response.json'),
+        Path('examples/reference-runs/2026-08-31-evening-rain/README.md'),
+        Path('examples/reference-runs/2026-08-31-evening-rain/artifacts/audio/narration.wav'),
+        Path('examples/reference-runs/2026-08-31-evening-rain/manifest.json'),
+        Path('examples/reference-runs/2026-08-31-evening-rain/monitor-report.json'),
+        Path('examples/reference-runs/2026-08-31-evening-rain/prompt.txt'),
+        Path('examples/reference-runs/2026-08-31-evening-rain/response.json'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/README.md'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/artifacts/audio/narration.wav'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/artifacts/transcripts/transcript.md'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/manifest.json'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/monitor-report.json'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/prompt.txt'),
+        Path('examples/reference-runs/2026-08-31-lighthouse-audio-roundtrip/response.json'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/README.md'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/artifacts/images/image-01.png'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/artifacts/images/image-02.png'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/artifacts/images/image-03.png'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/manifest.json'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/monitor-report.json'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/prompt.txt'),
+        Path('examples/reference-runs/2026-09-02-funny-animal-selfies/response.json'),
+    }
+)
+RELEASE_REFERENCE_EXAMPLE_DIRECTORIES = frozenset(
+    parent
+    for path in RELEASE_REFERENCE_EXAMPLE_FILES
+    for parent in path.parents
+    if parent != Path('.') and parent.parts[0] == 'examples'
+)
 TREE_SUFFIXES = {
     'helpers': frozenset({'.py'}),
     'ollmo_core': frozenset({'.py'}),
@@ -195,7 +243,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         Path('start_multi_models.sh'),
         Path('stop_multi_models.sh'),
     }
-) | CURRENT_DIAGRAM_PATHS | RELEASE_SKILL_FILES
+) | CURRENT_DIAGRAM_PATHS | RELEASE_SKILL_FILES | RELEASE_REFERENCE_EXAMPLE_FILES
 
 FORBIDDEN_ROOT_COMPONENTS = frozenset(
     {
@@ -388,6 +436,15 @@ def discover_release_files(source_root: Path) -> dict[Path, Path]:
         _ensure_relative_release_path(relative_path)
         selected[relative_path] = source_path
 
+    for relative_path in sorted(
+        RELEASE_REFERENCE_EXAMPLE_FILES,
+        key=lambda item: item.as_posix(),
+    ):
+        source_path = source_root / relative_path
+        _assert_regular_source_file(source_path, relative_path=relative_path)
+        _ensure_relative_release_path(relative_path)
+        selected[relative_path] = source_path
+
     for directory, suffixes in TREE_SUFFIXES.items():
         for relative_path, source_path in _iter_tree_files(
             source_root,
@@ -547,6 +604,17 @@ def validate_release_tree(
             if relative_path not in allowed_paths:
                 raise ReleaseArchiveError(
                     'Release tree contains a non-public skill path: '
+                    f'{relative_path.as_posix()}'
+                )
+        if relative_path.parts[0] == 'examples':
+            allowed_paths = (
+                RELEASE_REFERENCE_EXAMPLE_DIRECTORIES
+                if path.is_dir()
+                else RELEASE_REFERENCE_EXAMPLE_FILES
+            )
+            if relative_path not in allowed_paths:
+                raise ReleaseArchiveError(
+                    'Release tree contains a non-public reference example path: '
                     f'{relative_path.as_posix()}'
                 )
         if (

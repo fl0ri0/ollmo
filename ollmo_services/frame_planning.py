@@ -8,7 +8,10 @@ from typing import Any, Iterable, Optional
 
 from ollmo_g.request_phase_graph import build_request_phase_graph, downstream_phase_records
 from ollmo_services.artifact_contracts import extract_artifact_ref, sanitize_artifact_record
-from ollmo_services.responses import extract_responses_current_turn_prompt
+from ollmo_services.responses import (
+    extract_responses_current_turn_prompt,
+    response_item_is_internal_control_work,
+)
 
 
 _TEXT_OUTPUT_CAPABILITIES = {'chat', 'ocr', 'stt', 'speech_to_text', 'vision', 'embedding'}
@@ -83,6 +86,57 @@ _TEXT_ARTIFACT_EXTENSION_ALIASES = {
     'text': 'txt',
     'xhtml': 'html',
 }
+
+_BRANCH_OUTPUT_RECORD_FIELDS = (
+    'content_payload',
+    'content_payload_source',
+    'stage_direction',
+    'phase_summary',
+    'requires_artifact',
+    'text_artifact_extension',
+    'text_artifact_source_name',
+    'text_artifact_source',
+    'text_artifact_target_path',
+    'artifact_request',
+    'role',
+    'fulfillment_policy',
+    'saved_text_path',
+    'saved_audio_path',
+    'saved_image_path',
+    'image_data_url',
+    'result',
+    'result_text',
+    'output_text',
+    'content',
+    'text',
+    'transcript',
+    'visibility',
+    'surface_role',
+    'check_kind',
+    'semantic_review_authority',
+    'execution_contract',
+    'output_contract',
+    'diagnostic_only',
+    'materialization_eligible',
+    'superseded_by',
+    'superseded_by_candidate_id',
+    'superseded_by_obligation_id',
+    'supersession_reason',
+    'cancel_requested',
+    'cancel_reason',
+    'cancelled_by',
+    'cancelled_at',
+    'waiver_reason',
+    'execution_gate',
+)
+
+
+def _branch_output_value(record: Mapping[str, Any]) -> Any:
+    for key in ('result_text', 'output_text', 'content', 'text', 'transcript', 'content_payload'):
+        value = record.get(key)
+        if value not in (None, '', [], {}):
+            return value
+    return None
 
 
 def _clean_text(value: Any) -> str:
@@ -332,6 +386,12 @@ def _normalize_artifacts(artifacts: Iterable[Mapping[str, Any]], *, role: str) -
             'materialization_eligible',
             'integrity_reason_code',
             'blocked_reason',
+            'visibility',
+            'surface_role',
+            'stage_direction',
+            'check_kind',
+            'semantic_review_authority',
+            'execution_contract',
         ):
             value = canonical.get(key)
             if value in (None, '', [], {}):
@@ -607,35 +667,7 @@ def _normalize_branch_record(raw_branch: Any) -> Optional[dict[str, Any]]:
             normalized_recovery_state['exclude_instance_ids'] = exclude_instance_ids
         if normalized_recovery_state:
             payload['recovery_state'] = normalized_recovery_state
-    for key in (
-        'content_payload',
-        'content_payload_source',
-        'stage_direction',
-        'phase_summary',
-        'requires_artifact',
-        'text_artifact_extension',
-        'text_artifact_source_name',
-        'text_artifact_source',
-        'text_artifact_target_path',
-        'artifact_request',
-        'role',
-        'fulfillment_policy',
-        'saved_text_path',
-        'saved_audio_path',
-        'saved_image_path',
-        'image_data_url',
-        'result',
-        'superseded_by',
-        'superseded_by_candidate_id',
-        'superseded_by_obligation_id',
-        'supersession_reason',
-        'cancel_requested',
-        'cancel_reason',
-        'cancelled_by',
-        'cancelled_at',
-        'waiver_reason',
-        'execution_gate',
-    ):
+    for key in _BRANCH_OUTPUT_RECORD_FIELDS:
         value = raw_branch.get(key)
         if value not in (None, '', [], {}):
             payload[key] = value
@@ -806,29 +838,7 @@ def _build_branch_output_specs(
             spec['recovery_context'] = dict(explicit.get('recovery_context') or {})
         if isinstance(explicit.get('recovery_state'), Mapping):
             spec['recovery_state'] = dict(explicit.get('recovery_state') or {})
-        for key in (
-            'content_payload',
-            'content_payload_source',
-            'stage_direction',
-            'phase_summary',
-            'requires_artifact',
-            'text_artifact_extension',
-            'text_artifact_source_name',
-            'text_artifact_source',
-            'text_artifact_target_path',
-            'artifact_request',
-            'role',
-            'fulfillment_policy',
-            'saved_text_path',
-            'saved_audio_path',
-            'saved_image_path',
-            'image_data_url',
-            'result',
-            'superseded_by',
-            'superseded_by_candidate_id',
-            'superseded_by_obligation_id',
-            'supersession_reason',
-        ):
+        for key in _BRANCH_OUTPUT_RECORD_FIELDS:
             value = explicit.get(key)
             if value in (None, '', [], {}):
                 value = phase.get(key)
@@ -863,29 +873,7 @@ def _build_branch_output_specs(
             spec['recovery_context'] = dict(explicit.get('recovery_context') or {})
         if isinstance(explicit.get('recovery_state'), Mapping):
             spec['recovery_state'] = dict(explicit.get('recovery_state') or {})
-        for key in (
-            'content_payload',
-            'content_payload_source',
-            'stage_direction',
-            'phase_summary',
-            'requires_artifact',
-            'text_artifact_extension',
-            'text_artifact_source_name',
-            'text_artifact_source',
-            'text_artifact_target_path',
-            'artifact_request',
-            'role',
-            'fulfillment_policy',
-            'saved_text_path',
-            'saved_audio_path',
-            'saved_image_path',
-            'image_data_url',
-            'result',
-            'superseded_by',
-            'superseded_by_candidate_id',
-            'superseded_by_obligation_id',
-            'supersession_reason',
-        ):
+        for key in _BRANCH_OUTPUT_RECORD_FIELDS:
             value = explicit.get(key)
             if value not in (None, '', [], {}):
                 spec[key] = value
@@ -1210,6 +1198,8 @@ def _build_output_work_nodes(
     branch_specs = _build_branch_output_specs(response_payload, request_phase_graph)
     available_artifacts: dict[str, list[dict[str, Any]]] = {}
     for artifact in output_artifacts:
+        if response_item_is_internal_control_work(artifact):
+            continue
         artifact_type = _clean_text(artifact.get('type')).lower()
         if not artifact_type:
             continue
@@ -1252,6 +1242,19 @@ def _build_output_work_nodes(
             root_node['obligation_id'] = obligation_id
         if current_phase_id:
             root_node['phase_id'] = current_phase_id
+        for key in (
+            'branch_id',
+            'stage_direction',
+            'visibility',
+            'surface_role',
+            'check_kind',
+            'semantic_review_authority',
+            'execution_contract',
+            'output_contract',
+        ):
+            value = current_phase.get(key)
+            if value not in (None, '', [], {}):
+                root_node[key] = value
         root_artifact = (
             None
             if branch_text_artifact_specs and _clean_text(root_node.get('type')).lower() in {'text', 'document'}
@@ -1280,7 +1283,8 @@ def _build_output_work_nodes(
             slot_status = _slot_status_from_phase_status(spec.get('status'))
             branch_artifact: Optional[dict[str, Any]] = None
             spec_saved_text_path = _clean_text(spec.get('saved_text_path'))
-            if _spec_requires_text_artifact(spec):
+            internal_control_work = response_item_is_internal_control_work(spec)
+            if _spec_requires_text_artifact(spec) and not internal_control_work:
                 branch_artifact = _take_text_artifact_for_spec(available_artifacts, spec)
                 if branch_artifact or spec_saved_text_path:
                     slot_status = 'fulfilled'
@@ -1304,8 +1308,24 @@ def _build_output_work_nodes(
             }
             if spec.get('obligation_id'):
                 child_node['obligation_id'] = spec.get('obligation_id')
+            for key in (
+                'stage_direction',
+                'visibility',
+                'surface_role',
+                'check_kind',
+                'semantic_review_authority',
+                'execution_contract',
+                'output_contract',
+                'diagnostic_only',
+                'materialization_eligible',
+            ):
+                value = spec.get(key)
+                if value not in (None, '', [], {}):
+                    child_node[key] = value
             if slot_status == 'fulfilled':
-                if branch_artifact:
+                if internal_control_work:
+                    artifact = None
+                elif branch_artifact:
                     artifact = branch_artifact
                 elif spec_saved_text_path and _clean_text(spec.get('output_type')).lower() == 'text':
                     artifact = _take_output_artifact_for_spec(available_artifacts, spec)
@@ -1344,8 +1364,9 @@ def _build_output_work_nodes(
                         child_node['status'] = artifact_status
                         child_node['lifecycle'] = artifact_lifecycle
                         child_node['blocked_reason'] = artifact_reason
-                if spec.get('content_payload') not in (None, '', [], {}):
-                    child_node['value'] = spec.get('content_payload')
+                branch_value = _branch_output_value(spec)
+                if branch_value not in (None, '', [], {}):
+                    child_node['value'] = branch_value
                     if spec.get('saved_text_path'):
                         child_node['artifact_path'] = spec.get('saved_text_path')
             elif slot_status == 'pending':
@@ -1446,6 +1467,18 @@ def _build_output_work_nodes(
                 'obligation_id': _clean_text(record.get('obligation_id')) or None,
                 'status': _slot_status_from_phase_status(record.get('status')),
             }
+            for key in (
+                'stage_direction',
+                'visibility',
+                'surface_role',
+                'check_kind',
+                'semantic_review_authority',
+                'execution_contract',
+                'output_contract',
+            ):
+                value = record.get(key)
+                if value not in (None, '', [], {}):
+                    follow_up_spec[key] = value
             for key in ('superseded_by', 'superseded_by_candidate_id', 'superseded_by_obligation_id', 'supersession_reason'):
                 value = record.get(key)
                 if value not in (None, '', [], {}):
@@ -1506,6 +1539,18 @@ def _build_output_work_nodes(
                 follow_up_slot['phase_id'] = follow_up_phase_id
             if follow_up_branch_id:
                 follow_up_slot['branch_id'] = follow_up_branch_id
+            for key in (
+                'stage_direction',
+                'visibility',
+                'surface_role',
+                'check_kind',
+                'semantic_review_authority',
+                'execution_contract',
+                'output_contract',
+            ):
+                value = follow_up.get(key)
+                if value not in (None, '', [], {}):
+                    follow_up_slot[key] = value
             if follow_up_status == 'pending':
                 follow_up_slot['placeholder_ref'] = f'pending-output-{next_index}'
             if follow_up_status == 'blocked':
@@ -1689,6 +1734,8 @@ def _build_output_slots_from_work_tree(work_tree: Mapping[str, Any]) -> list[dic
         node = node_map.get(_clean_text(node_id))
         if not node or _clean_text(node.get('kind')) != 'output':
             continue
+        if response_item_is_internal_control_work(node):
+            continue
         slot = {
             'slot_id': _clean_text(node.get('slot_id')) or _slot_id_from_token(node_id, fallback_index=len(slots) + 1),
             'type': _clean_text(node.get('type')) or 'artifact',
@@ -1721,12 +1768,19 @@ def _build_output_slots_from_work_tree(work_tree: Mapping[str, Any]) -> list[dic
         if _clean_text(slot.get('status')).lower() in _TERMINAL_SLOT_STATUSES:
             slot.pop('placeholder_ref', None)
         parent_node_id = _clean_text(node.get('parent_node_id'))
-        if parent_node_id and parent_node_id in node_map and _clean_text(node_map[parent_node_id].get('kind')) == 'output':
+        if (
+            parent_node_id
+            and parent_node_id in node_map
+            and _clean_text(node_map[parent_node_id].get('kind')) == 'output'
+            and not response_item_is_internal_control_work(node_map[parent_node_id])
+        ):
             slot['parent_slot_id'] = _clean_text(node_map[parent_node_id].get('slot_id'))
         child_slot_ids = [
             _clean_text(node_map[child_id].get('slot_id'))
             for child_id in (node.get('child_node_ids') if isinstance(node.get('child_node_ids'), list) else [])
-            if child_id in node_map and _clean_text(node_map[child_id].get('kind')) == 'output'
+            if child_id in node_map
+            and _clean_text(node_map[child_id].get('kind')) == 'output'
+            and not response_item_is_internal_control_work(node_map[child_id])
         ]
         if child_slot_ids:
             slot['child_slot_ids'] = child_slot_ids
@@ -1812,6 +1866,8 @@ def _artifact_lookup_by_type(artifacts: list[dict[str, Any]]) -> dict[str, list[
     lookup: dict[str, list[dict[str, Any]]] = {}
     for artifact in artifacts:
         if not isinstance(artifact, Mapping):
+            continue
+        if response_item_is_internal_control_work(artifact):
             continue
         artifact_type = _clean_text(artifact.get('type')).lower() or 'artifact'
         lookup.setdefault(artifact_type, []).append(dict(artifact))
@@ -1905,13 +1961,29 @@ def _apply_late_fill_state_to_runtime_work_tree(
                 node[node_key] = value
         if spec.get('output_type') not in (None, '', [], {}):
             node['type'] = spec.get('output_type')
+        for key in (
+            'stage_direction',
+            'visibility',
+            'surface_role',
+            'check_kind',
+            'semantic_review_authority',
+            'execution_contract',
+            'output_contract',
+            'diagnostic_only',
+            'materialization_eligible',
+        ):
+            value = spec.get(key)
+            if value not in (None, '', [], {}):
+                node[key] = value
         if slot_status in _TERMINAL_SLOT_STATUSES:
             node.pop('placeholder_ref', None)
         if slot_status == 'fulfilled':
-            artifact = (
-                _take_output_artifact_for_spec(available_artifacts, spec)
-                or _take_output_artifact_by_type(available_artifacts, str(spec.get('output_type') or node.get('type') or ''))
-            )
+            artifact = None
+            if not response_item_is_internal_control_work(spec):
+                artifact = (
+                    _take_output_artifact_for_spec(available_artifacts, spec)
+                    or _take_output_artifact_by_type(available_artifacts, str(spec.get('output_type') or node.get('type') or ''))
+                )
             if artifact:
                 node['artifact_ref'] = artifact.get('artifact_ref') or artifact.get('ref')
                 artifact_path = _clean_text(artifact.get('path') or artifact.get('source_path'))
@@ -1924,14 +1996,14 @@ def _apply_late_fill_state_to_runtime_work_tree(
                     node['status'] = artifact_status
                     node['lifecycle'] = artifact_lifecycle
                     node['blocked_reason'] = artifact_reason
-            for key in ('content_payload', 'saved_text_path', 'saved_audio_path', 'saved_image_path'):
+            branch_value = _branch_output_value(spec)
+            if branch_value not in (None, '', [], {}):
+                node['value'] = branch_value
+            for key in ('saved_text_path', 'saved_audio_path', 'saved_image_path'):
                 value = spec.get(key)
                 if value in (None, '', [], {}):
                     continue
-                if key == 'content_payload':
-                    node['value'] = value
-                else:
-                    node['artifact_path'] = value
+                node['artifact_path'] = value
         elif slot_status == 'blocked':
             node['blocked_reason'] = _blocked_reason_for_spec(spec, late_fill, response_payload)
             error_ref = _error_ref_for_spec(spec)

@@ -45,6 +45,11 @@ _TERMINAL_LATE_FILL_STATUSES = {
     'skipped',
 }
 
+_CONSUMABLE_EVIDENCE_CAPABILITIES = {
+    'speech_to_text',
+    'vision_analysis',
+}
+
 _INTERNAL_BRANCH_STATUS_LINE_RE = re.compile(
     r'^branch-[A-Za-z0-9_.-]+-\d+\s*:\s*'
     r'(?:Image|Audio|Video|Artifact|File|Text|Document)\s+'
@@ -118,11 +123,45 @@ def _looks_like_internal_branch_status_summary(value: Any) -> bool:
     return len(matching) >= 2 and len(matching) == len(lines)
 
 
+def _looks_like_internal_semantic_review_instruction(value: Any) -> bool:
+    """Recognize Ollmo's bounded reviewer protocol when metadata was lost.
+
+    Structured visibility is the authoritative boundary. This compound signature is
+    deliberately narrow and exists only for legacy/replayed payloads that retained
+    the control prompt but dropped its branch metadata.
+    """
+
+    text = str(value or '').strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        '"kind": "ollmo.semantic_review_verdict"' in lowered
+        and 'authority boundary:' in lowered
+        and 'return exactly one json object' in lowered
+        and (
+            'runtime evidence:' in lowered
+            or 'branch runtime evidence:' in lowered
+        )
+        and (
+            'semantic closure review' in lowered
+            or 'branch-local semantic review' in lowered
+        )
+    )
+
+
 def _looks_like_internal_public_text(value: Any) -> bool:
     return (
         _looks_like_internal_text_artifact_instruction(value)
         or _looks_like_internal_branch_status_summary(value)
+        or _looks_like_internal_semantic_review_instruction(value)
     )
+
+
+def response_text_is_internal_control_protocol(value: Any) -> bool:
+    """Public compatibility hook for filtering metadata-lost control text."""
+
+    return _looks_like_internal_public_text(value)
 
 
 def _looks_like_artifact_handoff_text(value: Any) -> bool:
@@ -194,7 +233,89 @@ def _truth_guard_requires_clarification(payload: Mapping[str, Any]) -> bool:
     }
 
 
+def response_item_is_internal_control_work(item: Mapping[str, Any]) -> bool:
+    """Return whether a response record is internal control evidence.
+
+    Semantic-review work decides closure but is not itself a user deliverable. The
+    producer marks that boundary explicitly; the semantic identifiers below keep
+    older response frames and partially normalized runtime records safe on replay.
+    """
+
+    if not isinstance(item, Mapping):
+        return False
+    records = [item]
+    execution_contract = item.get('execution_contract')
+    if isinstance(execution_contract, Mapping):
+        records.append(execution_contract)
+        output_contract = execution_contract.get('output_contract')
+        if isinstance(output_contract, Mapping):
+            records.append(output_contract)
+    output_contract = item.get('output_contract')
+    if isinstance(output_contract, Mapping):
+        records.append(output_contract)
+
+    for record in records:
+        visibility = str(record.get('visibility') or '').strip().lower()
+        if visibility in {'internal', 'runtime_internal', 'control', 'control_plane'}:
+            return True
+        surface_role = str(record.get('surface_role') or '').strip().lower()
+        if surface_role in {'closure_evidence', 'semantic_review_evidence', 'internal_control'}:
+            return True
+        stage_direction = str(record.get('stage_direction') or '').strip().lower()
+        if stage_direction in {
+            'run_global_semantic_closure_review',
+            'run_branch_semantic_review',
+        }:
+            return True
+        role = str(record.get('role') or '').strip().lower()
+        if role in {
+            'semantic_review_transition',
+            'branch_semantic_review_output',
+            'global_semantic_closure_review',
+        }:
+            return True
+        check_kind = str(record.get('check_kind') or '').strip().lower()
+        if check_kind in {'global_semantic_closure', 'branch_semantic_review'}:
+            return True
+        content_source = str(record.get('content_payload_source') or '').strip().lower()
+        if (
+            content_source == 'global_semantic_closure_review'
+            or content_source.startswith('branch_semantic_review:')
+        ):
+            return True
+        review_authority = str(record.get('semantic_review_authority') or '').strip().lower()
+        if (
+            'global_semantic_closure_review' in review_authority
+            or 'branch_semantic_review' in review_authority
+        ):
+            return True
+        fulfillment_policy = str(record.get('fulfillment_policy') or '').strip().lower()
+        if fulfillment_policy in {
+            'semantic_review_text_required',
+            'semantic_review_verdict_required',
+            'global_semantic_review_verdict_required',
+            'branch_semantic_review_verdict_required',
+        }:
+            return True
+
+    identifiers = ' '.join(
+        str(item.get(key) or '').strip().lower()
+        for key in ('slot_id', 'branch_id', 'phase_id', 'obligation_id', 'task_id')
+    )
+    return any(
+        token in identifiers
+        for token in (
+            'branch-global-semantic-closure-review-',
+            'global-semantic-closure-review-',
+            'branch-semantic-review-',
+            'phase-semantic-review-',
+        )
+    )
+
+
 def _output_item_is_internal_materialization(item: Mapping[str, Any]) -> bool:
+    if response_item_is_internal_control_work(item):
+        return True
     identifiers = ' '.join(
         str(item.get(key) or '').strip().lower()
         for key in ('slot_id', 'branch_id', 'phase_id')
@@ -262,6 +383,118 @@ def _output_item_is_public_post_artifact_text_follow_up(
             if record_matches(raw_branch):
                 return True
     return False
+
+
+def _suppress_consumed_evidence_text_outputs(
+    payload: Mapping[str, Any],
+    outputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep branch evidence durable without publishing it beside its final join."""
+
+    if not outputs:
+        return outputs
+
+    terminal_outputs = [
+        output
+        for output in outputs
+        if isinstance(output, Mapping)
+        and str(output.get('type') or '').strip().lower() in {'text', 'document'}
+        and str(output.get('status') or '').strip().lower() in {'completed', 'fulfilled'}
+        and str(output.get('value') or '').strip()
+        and _output_item_is_public_post_artifact_text_follow_up(payload, output)
+    ]
+    if not terminal_outputs:
+        return outputs
+
+    late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+    fill_results = [
+        result
+        for result in (late_fill.get('fill_results') or [])
+        if isinstance(result, Mapping)
+    ]
+    runtime = payload.get('runtime') if isinstance(payload.get('runtime'), Mapping) else {}
+    phase_graph = (
+        runtime.get('request_phase_graph')
+        if isinstance(runtime.get('request_phase_graph'), Mapping)
+        else {}
+    )
+    graph_records = [
+        record
+        for key in ('phases', 'downstream_branches')
+        for record in (phase_graph.get(key) or [])
+        if isinstance(record, Mapping)
+    ]
+    records = [*fill_results, *graph_records]
+
+    def tokens(record: Mapping[str, Any]) -> set[str]:
+        return {
+            str(record.get(key) or '').strip()
+            for key in ('slot_id', 'branch_id', 'phase_id')
+            if str(record.get(key) or '').strip()
+        }
+
+    terminal_values = {
+        str(output.get('value') or '').replace('\r\n', '\n').strip()
+        for output in terminal_outputs
+    }
+    consumed_dependency_ids: set[str] = set()
+    for terminal_output in terminal_outputs:
+        terminal_tokens = tokens(terminal_output)
+        for record in records:
+            if not terminal_tokens.intersection(tokens(record)):
+                continue
+            execution_contract = (
+                record.get('execution_contract')
+                if isinstance(record.get('execution_contract'), Mapping)
+                else {}
+            )
+            capability = str(
+                record.get('capability') or execution_contract.get('capability') or ''
+            ).strip().lower()
+            role = str(record.get('role') or execution_contract.get('role') or '').strip().lower()
+            if capability != 'chat' or role != 'post_artifact_text_follow_up':
+                continue
+            depends_on = record.get('depends_on') or execution_contract.get('depends_on') or []
+            if isinstance(depends_on, list):
+                consumed_dependency_ids.update(
+                    str(item or '').strip()
+                    for item in depends_on
+                    if str(item or '').strip()
+                )
+
+    consumed_evidence_tokens: set[str] = set()
+    for record in records:
+        execution_contract = (
+            record.get('execution_contract')
+            if isinstance(record.get('execution_contract'), Mapping)
+            else {}
+        )
+        capability = str(
+            record.get('capability') or execution_contract.get('capability') or ''
+        ).strip().lower()
+        record_tokens = tokens(record)
+        if (
+            capability in _CONSUMABLE_EVIDENCE_CAPABILITIES
+            and record_tokens.intersection(consumed_dependency_ids)
+        ):
+            consumed_evidence_tokens.update(record_tokens)
+
+    filtered: list[dict[str, Any]] = []
+    for output in outputs:
+        if _output_item_is_public_post_artifact_text_follow_up(payload, output):
+            filtered.append(output)
+            continue
+        output_type = str(output.get('type') or '').strip().lower()
+        if output_type not in {'text', 'document'} or _artifact_ref_token(output):
+            filtered.append(output)
+            continue
+        value = str(output.get('value') or '').replace('\r\n', '\n').strip()
+        if value and value in terminal_values:
+            continue
+        if tokens(output).intersection(consumed_evidence_tokens):
+            continue
+        filtered.append(output)
+    return filtered
 
 
 def _output_item_is_fulfilled_repair_materialization(item: Mapping[str, Any]) -> bool:
@@ -413,7 +646,7 @@ def select_public_output_text(
         response_payload.get('output_text') if fallback_text is None else fallback_text
     or '').strip()
     if _truth_guard_requires_clarification(response_payload):
-        return fallback
+        return fallback if not _looks_like_internal_public_text(fallback) else ''
     if isinstance(outputs, list):
         for item in reversed(outputs):
             if not isinstance(item, Mapping):
@@ -443,7 +676,7 @@ def select_public_output_text(
         return fallback
     if fallback and _terminal_materialization_is_fulfilled(response_payload):
         return _generic_terminal_public_output_text(response_payload)
-    return fallback
+    return ''
 
 
 def _extract_semantic_phase_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -855,6 +1088,8 @@ def _is_generated_image_text_misbinding(record: Mapping[str, Any]) -> bool:
 def _is_public_output_artifact_record(record: Mapping[str, Any]) -> bool:
     if not isinstance(record, Mapping):
         return False
+    if response_item_is_internal_control_work(record):
+        return False
     if _is_generated_image_text_misbinding(record):
         return False
     status = _status_token(record.get('status') or record.get('state'))
@@ -1194,6 +1429,10 @@ def _normalize_slot_batch_index(value: Any) -> Optional[int]:
 
 
 def _slot_allows_implicit_artifact_assignment(slot: Mapping[str, Any]) -> bool:
+    status = str(slot.get('status') or '').strip().lower()
+    if status not in {'fulfilled', 'completed'}:
+        return False
+
     slot_type = str(slot.get('type') or '').strip().lower()
     if slot_type not in {'text', 'document'}:
         return True
@@ -1614,10 +1853,10 @@ def build_canonical_outputs(
     public_slots = [
         slot
         for slot in normalized_slots
-        if not _output_item_is_fulfilled_repair_materialization(slot)
+        if not response_item_is_internal_control_work(slot)
+        and not _output_item_is_fulfilled_repair_materialization(slot)
     ]
-    if public_slots:
-        normalized_slots = public_slots
+    normalized_slots = public_slots
     normalized_artifacts = artifacts if isinstance(artifacts, list) else []
     outputs = _assign_output_artifacts_from_slots(
         normalized_slots,
@@ -1651,12 +1890,13 @@ def build_canonical_outputs(
         filtered_outputs = [
             output
             for output in outputs
-            if not _output_item_is_fulfilled_repair_materialization(output)
+            if not response_item_is_internal_control_work(output)
+            and not _output_item_is_fulfilled_repair_materialization(output)
         ]
-        if filtered_outputs:
-            outputs = filtered_outputs
+        outputs = filtered_outputs
         outputs = _hydrate_artifact_backed_text_output_values(outputs, normalized_artifacts)
         outputs = _suppress_provisional_artifact_bundle_text_outputs(outputs)
+        outputs = _suppress_consumed_evidence_text_outputs(response_payload, outputs)
         return outputs
     fallback_text = str(response_payload.get('content_payload') or response_payload.get('output_text') or '').strip()
     if _looks_like_internal_public_text(fallback_text):
@@ -1785,8 +2025,18 @@ def hoist_response_output_surfaces(payload: Mapping[str, Any]) -> dict[str, Any]
     )
     planning = response_frame.get('planning') if isinstance(response_frame.get('planning'), Mapping) else {}
     artifact_flow = planning.get('artifact_flow') if isinstance(planning.get('artifact_flow'), Mapping) else {}
-    frame_output_slots = artifact_flow.get('output_slots') if isinstance(artifact_flow.get('output_slots'), list) else []
-    payload_output_slots = response_payload.get('output_slots') if isinstance(response_payload.get('output_slots'), list) else []
+    frame_output_slots = [
+        dict(slot)
+        for slot in (artifact_flow.get('output_slots') or [])
+        if isinstance(slot, Mapping)
+        and not response_item_is_internal_control_work(slot)
+    ] if isinstance(artifact_flow.get('output_slots'), list) else []
+    payload_output_slots = [
+        dict(slot)
+        for slot in (response_payload.get('output_slots') or [])
+        if isinstance(slot, Mapping)
+        and not response_item_is_internal_control_work(slot)
+    ] if isinstance(response_payload.get('output_slots'), list) else []
     output_slots = payload_output_slots or frame_output_slots
     work_tree = planning.get('work_tree') if isinstance(planning.get('work_tree'), Mapping) else {}
     artifacts = response_payload.get('artifacts') if isinstance(response_payload.get('artifacts'), list) else []
@@ -1798,8 +2048,24 @@ def hoist_response_output_surfaces(payload: Mapping[str, Any]) -> dict[str, Any]
     if output_slots:
         response_payload['output_slots'] = output_slots
         response_payload['output_branches'] = build_public_output_branches_from_slots(output_slots)
-    output_branches = response_payload.get('output_branches') if isinstance(response_payload.get('output_branches'), list) else []
-    existing_outputs = response_payload.get('outputs') if isinstance(response_payload.get('outputs'), list) else []
+    else:
+        response_payload.pop('output_slots', None)
+    output_branches = [
+        dict(branch)
+        for branch in (response_payload.get('output_branches') or [])
+        if isinstance(branch, Mapping)
+        and not response_item_is_internal_control_work(branch)
+    ] if isinstance(response_payload.get('output_branches'), list) else []
+    if output_branches:
+        response_payload['output_branches'] = output_branches
+    else:
+        response_payload.pop('output_branches', None)
+    existing_outputs = [
+        dict(output)
+        for output in (response_payload.get('outputs') or [])
+        if isinstance(output, Mapping)
+        and not response_item_is_internal_control_work(output)
+    ] if isinstance(response_payload.get('outputs'), list) else []
     explicit_existing_outputs = (
         bool(existing_outputs)
         and not output_slots
@@ -1842,9 +2108,18 @@ def hoist_response_output_surfaces(payload: Mapping[str, Any]) -> dict[str, Any]
                 if output.get(key) in (None, '', [], {}) and existing.get(key) not in (None, '', [], {}):
                     output[key] = existing.get(key)
     outputs = _hydrate_artifact_backed_text_output_values(outputs, artifacts)
+    outputs = [
+        output
+        for output in outputs
+        if isinstance(output, dict)
+        and not response_item_is_internal_control_work(output)
+    ]
     outputs = _suppress_provisional_artifact_bundle_text_outputs(outputs)
+    outputs = _suppress_consumed_evidence_text_outputs(response_payload, outputs)
     if outputs:
         response_payload['outputs'] = outputs
+    else:
+        response_payload.pop('outputs', None)
     public_artifacts = filter_public_response_artifacts(
         response_payload,
         artifacts,
@@ -1872,6 +2147,38 @@ def hoist_response_output_surfaces(payload: Mapping[str, Any]) -> dict[str, Any]
             response_id=str(response_payload.get('id') or f'resp_{uuid.uuid4().hex}'),
             message_id=str(existing_item.get('id') or f'msg_{uuid.uuid4().hex}'),
         )
+    else:
+        response_payload.pop('output_text', None)
+        raw_output = response_payload.get('output')
+        if isinstance(raw_output, list):
+            retained_output: list[dict[str, Any]] = []
+            for raw_item in raw_output:
+                if not isinstance(raw_item, Mapping):
+                    continue
+                if response_item_is_internal_control_work(raw_item):
+                    continue
+                content = raw_item.get('content') if isinstance(raw_item.get('content'), list) else []
+                texts = [
+                    str(part.get('text') or '').strip()
+                    for part in content
+                    if isinstance(part, Mapping)
+                    and str(part.get('type') or '').strip() == 'output_text'
+                    and str(part.get('text') or '').strip()
+                ]
+                if texts and all(_looks_like_internal_public_text(value) for value in texts):
+                    continue
+                retained_output.append(dict(raw_item))
+            if retained_output:
+                response_payload['output'] = retained_output
+            else:
+                response_payload.pop('output', None)
+        result_value = response_payload.get('result')
+        if (
+            response_item_is_internal_control_work(result_value)
+            if isinstance(result_value, Mapping)
+            else _looks_like_internal_public_text(result_value)
+        ):
+            response_payload.pop('result', None)
     return response_payload
 
 

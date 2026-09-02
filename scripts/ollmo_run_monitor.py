@@ -19,7 +19,6 @@ from typing import Any
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
-IDLE_AUTO_PAUSE_CHECKS = 4
 
 
 def _utc_now() -> str:
@@ -2734,6 +2733,27 @@ def _load_last_seen(state_dir: Path) -> dict[str, Any]:
         return {}
 
 
+def _load_reported_ids(path: Path) -> set[str]:
+    reported_ids: set[str] = set()
+    for _, _, record in _iter_jsonl(path):
+        if not isinstance(record, dict):
+            continue
+        response_id = record.get('response_id')
+        if isinstance(response_id, str) and response_id.strip():
+            reported_ids.add(response_id)
+    return reported_ids
+
+
+def _drop_legacy_idle_state(last_seen: dict[str, Any]) -> None:
+    for key in (
+        'idle_no_running_auto_pause_recommended',
+        'idle_no_running_check_count',
+        'idle_no_running_last_checked_at',
+        'idle_no_running_latest_response_id',
+    ):
+        last_seen.pop(key, None)
+
+
 def _save_last_seen(state_dir: Path, data: dict[str, Any]) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     tmp = state_dir / 'last_seen.json.tmp'
@@ -2755,31 +2775,36 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
         return 0
 
     last_seen = _load_last_seen(state_dir)
-    last_terminal = last_seen.get('terminal_reported_response_id')
-    if last_terminal in order:
-        new_candidate_ids = order[order.index(last_terminal) + 1:]
-    else:
-        new_candidate_ids = [order[-1]]
-
-    retry_running_ids = [
+    _drop_legacy_idle_state(last_seen)
+    reported_ids = _load_reported_ids(state_dir / 'reports.jsonl')
+    tracked_running_ids = [
         response_id
         for response_id in last_seen.get('running_unreported_response_ids') or []
-        if response_id in latest
+        if isinstance(response_id, str) and response_id and response_id not in reported_ids
     ]
-    candidate_ids = []
-    seen_candidate_ids = set()
-    for response_id in [*retry_running_ids, *new_candidate_ids]:
-        if response_id in seen_candidate_ids:
-            continue
-        candidate_ids.append(response_id)
-        seen_candidate_ids.add(response_id)
+    candidate_ids = [response_id for response_id in order if response_id not in reported_ids]
+    candidate_id_set = set(candidate_ids)
+    for response_id in tracked_running_ids:
+        if response_id not in candidate_id_set:
+            candidate_ids.append(response_id)
+            candidate_id_set.add(response_id)
 
     emitted = 0
     still_running_ids: list[str] = []
     for response_id in candidate_ids:
-        next_index = order.index(response_id) + 1
-        next_id = order[next_index] if next_index < len(order) else None
-        report = _build_report(root, response_id, next_id, latest[response_id])
+        if response_id in reported_ids:
+            continue
+        if response_id in latest:
+            next_index = order.index(response_id) + 1
+            next_id = order[next_index] if next_index < len(order) else None
+        else:
+            next_id = None
+        report = _build_report(
+            root,
+            response_id,
+            next_id,
+            latest.get(response_id, {'line': 0, 'bytes': 0}),
+        )
 
         if report['verdict'] == 'running':
             # Terminal-only monitor: do not emit or persist live/running snapshots.
@@ -2789,6 +2814,7 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
             continue
 
         _append(state_dir / 'reports.jsonl', json.dumps(report, sort_keys=True) + '\n')
+        reported_ids.add(response_id)
         _append(
             state_dir / 'reports.md',
             f"\n\n## {report['response_id']} ({report['reported_at']})\n\n{report['human_report']}\n",
@@ -2811,15 +2837,7 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
                     'backfill_terminal_reported_at': report.get('reported_at'),
                 }
             )
-        last_seen.update(
-            {
-                'idle_no_running_check_count': 0,
-                'idle_no_running_last_checked_at': None,
-                'idle_no_running_latest_response_id': None,
-                'running_snapshot_response_id': None,
-                'idle_no_running_auto_pause_recommended': False,
-            }
-        )
+        last_seen['running_snapshot_response_id'] = None
         _save_last_seen(state_dir, last_seen)
         if not quiet:
             print(report['human_report'])
@@ -2829,11 +2847,9 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
     if emitted:
         last_seen.update(
             {
-                'idle_no_running_check_count': 0,
-                'idle_no_running_last_checked_at': None,
-                'idle_no_running_latest_response_id': None,
                 'running_unreported_response_ids': still_running_ids,
-                'idle_no_running_auto_pause_recommended': False,
+                'reconciled_at': _utc_now(),
+                'reported_response_count': len(reported_ids),
             }
         )
         _save_last_seen(state_dir, last_seen)
@@ -2842,11 +2858,9 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
     if still_running_ids:
         last_seen.update(
             {
-                'idle_no_running_check_count': 0,
-                'idle_no_running_last_checked_at': None,
-                'idle_no_running_latest_response_id': None,
                 'running_unreported_response_ids': still_running_ids,
-                'idle_no_running_auto_pause_recommended': False,
+                'reconciled_at': _utc_now(),
+                'reported_response_count': len(reported_ids),
             }
         )
         _save_last_seen(state_dir, last_seen)
@@ -2863,40 +2877,25 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
             )
         return 0
 
-    if last_seen.get('idle_no_running_auto_pause_recommended'):
-        idle_count = 0
-    else:
-        idle_count = int(last_seen.get('idle_no_running_check_count') or 0) + 1
-    now = _utc_now()
     last_seen.update(
         {
-            'idle_no_running_check_count': idle_count,
-            'idle_no_running_last_checked_at': now,
-            'idle_no_running_latest_response_id': order[-1],
             'running_unreported_response_ids': [],
-            'idle_no_running_auto_pause_recommended': False,
+            'reconciled_at': _utc_now(),
+            'reported_response_count': len(reported_ids),
         }
     )
     _save_last_seen(state_dir, last_seen)
 
-    if emitted == 0 and not quiet:
-        status = (
-            'auto_pause_recommended'
-            if idle_count >= IDLE_AUTO_PAUSE_CHECKS
-            else ('no_new_terminal_reports' if candidate_ids else 'no_change')
+    if not quiet:
+        print(
+            json.dumps(
+                {
+                    'latest_response_id': order[-1],
+                    'status': 'no_new_terminal_reports' if candidate_ids else 'no_change',
+                },
+                sort_keys=True,
+            )
         )
-        payload = {
-            'auto_pause_threshold': IDLE_AUTO_PAUSE_CHECKS,
-            'idle_no_running_check_count': idle_count,
-            'latest_response_id': order[-1],
-            'nothing_running': True,
-            'status': status,
-        }
-        if status == 'auto_pause_recommended':
-            payload['reason'] = 'no_running_responses_after_consecutive_checks'
-            last_seen['idle_no_running_auto_pause_recommended'] = True
-            _save_last_seen(state_dir, last_seen)
-        print(json.dumps(payload, sort_keys=True))
     return 0
 
 

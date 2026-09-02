@@ -8,6 +8,7 @@ from ollmo_g.execution_planner import (
     split_visible_image_payload,
 )
 from ollmo_g.control_hints import infer_tts_instruct_from_prompt
+from ollmo_g.intent import analyze_prompt_intent
 from ollmo_g.request_ir import build_request_ir
 from ollmo_g.request_phase_graph import (
     build_request_phase_graph,
@@ -15,6 +16,7 @@ from ollmo_g.request_phase_graph import (
     next_executable_downstream_branches,
 )
 from ollmo_g.router import _sanitize_workload_task_proposals
+from ollmo_services.tts_source import resolve_explicit_tts_source
 
 
 class GhostExecutionPlannerTests(unittest.TestCase):
@@ -2250,6 +2252,62 @@ class GhostExecutionPlannerTests(unittest.TestCase):
             [branch['depends_on'] for branch in graph['downstream_branches']],
             [['phase-1'], ['phase-2'], ['phase-3']],
         )
+
+    def test_request_phase_graph_self_proofs_exact_tts_output(self):
+        spoken_text = 'At sunrise, the harbor slowly came alive.'
+        for opening_quote, closing_quote in (("\"", "\""), ('“', '”')):
+            with self.subTest(opening_quote=opening_quote):
+                prompt = (
+                    'Create exactly one English WAV audio artifact using local text-to-speech. '
+                    f'Speak exactly: {opening_quote}{spoken_text}{closing_quote} '
+                    'Then transcribe the actually generated audio and report whether the '
+                    'transcript matches the spoken source. Do not create an image.'
+                )
+
+                source = resolve_explicit_tts_source(prompt)
+                intent = analyze_prompt_intent(prompt)
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload={'ghost_route': True},
+                    route_payload={
+                        'capability': 'chat',
+                        'route_source': 'ghost_carried',
+                    },
+                )
+                branches = downstream_phase_records(graph)
+
+                self.assertEqual(source['source_kind'], 'quoted_literal')
+                self.assertEqual(source['text'], spoken_text)
+                self.assertTrue(intent['requests_audio_output'])
+                self.assertTrue(intent['requests_speech_to_text_output'])
+                self.assertFalse(intent['requests_visual_output'])
+                self.assertEqual(
+                    [branch['capability'] for branch in branches],
+                    ['text_to_speech', 'speech_to_text', 'chat'],
+                )
+                self.assertEqual(branches[0]['content_payload'], spoken_text)
+                self.assertEqual(branches[1]['depends_on'], [branches[0]['phase_id']])
+                self.assertEqual(branches[2]['depends_on'], [branches[1]['phase_id']])
+                self.assertFalse(
+                    any(
+                        branch['capability'] == 'image_generation'
+                        and branch['output_contract']['required']
+                        for branch in graph['phases']
+                    )
+                )
+
+    def test_stt_voice_description_does_not_create_tts_work(self):
+        prompt = 'Transcribe this audio with a male voice.'
+        intent = analyze_prompt_intent(prompt)
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertFalse(intent['requests_audio_output'])
+        self.assertTrue(intent['requests_speech_to_text_output'])
+        self.assertNotIn('text_to_speech', graph['downstream_capabilities'])
 
     def test_request_phase_graph_promotes_input_audio_stt_before_dependent_tts(self):
         graph = build_request_phase_graph(

@@ -257,6 +257,102 @@ def _normalize_criterion_results(value: Any) -> list[dict[str, Any]]:
     return results
 
 
+def _criterion_identity(value: Any) -> str:
+    return re.sub(r'[^a-z0-9_]+', '_', _clean_text(value).lower()).strip('_')
+
+
+def semantic_review_verdict_freeze_acceptance(
+    verdict: Any,
+    *,
+    required_criteria: Any = (),
+) -> dict[str, Any]:
+    """Validate the exact structured contract required for a truthful freeze.
+
+    Normalized semantic verdicts remain useful advisory evidence even when they
+    were parsed from legacy or loose model output.  This stricter check is the
+    authority boundary used by Closure: normalization alone must never promote
+    a loose payload into a passed global semantic review.
+    """
+
+    payload = dict(verdict) if isinstance(verdict, Mapping) else {}
+    declared_schema = (
+        dict(payload.get('declared_schema'))
+        if isinstance(payload.get('declared_schema'), Mapping)
+        else {}
+    )
+    required: list[str] = []
+    required_by_identity: dict[str, str] = {}
+    for item in required_criteria if isinstance(required_criteria, (list, tuple)) else []:
+        text = _clean_text(item)
+        identity = _criterion_identity(text)
+        if not text or not identity or identity in required_by_identity:
+            continue
+        required_by_identity[identity] = text
+        required.append(text)
+
+    result_statuses: dict[str, list[str]] = {}
+    for item in payload.get('criterion_results') or []:
+        if not isinstance(item, Mapping):
+            continue
+        identity = _criterion_identity(item.get('criterion'))
+        if not identity:
+            continue
+        result_statuses.setdefault(identity, []).append(
+            _normalize_criterion_status(item.get('status'))
+        )
+
+    missing_criteria: list[str] = []
+    nonpassed_criteria: list[str] = []
+    for identity, text in required_by_identity.items():
+        statuses = result_statuses.get(identity) or []
+        if not statuses:
+            missing_criteria.append(text)
+        elif any(status != VERDICT_PASSED for status in statuses):
+            nonpassed_criteria.append(text)
+
+    rejection_reasons: list[str] = []
+    if payload.get('parse_status') != 'parsed':
+        rejection_reasons.append('missing_parseable_verdict')
+    if declared_schema.get('kind') != SEMANTIC_REVIEW_VERDICT_KIND:
+        rejection_reasons.append('kind_not_explicit_or_invalid')
+    if declared_schema.get('verdict') != VERDICT_PASSED:
+        rejection_reasons.append('verdict_not_explicit_passed')
+    if payload.get('verdict') != VERDICT_PASSED:
+        rejection_reasons.append('normalized_verdict_not_passed')
+    if declared_schema.get('recommended_transition') != TRANSITION_TRUTHFUL_FREEZE:
+        rejection_reasons.append('transition_not_explicit_truthful_freeze')
+    if payload.get('recommended_transition') != TRANSITION_TRUTHFUL_FREEZE:
+        rejection_reasons.append('normalized_transition_not_truthful_freeze')
+    if declared_schema.get('defects_is_empty_array') is not True or payload.get('defects') not in (None, []):
+        rejection_reasons.append('defects_not_explicitly_empty')
+    if declared_schema.get('evidence_refs_is_array') is not True or not payload.get('evidence_refs'):
+        rejection_reasons.append('missing_evidence_refs')
+    if required and declared_schema.get('criterion_results_is_array') is not True:
+        rejection_reasons.append('criterion_results_not_explicit_array')
+    if missing_criteria:
+        rejection_reasons.append('required_criteria_missing')
+    if nonpassed_criteria:
+        rejection_reasons.append('required_criteria_not_passed')
+
+    accepted = not rejection_reasons
+    return _compact_mapping(
+        {
+            'kind': 'ollmo.semantic_review_freeze_acceptance',
+            'status': 'accepted' if accepted else 'rejected',
+            'accepted': accepted,
+            'required_criteria': required,
+            'missing_criteria': missing_criteria,
+            'nonpassed_criteria': nonpassed_criteria,
+            'rejection_reasons': rejection_reasons,
+            'reason': (
+                'semantic review verdict satisfies the truthful-freeze contract'
+                if accepted
+                else 'semantic review verdict does not satisfy the truthful-freeze contract'
+            ),
+        }
+    )
+
+
 def normalize_semantic_review_verdict(
     value: Any,
     *,
@@ -279,6 +375,17 @@ def normalize_semantic_review_verdict(
             source_format = 'legacy_headings' if raw else ''
 
     parse_status = 'parsed' if raw else 'missing_structured_verdict'
+    # Rebuild schema provenance from the actual top-level fields every time.
+    # A model-supplied ``declared_schema`` mapping is advisory data, not an
+    # authority token, even when the payload resembles our normalized shape.
+    declared_schema = {
+        'kind': _clean_text(raw.get('kind')),
+        'verdict': _clean_text(raw.get('verdict')).lower(),
+        'recommended_transition': _clean_text(raw.get('recommended_transition')).lower(),
+        'defects_is_empty_array': isinstance(raw.get('defects'), list) and not raw.get('defects'),
+        'evidence_refs_is_array': isinstance(raw.get('evidence_refs'), list),
+        'criterion_results_is_array': isinstance(raw.get('criterion_results'), list),
+    }
     verdict = _normalize_verdict(
         raw.get('verdict')
         or raw.get('overall_status')
@@ -327,13 +434,19 @@ def normalize_semantic_review_verdict(
         'criterion_results': criterion_results,
         'evidence_refs': evidence_refs,
         'defects': defects,
+        'declared_schema': declared_schema,
         'authority_boundary': (
             _clean_text(raw.get('authority_boundary')) if raw else ''
         ) or 'advisory_review_only_runtime_contracts_closure_decide_truth',
     }
     if parse_status == 'missing_structured_verdict':
         payload['reason'] = 'semantic review branch completed without a parseable verdict'
-    return _compact_mapping(payload)
+    normalized = _compact_mapping(payload)
+    # Preserve the explicit empty-array declaration through an internal
+    # normalize/re-normalize cycle; Closure distinguishes it from omission.
+    if declared_schema.get('defects_is_empty_array') is True:
+        normalized['defects'] = []
+    return normalized
 
 
 def semantic_review_verdict_from_text(

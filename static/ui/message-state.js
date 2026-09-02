@@ -574,6 +574,7 @@ function isGeneratedImageTextMisbindingArtifact(artifact = {}) {
 
 function isPublicArtifactOutputItem(output = {}) {
     if (!output || typeof output !== 'object') return false;
+    if (responseWorkItemIsInternalProjection(output)) return false;
     if (isGeneratedImageTextMisbindingArtifact(output)) return false;
     const status = String(output.status || output.state || '').trim().toLowerCase().replace(/[-\s]+/g, '_');
     if (NON_PUBLIC_OUTPUT_ARTIFACT_STATUSES.has(status)) return false;
@@ -698,6 +699,14 @@ function sanitizeResponseOutputSlots(value) {
                 type: String(slot.type || '').trim().toLowerCase() || null,
                 status: String(slot.status || '').trim().toLowerCase() || null,
                 lifecycle: String(slot.lifecycle || '').trim().toLowerCase() || null,
+                visibility: String(slot.visibility || '').trim().toLowerCase() || null,
+                surface_role: String(slot.surface_role || slot.surfaceRole || '').trim().toLowerCase() || null,
+                stage_direction: String(slot.stage_direction || slot.stageDirection || '').trim().toLowerCase() || null,
+                role: String(slot.role || '').trim().toLowerCase() || null,
+                check_kind: String(slot.check_kind || slot.checkKind || '').trim().toLowerCase() || null,
+                content_payload_source: String(slot.content_payload_source || slot.contentPayloadSource || '').trim().toLowerCase() || null,
+                semantic_review_authority: String(slot.semantic_review_authority || slot.semanticReviewAuthority || '').trim().toLowerCase() || null,
+                fulfillment_policy: String(slot.fulfillment_policy || slot.fulfillmentPolicy || '').trim().toLowerCase() || null,
                 artifact_ref: String(slot.artifact_ref || slot.artifactRef || '').trim() || null,
                 placeholder_ref: String(slot.placeholder_ref || slot.placeholderRef || '').trim() || null,
                 blocked_reason: String(slot.blocked_reason || slot.blockedReason || '').trim() || null,
@@ -705,6 +714,8 @@ function sanitizeResponseOutputSlots(value) {
                 follow_up_source: String(slot.follow_up_source || slot.followUpSource || '').trim() || null,
                 branch_id: String(slot.branch_id || slot.branchId || '').trim() || null,
                 phase_id: String(slot.phase_id || slot.phaseId || '').trim() || null,
+                task_id: String(slot.task_id || slot.taskId || '').trim() || null,
+                obligation_id: String(slot.obligation_id || slot.obligationId || '').trim() || null,
                 parent_slot_id: String(slot.parent_slot_id || slot.parentSlotId || '').trim() || null,
                 child_slot_ids: Array.isArray(slot.child_slot_ids || slot.childSlotIds)
                     ? (slot.child_slot_ids || slot.childSlotIds).map((item) => String(item || '').trim()).filter(Boolean)
@@ -743,13 +754,19 @@ function sanitizeResponseOutputBranches(value) {
                 slot_id: String(branch.slot_id || branch.slotId || '').trim() || null,
                 branch_id: String(branch.branch_id || branch.branchId || '').trim() || null,
                 phase_id: String(branch.phase_id || branch.phaseId || '').trim() || null,
+                task_id: String(branch.task_id || branch.taskId || '').trim() || null,
+                obligation_id: String(branch.obligation_id || branch.obligationId || '').trim() || null,
                 type: String(branch.type || '').trim().toLowerCase() || null,
                 capability: normalizeCapability(branch.capability || branch.follow_up_capability || branch.followUpCapability || '') || null,
                 output_type: String(branch.output_type || branch.outputType || branch.type || '').trim().toLowerCase() || null,
                 status: String(branch.status || '').trim().toLowerCase() || null,
                 lifecycle: String(branch.lifecycle || '').trim().toLowerCase() || null,
+                visibility: String(branch.visibility || '').trim().toLowerCase() || null,
+                surface_role: String(branch.surface_role || branch.surfaceRole || '').trim().toLowerCase() || null,
+                stage_direction: String(branch.stage_direction || branch.stageDirection || '').trim().toLowerCase() || null,
                 follow_up_capability: normalizeCapability(branch.follow_up_capability || branch.followUpCapability || '') || null,
                 role: String(branch.role || '').trim() || null,
+                check_kind: String(branch.check_kind || branch.checkKind || '').trim().toLowerCase() || null,
                 phase_summary: String(branch.phase_summary || branch.phaseSummary || '').trim() || null,
                 objective: String(branch.objective || '').trim() || null,
                 deliverable: String(branch.deliverable || '').trim() || null,
@@ -759,6 +776,8 @@ function sanitizeResponseOutputBranches(value) {
                 source: String(branch.source || '').trim() || null,
                 source_name: String(branch.source_name || branch.sourceName || '').trim() || null,
                 content_payload_source: String(branch.content_payload_source || branch.contentPayloadSource || '').trim() || null,
+                semantic_review_authority: String(branch.semantic_review_authority || branch.semanticReviewAuthority || '').trim().toLowerCase() || null,
+                fulfillment_policy: String(branch.fulfillment_policy || branch.fulfillmentPolicy || '').trim().toLowerCase() || null,
                 review_criteria: Array.isArray(branch.review_criteria || branch.reviewCriteria)
                     ? (branch.review_criteria || branch.reviewCriteria).map((item) => String(item || '').trim()).filter(Boolean)
                     : [],
@@ -814,15 +833,26 @@ function sanitizeResponseOutputs(value) {
                 slot_id: String(output.slot_id || output.slotId || '').trim() || null,
                 branch_id: String(output.branch_id || output.branchId || '').trim() || null,
                 phase_id: String(output.phase_id || output.phaseId || '').trim() || null,
+                task_id: String(output.task_id || output.taskId || '').trim() || null,
+                obligation_id: String(output.obligation_id || output.obligationId || '').trim() || null,
                 type: String(output.type || '').trim().toLowerCase() || null,
                 status: String(output.status || '').trim().toLowerCase() || null,
                 lifecycle: String(output.lifecycle || '').trim().toLowerCase() || null,
+                visibility: String(output.visibility || '').trim().toLowerCase() || null,
+                surface_role: String(output.surface_role || output.surfaceRole || '').trim().toLowerCase() || null,
+                stage_direction: String(output.stage_direction || output.stageDirection || '').trim().toLowerCase() || null,
+                role: String(output.role || '').trim().toLowerCase() || null,
+                check_kind: String(output.check_kind || output.checkKind || '').trim().toLowerCase() || null,
+                content_payload_source: String(output.content_payload_source || output.contentPayloadSource || '').trim().toLowerCase() || null,
+                semantic_review_authority: String(output.semantic_review_authority || output.semanticReviewAuthority || '').trim().toLowerCase() || null,
+                fulfillment_policy: String(output.fulfillment_policy || output.fulfillmentPolicy || '').trim().toLowerCase() || null,
                 artifact_ref: String(output.artifact_ref || output.artifactRef || '').trim() || null,
                 placeholder_ref: String(output.placeholder_ref || output.placeholderRef || '').trim() || null,
                 blocked_reason: String(output.blocked_reason || output.blockedReason || '').trim() || null,
                 parent_slot_id: String(output.parent_slot_id || output.parentSlotId || '').trim() || null,
                 follow_up_capability: normalizeCapability(output.follow_up_capability || output.followUpCapability || '') || null,
                 value: String(output.value || '').trim() || null,
+                content_payload: String(output.content_payload || output.contentPayload || '').trim() || null,
                 child_slot_ids: Array.isArray(output.child_slot_ids || output.childSlotIds)
                     ? (output.child_slot_ids || output.childSlotIds).map((item) => String(item || '').trim()).filter(Boolean)
                     : [],
@@ -870,9 +900,19 @@ function buildOutputsFromSlots(payload = {}, outputSlots = [], artifacts = []) {
                 slot_id: slot.slot_id || null,
                 branch_id: slot.branch_id || slot.phase_id || null,
                 phase_id: slot.phase_id || slot.branch_id || null,
+                task_id: slot.task_id || null,
+                obligation_id: slot.obligation_id || null,
                 type: slot.type || null,
                 status: slot.status || null,
                 lifecycle: slot.lifecycle || null,
+                visibility: slot.visibility || null,
+                surface_role: slot.surface_role || null,
+                stage_direction: slot.stage_direction || null,
+                role: slot.role || null,
+                check_kind: slot.check_kind || null,
+                content_payload_source: slot.content_payload_source || null,
+                semantic_review_authority: slot.semantic_review_authority || null,
+                fulfillment_policy: slot.fulfillment_policy || null,
                 artifact_ref: slot.artifact_ref || null,
                 placeholder_ref: slot.placeholder_ref || null,
                 blocked_reason: slot.blocked_reason || null,
@@ -925,9 +965,19 @@ function buildOutputBranchesFromSlots(outputSlots = []) {
                 slot_id: String(slot.slot_id || '').trim() || null,
                 branch_id: String(slot.branch_id || slot.phase_id || '').trim() || null,
                 phase_id: String(slot.phase_id || slot.branch_id || '').trim() || null,
+                task_id: String(slot.task_id || '').trim() || null,
+                obligation_id: String(slot.obligation_id || '').trim() || null,
                 type: String(slot.type || '').trim().toLowerCase() || null,
                 status: String(slot.status || '').trim().toLowerCase() || null,
                 lifecycle: String(slot.lifecycle || '').trim().toLowerCase() || null,
+                visibility: String(slot.visibility || '').trim().toLowerCase() || null,
+                surface_role: String(slot.surface_role || '').trim().toLowerCase() || null,
+                stage_direction: String(slot.stage_direction || '').trim().toLowerCase() || null,
+                role: String(slot.role || '').trim().toLowerCase() || null,
+                check_kind: String(slot.check_kind || '').trim().toLowerCase() || null,
+                content_payload_source: String(slot.content_payload_source || '').trim().toLowerCase() || null,
+                semantic_review_authority: String(slot.semantic_review_authority || '').trim().toLowerCase() || null,
+                fulfillment_policy: String(slot.fulfillment_policy || '').trim().toLowerCase() || null,
                 follow_up_capability: normalizeCapability(slot.follow_up_capability || '') || null,
                 artifact_ref: String(slot.artifact_ref || '').trim() || null,
                 placeholder_ref: String(slot.placeholder_ref || '').trim() || null,
@@ -1892,8 +1942,12 @@ function isSelectedMessageReferenceForMessage(message) {
 
 function getAssistantDisplayContent(payload = {}, preferredText = '') {
     const preferredPreviewText = String(preferredText || '').trim();
+    const semanticReviewProjectionTexts = responsePayloadSemanticReviewProjectionTexts(payload);
+    const preferredPreviewIsInternalReview = assistantOutputTextHasSemanticReviewProtocol(preferredPreviewText)
+        || semanticReviewProjectionTexts.has(normalizeAssistantOutputTextForComparison(preferredPreviewText));
     if (
         preferredPreviewText
+        && !preferredPreviewIsInternalReview
         && typeof assistantPreviewTextIsWorthPreserving === 'function'
         && assistantPreviewTextIsWorthPreserving(preferredPreviewText)
     ) {
@@ -1967,8 +2021,12 @@ function getAssistantDisplayContent(payload = {}, preferredText = '') {
         || displayOutputSlots.some((slot) => String(slot.artifact_ref || slot.ref || '').trim());
     const fallbackText = extractAssistantResponseText(payload, preferredText);
     const suppressFallbackArtifactDump = (
-        (artifacts.length > 0 || outputArtifactContext)
-        && assistantOutputTextHasInternalMarker(fallbackText)
+        assistantOutputTextHasSemanticReviewProtocol(fallbackText)
+        || semanticReviewProjectionTexts.has(normalizeAssistantOutputTextForComparison(fallbackText))
+        || (
+            (artifacts.length > 0 || outputArtifactContext)
+            && assistantOutputTextHasInternalMarker(fallbackText)
+        )
     );
     const explicitText = String(renderableTextOutput?.value || '').trim()
         || (suppressFallbackArtifactDump ? '' : fallbackText);
@@ -2402,6 +2460,24 @@ function assistantOutputTextDuplicatesArtifactOutput(value = '', outputs = []) {
     });
 }
 
+function assistantOutputTextHasSemanticReviewProtocol(value = '') {
+    const normalized = String(value || '').trim().toLowerCase().replace(/\r\n?/g, '\n');
+    if (!normalized) return false;
+    const hasReviewOpener = normalized.includes(
+        'run a whole-turn semantic closure review for the current ollmo response.'
+    ) || normalized.includes(
+        'run a branch-local semantic review for the current ollmo response graph.'
+    );
+    if (!hasReviewOpener) return false;
+    const protocolMarkers = [
+        'authority boundary:',
+        'you are a semantic reviewer',
+        'return exactly one json object',
+        '"kind": "ollmo.semantic_review_verdict"',
+    ];
+    return protocolMarkers.filter((marker) => normalized.includes(marker)).length >= 3;
+}
+
 function assistantOutputTextHasInternalMarker(value = '') {
     const normalized = String(value || '').trim().toLowerCase().replace(/\r\n/g, '\n');
     if (!normalized) return false;
@@ -2410,7 +2486,8 @@ function assistantOutputTextHasInternalMarker(value = '') {
         .replace(/^#{1,6}\s+/, '')
         .replace(/^[*_`~\s]+|[*_`~\s]+$/g, '');
     if (firstLine.startsWith('image generation prompts')) return true;
-    return normalized.includes('original user request for bounded intent context')
+    return assistantOutputTextHasSemanticReviewProtocol(normalized)
+        || normalized.includes('original user request for bounded intent context')
         || normalized.includes('target text artifact:')
         || normalized.includes('deterministic syntax sanity issues')
         || (
@@ -2425,6 +2502,7 @@ function assistantOutputTextHasInternalMarker(value = '') {
 
 function shouldRenderAssistantOutputText(output = {}, outputs = [], lateFill = null) {
     const sourceOutput = output && typeof output === 'object' ? output : {};
+    if (responseWorkItemIsSemanticReviewProjection(sourceOutput)) return false;
     const normalizedOutput = sanitizeResponseOutputs([sourceOutput])[0] || {};
     const outputType = String(normalizedOutput.type || sourceOutput.type || '').trim().toLowerCase();
     if (!['text', 'document'].includes(outputType)) return false;
@@ -2436,6 +2514,7 @@ function shouldRenderAssistantOutputText(output = {}, outputs = [], lateFill = n
         || ''
     ).trim();
     if (!value) return false;
+    if (assistantOutputTextHasSemanticReviewProtocol(value)) return false;
     if (assistantOutputHasArtifactRecord(normalizedOutput)) return false;
     if (isResolvedLinkedArtifactBindingOutput(normalizedOutput, lateFill)) return false;
     const normalizedOutputs = sanitizeResponseOutputs(outputs);
@@ -2955,8 +3034,235 @@ function currentWorkItemIdentity(item = {}) {
     return '';
 }
 
+function normalizeResponseWorkControlToken(value = '') {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, '_');
+}
+
+function responseWorkItemHasReservedSemanticReviewId(item = {}) {
+    if (!item || typeof item !== 'object') return false;
+    const semanticBinding = item.semantic_review_evidence_binding
+        || item.semanticReviewEvidenceBinding
+        || item.branch_semantic_review_evidence_binding
+        || item.branchSemanticReviewEvidenceBinding
+        || {};
+    const identifiers = [
+        item.slot_id,
+        item.slotId,
+        item.branch_id,
+        item.branchId,
+        item.phase_id,
+        item.phaseId,
+        item.task_id,
+        item.taskId,
+        item.obligation_id,
+        item.obligationId,
+        semanticBinding.branch_id,
+        semanticBinding.branchId,
+        semanticBinding.phase_id,
+        semanticBinding.phaseId,
+        semanticBinding.task_id,
+        semanticBinding.taskId,
+        semanticBinding.obligation_id,
+        semanticBinding.obligationId,
+        semanticBinding.generation_id,
+        semanticBinding.generationId,
+    ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    const reservedIdPattern = /^(?:output-)?(?:(?:branch|phase|task|obligation)-)?(?:global-semantic-closure-review|branch-semantic-review|semantic-review)(?:[-:]|$)/;
+    return identifiers.some((identifier) => reservedIdPattern.test(identifier));
+}
+
+function responseWorkItemIsSemanticReviewProjection(item = {}) {
+    if (!item || typeof item !== 'object') return false;
+    const executionContract = item.execution_contract && typeof item.execution_contract === 'object'
+        ? item.execution_contract
+        : item.executionContract && typeof item.executionContract === 'object'
+            ? item.executionContract
+            : {};
+    const outputContract = executionContract.output_contract && typeof executionContract.output_contract === 'object'
+        ? executionContract.output_contract
+        : executionContract.outputContract && typeof executionContract.outputContract === 'object'
+            ? executionContract.outputContract
+            : {};
+
+    const visibilityTokens = [
+        item.visibility,
+        item.surface_visibility,
+        item.surfaceVisibility,
+        executionContract.visibility,
+        outputContract.visibility,
+    ].map(normalizeResponseWorkControlToken).filter(Boolean);
+    if (visibilityTokens.some((token) => [
+        'internal',
+        'internal_only',
+        'runtime_internal',
+        'control',
+        'control_plane',
+        'control_only',
+        'diagnostic_only',
+        'non_public',
+    ].includes(token))) {
+        return true;
+    }
+
+    const surfaceRoleTokens = [
+        item.surface_role,
+        item.surfaceRole,
+        executionContract.surface_role,
+        executionContract.surfaceRole,
+        outputContract.surface_role,
+        outputContract.surfaceRole,
+    ].map(normalizeResponseWorkControlToken).filter(Boolean);
+    if (surfaceRoleTokens.some((token) => [
+        'closure_evidence',
+        'control_evidence',
+        'internal_control',
+        'semantic_review',
+        'semantic_review_evidence',
+        'semantic_review_output',
+        'semantic_review_transition',
+        'branch_semantic_review',
+        'branch_semantic_review_output',
+        'global_semantic_closure_review',
+    ].includes(token))) {
+        return true;
+    }
+
+    const stageDirection = normalizeResponseWorkControlToken(
+        item.stage_direction
+        || item.stageDirection
+        || executionContract.stage_direction
+        || executionContract.stageDirection
+    );
+    if (['run_global_semantic_closure_review', 'run_branch_semantic_review'].includes(stageDirection)) {
+        return true;
+    }
+
+    const role = normalizeResponseWorkControlToken(
+        item.role
+        || item.output_role
+        || item.outputRole
+        || executionContract.role
+        || outputContract.role
+    );
+    if ([
+        'semantic_review_transition',
+        'semantic_review_output',
+        'branch_semantic_review_output',
+        'global_semantic_closure_review',
+    ].includes(role)) {
+        return true;
+    }
+
+    const checkKind = normalizeResponseWorkControlToken(item.check_kind || item.checkKind);
+    if (['global_semantic_closure', 'branch_semantic_review', 'semantic_review'].includes(checkKind)) {
+        return true;
+    }
+
+    const contentSource = String(
+        item.content_payload_source
+        || item.contentPayloadSource
+        || ''
+    ).trim().toLowerCase();
+    if (
+        contentSource === 'global_semantic_closure_review'
+        || contentSource === 'branch_semantic_review'
+        || contentSource.startsWith('branch_semantic_review:')
+        || contentSource.startsWith('branch-semantic-review:')
+    ) {
+        return true;
+    }
+
+    const semanticAuthority = normalizeResponseWorkControlToken(
+        item.semantic_review_authority
+        || item.semanticReviewAuthority
+    );
+    if (semanticAuthority.includes('semantic_review')) {
+        return true;
+    }
+
+    const fulfillmentPolicy = normalizeResponseWorkControlToken(
+        item.fulfillment_policy
+        || item.fulfillmentPolicy
+        || outputContract.fulfillment_policy
+        || outputContract.fulfillmentPolicy
+    );
+    if (fulfillmentPolicy.includes('semantic_review')) {
+        return true;
+    }
+
+    return responseWorkItemHasReservedSemanticReviewId(item);
+}
+
+function responsePayloadSemanticReviewProjectionTexts(payload = {}) {
+    const texts = new Set();
+    if (!payload || typeof payload !== 'object') return texts;
+    const candidates = [];
+    const appendCollection = (value) => {
+        if (!Array.isArray(value)) return;
+        value.forEach((item) => {
+            if (item && typeof item === 'object') candidates.push(item);
+        });
+    };
+    const appendOutputSurface = (surface) => {
+        if (!surface || typeof surface !== 'object') return;
+        appendCollection(surface.outputs || surface.canonical_outputs || surface.canonicalOutputs);
+        appendCollection(surface.output_slots || surface.outputSlots);
+        appendCollection(surface.output_branches || surface.outputBranches);
+        if (surface.output && typeof surface.output === 'object' && !Array.isArray(surface.output)) {
+            appendCollection(surface.output.outputs);
+        }
+    };
+    const appendLateFillSurface = (lateFill) => {
+        if (!lateFill || typeof lateFill !== 'object') return;
+        appendCollection(lateFill.pending_branches || lateFill.pendingBranches);
+        appendCollection(lateFill.active_branches || lateFill.activeBranches);
+        appendCollection(lateFill.completed_branches || lateFill.completedBranches);
+        appendCollection(lateFill.failed_branches || lateFill.failedBranches);
+        appendCollection(lateFill.cancelled_branches || lateFill.cancelledBranches);
+        appendCollection(lateFill.fill_results || lateFill.fillResults);
+        appendCollection(lateFill.branch_progress || lateFill.branchProgress);
+    };
+
+    const responseFrame = payload.response_frame && typeof payload.response_frame === 'object'
+        ? payload.response_frame
+        : null;
+    const currentState = responseFrame?.current_state && typeof responseFrame.current_state === 'object'
+        ? responseFrame.current_state
+        : null;
+    appendOutputSurface(payload);
+    appendOutputSurface(responseFrame);
+    appendOutputSurface(currentState);
+    appendLateFillSurface(payload.late_fill || payload.lateFill);
+    appendLateFillSurface(payload?.runtime?.late_fill || payload?.runtime?.lateFill);
+    appendLateFillSurface(currentState?.late_fill || currentState?.lateFill);
+
+    candidates.forEach((item) => {
+        if (!responseWorkItemIsSemanticReviewProjection(item)) return;
+        for (const key of [
+            'value',
+            'content_payload',
+            'contentPayload',
+            'result_text',
+            'resultText',
+            'output_text',
+            'outputText',
+            'content',
+            'text',
+            'transcript',
+        ]) {
+            const text = normalizeAssistantOutputTextForComparison(item[key]);
+            if (text) texts.add(text);
+        }
+    });
+    return texts;
+}
+
 function responseWorkItemIsInternalProjection(item = {}) {
     if (!item || typeof item !== 'object') return false;
+    if (responseWorkItemIsSemanticReviewProjection(item)) return true;
     const ids = [
         item.slot_id,
         item.slotId,
@@ -2981,6 +3287,7 @@ function filterUserVisibleResponseWorkItems(items = [], options = {}) {
     const keepActionableInternal = Boolean(options.keepActionableInternal);
     return normalizedItems.filter((item) => {
         if (!responseWorkItemIsInternalProjection(item)) return true;
+        if (responseWorkItemIsSemanticReviewProjection(item)) return false;
         return keepActionableInternal;
     });
 }

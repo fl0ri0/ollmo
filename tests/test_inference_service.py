@@ -167,6 +167,97 @@ class InferenceServiceTests(unittest.TestCase):
             )
         )
 
+    def test_qwen3_model_types_use_their_own_long_form_boundaries(self):
+        passage = (
+            'The rhythmic tapping of raindrops against the window provides a soothing lullaby '
+            'for the end of the day. As the streets darken under the twilight sky, a sense of '
+            'profound stillness settles over the world. There is a quiet magic in watching the '
+            'evening mist dance through the streetlamps.'
+        )
+
+        for model_type, expected_trigger in (
+            ('voice_design', 28.0),
+            ('custom_voice', 28.0),
+            ('base', 56.0),
+        ):
+            with self.subTest(model_type=model_type):
+                plan = build_qwen3_tts_chunk_plan(
+                    passage,
+                    tts_model_type=model_type,
+                )
+                self.assertEqual(plan['estimated_speech_seconds'], 24.5)
+                self.assertEqual(plan['trigger_speech_seconds'], expected_trigger)
+                self.assertFalse(plan['applied'])
+                self.assertEqual(plan['status'], 'not_applied')
+                self.assertEqual(plan['chunk_count'], 1)
+                self.assertEqual(plan['chunks'], [])
+
+        for model_type in (None, 'unknown'):
+            with self.subTest(model_type=model_type):
+                fallback_plan = build_qwen3_tts_chunk_plan(
+                    passage,
+                    tts_model_type=model_type,
+                )
+                self.assertEqual(fallback_plan['trigger_speech_seconds'], 16.0)
+                self.assertTrue(fallback_plan['applied'])
+
+        designed_voice_boundary_source = (
+            'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
+            'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
+            'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
+            'about the work still ahead. Nothing was finished, but everything was finally moving. '
+            'The morning tide carried every answer onward.'
+        )
+        for model_type, expected_applied in (
+            ('voice_design', True),
+            ('custom_voice', True),
+            ('base', False),
+        ):
+            with self.subTest(model_type=model_type, source='29-second-source'):
+                plan = build_qwen3_tts_chunk_plan(
+                    designed_voice_boundary_source,
+                    tts_model_type=model_type,
+                )
+                self.assertEqual(plan['estimated_speech_seconds'], 29.0)
+                self.assertEqual(plan['applied'], expected_applied)
+
+        base_boundary_source = ' '.join(
+            ['Clear water moves through the old stone channel.'] * 14
+        )
+        base_over_boundary_source = ' '.join(
+            ['Clear water moves through the old stone channel.'] * 15
+        )
+        base_boundary_plan = build_qwen3_tts_chunk_plan(
+            base_boundary_source,
+            tts_model_type='base',
+        )
+        base_over_boundary_plan = build_qwen3_tts_chunk_plan(
+            base_over_boundary_source,
+            tts_model_type='base',
+        )
+        self.assertEqual(base_boundary_plan['estimated_speech_seconds'], 56.0)
+        self.assertEqual(base_boundary_plan['trigger_speech_seconds'], 56.0)
+        self.assertFalse(base_boundary_plan['applied'])
+        self.assertEqual(
+            build_qwen3_tts_generation_budget(base_boundary_source)['max_tokens'],
+            1150,
+        )
+        self.assertEqual(base_over_boundary_plan['estimated_speech_seconds'], 60.0)
+        self.assertTrue(base_over_boundary_plan['applied'])
+
+        ten_minute_multiline_source = '\n'.join(
+            ['Clear water moves through the old stone channel.'] * 150
+        )
+        multiline_plan = build_qwen3_tts_chunk_plan(
+            ten_minute_multiline_source,
+            tts_model_type='base',
+        )
+        self.assertEqual(multiline_plan['estimated_speech_seconds'], 600.0)
+        self.assertEqual(multiline_plan['trigger_basis'], 'longest_backend_segment')
+        self.assertEqual(multiline_plan['trigger_estimated_speech_seconds'], 4.0)
+        self.assertEqual(multiline_plan['backend_segment_count'], 150)
+        self.assertFalse(multiline_plan['applied'])
+
     def test_detect_text_artifact_request_from_explicit_filename(self):
         request = detect_text_artifact_request('Create an index.html artifact with a simple landing page.')
 
@@ -1757,12 +1848,91 @@ class InferenceServiceTests(unittest.TestCase):
             'Guten Tag aus Ollmo.',
         )
 
+    def test_moderate_qwen_designed_voice_uses_one_backend_call(self):
+        passage = (
+            'The rhythmic tapping of raindrops against the window provides a soothing lullaby '
+            'for the end of the day. As the streets darken under the twilight sky, a sense of '
+            'profound stillness settles over the world. There is a quiet magic in watching the '
+            'evening mist dance through the streetlamps.'
+        )
+        for model_type, model_name, voice in (
+            (
+                'voice_design',
+                'mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16',
+                None,
+            ),
+            (
+                'custom_voice',
+                'mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16',
+                'serena',
+            ),
+        ):
+            with self.subTest(model_type=model_type), tempfile.TemporaryDirectory() as temp_dir:
+                ctx = InferContext(
+                    instance_id=f'tts-{model_type}-single-sequence-1',
+                    backend='mlx',
+                    capability='text_to_speech',
+                    model_name=model_name,
+                    port=11504,
+                    prompt=passage,
+                    user_prompt=passage,
+                    infer_timeout_sec=1200,
+                    pdf_page_timeout_sec=240,
+                    pdf_max_image_side=2400,
+                    pdf_synthesize=False,
+                    voice=voice,
+                    instruct='Calm, natural English narration.',
+                    response_format='wav',
+                    lang_code='english',
+                    tts_model_type=model_type,
+                )
+                backend_calls = []
+
+                def mlx_audio_speech(_port, _model_name, spoken_text, **kwargs):
+                    backend_calls.append((spoken_text, dict(kwargs)))
+                    return {
+                        'audio_bytes': _pcm_wav_bytes(16.0),
+                        'content_type': 'audio/wav',
+                        'result': {'bytes': 1},
+                    }
+
+                saved_path = Path(temp_dir) / f'{model_type}-single-sequence.wav'
+
+                def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                    saved_path.write_bytes(audio_bytes)
+                    return str(saved_path)
+
+                payload, status = dispatch_infer_request(
+                    ctx,
+                    InferArtifacts(),
+                    {
+                        'mlx_audio_speech': mlx_audio_speech,
+                        'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                    },
+                )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(len(backend_calls), 1)
+                self.assertEqual(backend_calls[0][0], passage)
+                self.assertEqual(backend_calls[0][1]['max_tokens'], 560)
+                self.assertEqual(backend_calls[0][1]['voice'], voice)
+                self.assertEqual(
+                    payload['tts_generation_budget']['generation_scope'],
+                    'single_sequence',
+                )
+                self.assertEqual(payload['tts_audio_integrity_evidence']['status'], 'passed')
+                self.assertNotIn(
+                    'chunking_evidence',
+                    payload['tts_audio_integrity_evidence'],
+                )
+
     def test_long_qwen_voice_design_synthesizes_verified_chunks_and_persists_once(self):
         passage = (
             'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
             'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
             'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
-            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+            'about the work still ahead. Nothing was finished, but everything was finally moving. '
+            'The morning tide carried every answer onward.'
         )
         ctx = InferContext(
             instance_id='tts-long-chunked-1',
@@ -1837,9 +2007,13 @@ class InferenceServiceTests(unittest.TestCase):
             'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
             'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
             'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
-            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+            'about the work still ahead. Nothing was finished, but everything was finally moving. '
+            'The morning tide carried every answer onward.'
         )
-        planned_chunks = build_qwen3_tts_chunk_plan(passage)['chunks']
+        planned_chunks = build_qwen3_tts_chunk_plan(
+            passage,
+            tts_model_type='voice_design',
+        )['chunks']
         exhausted_chunk = planned_chunks[2]['text']
         ctx = InferContext(
             instance_id='tts-long-chunk-recovery-1',
@@ -1982,9 +2156,13 @@ class InferenceServiceTests(unittest.TestCase):
             'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
             'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
             'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
-            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+            'about the work still ahead. Nothing was finished, but everything was finally moving. '
+            'The morning tide carried every answer onward.'
         )
-        planned_chunks = build_qwen3_tts_chunk_plan(passage)['chunks']
+        planned_chunks = build_qwen3_tts_chunk_plan(
+            passage,
+            tts_model_type='voice_design',
+        )['chunks']
         exhausted_chunk = planned_chunks[2]['text']
         ctx = InferContext(
             instance_id='tts-long-chunk-recovery-failure-1',
@@ -2167,7 +2345,8 @@ class InferenceServiceTests(unittest.TestCase):
             'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
             'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
             'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
-            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+            'about the work still ahead. Nothing was finished, but everything was finally moving. '
+            'The morning tide carried every answer onward.'
         )
         ctx = InferContext(
             instance_id='tts-long-chunk-failure-1',
@@ -2229,12 +2408,14 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(chunking['completed_chunk_count'], 2)
 
     def test_long_qwen_base_uses_the_same_verified_chunk_pipeline(self):
-        passage = (
+        segment = (
             'At sunrise, the harbor slowly came alive. Ropes creaked against wooden posts, '
             'gulls crossed the pale sky, and the first boats moved beyond the breakwater. '
             'Mara stood beside the old lighthouse, listening to the steady waves and thinking '
-            'about the work still ahead. Nothing was finished, but everything was finally moving.'
+            'about the work still ahead. Nothing was finished, but everything was finally moving. '
+            'The morning tide carried every answer onward.'
         )
+        passage = f'{segment} {segment}'
         ctx = InferContext(
             instance_id='tts-long-base-1',
             backend='mlx',
@@ -2296,6 +2477,74 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(
             payload['tts_audio_integrity_evidence']['chunking_evidence']['status'],
             'passed',
+        )
+        self.assertEqual(
+            payload['tts_audio_integrity_evidence']['chunking_evidence'][
+                'trigger_speech_seconds'
+            ],
+            56.0,
+        )
+
+    def test_multiline_qwen_base_keeps_one_backend_call_and_budgets_per_segment(self):
+        passage = '\n'.join(
+            ['Clear water moves through the old stone channel.'] * 20
+        )
+        ctx = InferContext(
+            instance_id='tts-long-multiline-base-1',
+            backend='mlx',
+            capability='text_to_speech',
+            model_name='mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16',
+            port=11504,
+            prompt=passage,
+            user_prompt=passage,
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            voice='Chelsie',
+            response_format='wav',
+            lang_code='english',
+        )
+        backend_calls = []
+
+        def mlx_audio_speech(_port, _model_name, spoken_text, **kwargs):
+            backend_calls.append((spoken_text, dict(kwargs)))
+            return {
+                'audio_bytes': _pcm_wav_bytes(32.0),
+                'content_type': 'audio/wav',
+                'result': {'bytes': 1},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved_path = Path(temp_dir) / 'multiline-base.wav'
+
+            def persist_audio_bytes_locally(audio_bytes, _model_name, **_kwargs):
+                saved_path.write_bytes(audio_bytes)
+                return str(saved_path)
+
+            payload, status = dispatch_infer_request(
+                ctx,
+                InferArtifacts(),
+                {
+                    'mlx_audio_speech': mlx_audio_speech,
+                    'persist_audio_bytes_locally': persist_audio_bytes_locally,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(backend_calls), 1)
+        self.assertEqual(backend_calls[0][0], passage)
+        self.assertEqual(backend_calls[0][1]['max_tokens'], 256)
+        budget = payload['tts_generation_budget']
+        self.assertEqual(budget['generation_scope'], 'segmented_sequence')
+        self.assertEqual(budget['budget_scope'], 'longest_backend_segment')
+        self.assertEqual(budget['max_tokens_application'], 'per_backend_segment')
+        self.assertEqual(budget['backend_segment_count'], 20)
+        self.assertEqual(budget['aggregate_estimated_speech_seconds'], 80.0)
+        self.assertEqual(payload['tts_audio_integrity_evidence']['status'], 'passed')
+        self.assertNotIn(
+            'chunking_evidence',
+            payload['tts_audio_integrity_evidence'],
         )
 
     def test_text_to_speech_qwen_canonicalizes_explicit_language_aliases(self):

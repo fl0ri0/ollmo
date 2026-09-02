@@ -1,0 +1,72 @@
+{
+  "entrypoint": "index.html",
+  "files": [
+    {
+      "artifact_ref": "artifact:audio_bbeb9e3421ca62a9f4c29224",
+      "relative_path": "assets/audio/narration.wav",
+      "sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+      "size_bytes": 257324,
+      "source_sha256": "370a141d9954e937d429fa592b61ab616ccf59fd3ccb8ded1a0fb5edced72d25",
+      "type": "audio"
+    },
+    {
+      "artifact_ref": "artifact:text_8b2746ad7af81ed1fca70dd6",
+      "relative_path": "assets/css/styles.css",
+      "sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+      "size_bytes": 2446,
+      "source_sha256": "8da6c916e0a39dccd3714f3dc29f624baaac84d6e74da4540df72194614e07b2",
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:image_9441f6b58f53a33a509b7b39",
+      "relative_path": "assets/images/image-01.png",
+      "sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+      "size_bytes": 978300,
+      "source_sha256": "ce7afafa5a08fce112775d1c6e2efa86c5dcc40855ffca5b8902f07246289c43",
+      "type": "image"
+    },
+    {
+      "artifact_ref": "artifact:image_77cfcefa7503408c727bae93",
+      "relative_path": "assets/images/image-02.png",
+      "sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+      "size_bytes": 1495723,
+      "source_sha256": "224de0da89bc06d2e9dda406bb7d3e8b4d8f1cce4d4aa7ff6d2bdad6c8c3bc1a",
+      "type": "image"
+    },
+    {
+      "artifact_ref": "artifact:text_95d6008dcb360eff7bb44134",
+      "relative_path": "index.html",
+      "sha256": "7babc53e6982e8cd895e45133f9e3572c28927b92f96fed0fb0b8c9efe3ec72d",
+      "size_bytes": 2218,
+      "source_sha256": "476bc4d56e34aeae87342efd289400671262b2a01b4fb0296671197ef23ba36c",
+      "type": "text"
+    }
+  ],
+  "link_check": {
+    "status": "passed"
+  },
+  "raw_runtime_manifest_published": false,
+  "resolved_links": [
+    {
+      "kind": "html_href",
+      "target": "assets/css/styles.css"
+    },
+    {
+      "kind": "html_src",
+      "target": "assets/images/image-01.png"
+    },
+    {
+      "kind": "html_src",
+      "target": "assets/images/image-02.png"
+    },
+    {
+      "kind": "html_src",
+      "target": "assets/audio/narration.wav"
+    }
+  ],
+  "schema": "ollmo.public_bundle_manifest.v1",
+  "source_bundle_id": "bundle:085eff9227e70b545c79f9a4",
+  "source_response_id": "resp_1788201103997_e9c5814aa9c17",
+  "status": "bundled",
+  "version": 1
+}

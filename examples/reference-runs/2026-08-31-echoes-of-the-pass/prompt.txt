@@ -1,0 +1,5 @@
+Create a quiet local exhibition website for a fictional alpine sound archive called Echoes of the Pass.
+
+Create index.html and styles.css, exactly two atmospheric mountain images, and one English WAV narration. The narration must say exactly: “Above the tree line, wind and stone preserve the memory of every season.”
+
+Use one image as the hero and the other in a listening section. Include a working audio player for the narration. Save everything as one complete local bundle with correct relative links and no external assets.

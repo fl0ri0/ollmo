@@ -258,6 +258,26 @@ _MATERIALIZATION_ONLY_OUTPUT_CONTRAST_RE = re.compile(
     r"\bnicht\s+nur\s+(?:ausgeben|zurueckgeben|zurückgeben|schreiben|zeigen|anzeigen)\b",
     re.IGNORECASE,
 )
+_VISUAL_CONTENT_CONSTRAINT_RE = re.compile(
+    r"\b(?:do\s+not|don[\'’]?t|dont|never)\b[^.;!?\n]{0,64}\b"
+    r'(?:include|add|place|put|feature|contain|depict|show|display|render)\b'
+    r'(?P<object>\s+[^.;!?\n]{1,180})',
+    re.IGNORECASE,
+)
+_VISUAL_CONTENT_CONSTRAINT_MEDIA_NOUN_RE = re.compile(
+    r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|render(?:s)?|'
+    r'visual(?:s)?|artwork(?:s)?|asset(?:s)?)\b',
+    re.IGNORECASE,
+)
+_VISUAL_CONTENT_CONSTRAINT_LOCATION_RE = re.compile(
+    r'\b(?:in|on|within|inside|from|over|under|beside|around)\b',
+    re.IGNORECASE,
+)
+_VISUAL_CONTENT_CONSTRAINT_DEFER_OBJECT_RE = re.compile(
+    r'^(?:it|them|this|that|these|those|anything|yet|now|for\s+now|at\s+this\s+time|'
+    r'publicly|to\s+(?:me|the\s+user)|in\s+(?:the\s+)?(?:response|reply|answer|output))\b',
+    re.IGNORECASE,
+)
 _EXPLICIT_DEFER_MATERIALIZATION_RE: list[re.Pattern[str]] = [
     re.compile(
         r'(?:^|[.;!?\n])\s*(?:no|without)\s+(?:an?\s+)?'
@@ -266,27 +286,28 @@ _EXPLICIT_DEFER_MATERIALIZATION_RE: list[re.Pattern[str]] = [
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b[\s\S]{0,96}\b"
+        r"\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b"
+        r"(?:(?!\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b)[^.;!?\n]){0,96}\b"
         r'(?:generate|create|make|render|produce|materiali[sz]e|show|display|read(?:\s+\w+){0,3}\s+aloud|'
         r'speak|turn(?:\s+\w+){0,3}\s+into)\b',
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b[\s\S]{0,96}\b"
+        r"\b(?:not yet|not now|hold off on|wait before)\b[^.;!?\n]{0,96}\b"
         r'(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|render(?:s)?|audio|voice|voiceover|speech|'
         r'html|landing page|asset(?:s)?|artifact(?:s)?)\b',
         re.IGNORECASE,
     ),
     re.compile(
-        r'\b(?:later|later on|for later|afterwards|in a later turn|in the next turn)\b[\s\S]{0,64}\b'
+        r'\b(?:later|later on|for later|afterwards|in a later turn|in the next turn)\b[^.;!?\n]{0,64}\b'
         r'(?:generate|create|make|render|produce|read(?:\s+\w+){0,3}\s+aloud|speak|audio|voice|image(?:s)?|'
         r'picture(?:s)?|photo(?:s)?|illustration(?:s)?|html)\b',
         re.IGNORECASE,
     ),
     re.compile(
-        r'\b(?:first|initially)\b[\s\S]{0,40}\b(?:produce|output|return|give|provide|draft|write)\b'
-        r'[\s\S]{0,96}\b(?:draft|brief|outline|script|shot map|memo|pack|section(?:s)?|heading(?:s)?)\b'
-        r'[\s\S]{0,40}\bonly\b',
+        r'\b(?:first|initially)\b[^.;!?\n]{0,40}\b(?:produce|output|return|give|provide|draft|write)\b'
+        r'[^.;!?\n]{0,96}\b(?:draft|brief|outline|script|shot map|memo|pack|section(?:s)?|heading(?:s)?)\b'
+        r'[^.;!?\n]{0,40}\bonly\b',
         re.IGNORECASE,
     ),
     re.compile(
@@ -1734,28 +1755,85 @@ def _has_explicit_materialization_deferal(
     normalized = str(normalized_prompt or '').strip()
     if not raw_prompt or not normalized or not mentions_materialization_targets:
         return False
+    clause_safe_normalized = normalize_intent_text(
+        re.sub(r'[\r\n]+', '. ', raw_prompt)
+    )
     for pattern in _EXPLICIT_DEFER_MATERIALIZATION_RE:
-        for source in (raw_prompt, normalized):
+        for source in (raw_prompt, clause_safe_normalized):
             for match in pattern.finditer(source):
-                if materialization_negation_match_is_artifact_fulfillment_only(
+                local_prompt = _materialization_defer_match_local_prompt(
                     source,
                     match.start(),
                     match.end(),
+                )
+                local_end = match.end() - match.start()
+                if _materialization_defer_match_is_visual_content_constraint(
+                    local_prompt,
+                    0,
+                    local_end,
+                ):
+                    continue
+                if materialization_negation_match_is_artifact_fulfillment_only(
+                    local_prompt,
+                    0,
+                    local_end,
                 ):
                     continue
                 if _materialization_negation_match_is_cardinality_constraint(
-                    source,
-                    match.start(),
-                    match.end(),
+                    local_prompt,
+                    0,
+                    local_end,
                 ):
                     continue
                 if materialization_negation_match_is_output_contrast(
-                    source,
-                    match.start(),
-                    match.end(),
+                    local_prompt,
+                    0,
+                    local_end,
                 ):
                     continue
                 return True
+    return False
+
+
+def _materialization_defer_match_local_prompt(
+    prompt: str,
+    start: int,
+    end: int,
+) -> str:
+    prompt_text = str(prompt or '')
+    candidate_start = max(0, int(start or 0))
+    candidate_end = len(prompt_text)
+    following_boundary = re.search(r'[.;!?\n]', prompt_text[max(candidate_start, end):])
+    if following_boundary:
+        candidate_end = max(candidate_start, end) + following_boundary.start()
+    return prompt_text[candidate_start:candidate_end]
+
+
+def _materialization_defer_match_is_visual_content_constraint(
+    prompt: str,
+    start: int,
+    end: int,
+) -> bool:
+    candidate_start = max(0, int(start or 0))
+    candidate = _materialization_defer_match_local_prompt(prompt, start, end)
+    for constraint in _VISUAL_CONTENT_CONSTRAINT_RE.finditer(candidate):
+        action_end = candidate_start + constraint.start('object')
+        if action_end != int(end or 0):
+            continue
+        object_text = str(constraint.group('object') or '').strip()
+        if (
+            not object_text
+            or _VISUAL_CONTENT_CONSTRAINT_DEFER_OBJECT_RE.search(object_text)
+        ):
+            return False
+        media_noun = _VISUAL_CONTENT_CONSTRAINT_MEDIA_NOUN_RE.search(object_text)
+        if not media_noun:
+            return True
+        return bool(
+            _VISUAL_CONTENT_CONSTRAINT_LOCATION_RE.search(
+                object_text[:media_noun.start()]
+            )
+        )
     return False
 
 
@@ -1766,28 +1844,40 @@ def _latest_explicit_visual_defer_end(normalized_prompt: str) -> int:
     latest_end = -1
     for pattern in _EXPLICIT_DEFER_MATERIALIZATION_RE:
         for match in pattern.finditer(prompt):
-            if materialization_negation_match_is_artifact_fulfillment_only(
+            local_prompt = _materialization_defer_match_local_prompt(
                 prompt,
                 match.start(),
                 match.end(),
+            )
+            local_end = match.end() - match.start()
+            if _materialization_defer_match_is_visual_content_constraint(
+                local_prompt,
+                0,
+                local_end,
+            ):
+                continue
+            if materialization_negation_match_is_artifact_fulfillment_only(
+                local_prompt,
+                0,
+                local_end,
             ):
                 continue
             if _materialization_negation_match_is_cardinality_constraint(
-                prompt,
-                match.start(),
-                match.end(),
+                local_prompt,
+                0,
+                local_end,
             ):
                 continue
             if materialization_negation_match_is_output_contrast(
-                prompt,
-                match.start(),
-                match.end(),
+                local_prompt,
+                0,
+                local_end,
             ):
                 continue
             scope = _materialization_negation_scope(
-                prompt,
-                match.start(),
-                match.end(),
+                local_prompt,
+                0,
+                local_end,
             )
             if _VISUAL_ACTION_TARGET_RE.search(scope):
                 contrast = _VISUAL_ACTION_POLARITY_RESET_RE.search(
@@ -1919,8 +2009,16 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
     if visual_analysis_execution_suppressed_by_preservation:
         vision_positive = 0
 
+    affirmative_audio_materialization_action = _has_affirmative_audio_materialization_action(
+        command_text
+    )
+    explicit_tts_stt_co_request = bool(
+        stt_positive >= 4
+        and (normalized_tts_source or affirmative_audio_materialization_action)
+    )
+    effective_tts_negative = 0 if explicit_tts_stt_co_request else tts_negative
     capability_scores = {
-        CAPABILITY_TEXT_TO_SPEECH: max(0, tts_positive - tts_negative),
+        CAPABILITY_TEXT_TO_SPEECH: max(0, tts_positive - effective_tts_negative),
         CAPABILITY_IMAGE_GENERATION: max(0, image_positive - image_negative),
         CAPABILITY_VISION_ANALYSIS: max(0, vision_positive),
         CAPABILITY_SPEECH_TO_TEXT: max(0, stt_positive),
@@ -1976,9 +2074,6 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         for match in audio_output_negation_matches
     ):
         audio_output_negation_matches = []
-    affirmative_audio_materialization_action = _has_affirmative_audio_materialization_action(
-        command_text
-    )
     has_audio_output_negation = bool(
         audio_output_negation_matches
         or answer_as_audio_delivery_negated

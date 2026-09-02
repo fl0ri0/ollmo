@@ -69,6 +69,7 @@ Useful public context:
 
 - [Vision Alignment](docs/VISION_ALIGNMENT.md)
 - [State Substrate Architecture](docs/diagrams/ollmo-state-substrate-architecture.html)
+- [Verified Reference Runs](examples/README.md)
 - [Project Participation and Capacity](CONTRIBUTING.md)
 
 ## Supported Environment

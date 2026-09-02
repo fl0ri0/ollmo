@@ -466,9 +466,50 @@ _COALESCED_TEXT_ARTIFACT_RECOVERY_MAX_ATTEMPTS = 2
 _TTS_AUTO_RECOVERY_POLICY_ID = 'tts_bounded_materialization_recovery_v1'
 _TTS_AUTO_RECOVERY_TRIGGER = 'tts_auto_recovery'
 _TTS_AUTO_RECOVERY_MAX_ATTEMPTS = 2
+_TARGET_BOUND_SAVED_TEXT_SYNTAX_REPAIR_TRIGGER = (
+    'target_bound_saved_text_syntax_repair'
+)
 _PARTIAL_GRAPH_REBASE_HANDOFF_LOCK = threading.RLock()
 _GRAPH_PATCH_TERMINAL_REVIEW_HANDOFF_LOCK = threading.RLock()
 _GRAPH_PATCH_TERMINAL_REVIEW_RELATION = 'graph_patch_terminal_review'
+
+_BRANCH_LOCAL_PUBLICATION_FIELDS = {
+    'artifact_id',
+    'artifact_ref',
+    'ref',
+    'path',
+    'artifact_path',
+    'saved_text_path',
+    'saved_text_artifacts',
+    'saved_audio_path',
+    'saved_image_path',
+    'saved_video_path',
+    'image_data_url',
+    'image_state',
+    'artifacts',
+    'provenance_id',
+    'derived_from',
+    'source_response_id',
+}
+_BRANCH_LOCAL_MATERIALIZATION_FIELDS = {
+    'artifact_request',
+    'text_artifact_request',
+    'text_artifact_requests',
+    'requires_artifact',
+    'text_artifact_extension',
+    'text_artifact_source_name',
+    'text_artifact_source',
+    'text_artifact_target_path',
+    'text_artifact_revision_required',
+    'text_artifact_revision_source',
+    'text_artifact_source_is_input',
+    'text_artifact_revision_binding_state',
+    'text_artifact_revision_source_path',
+    'text_artifact_revision_source_size_bytes',
+    'text_artifact_revision_source_sha256',
+    'text_artifact_revision_preservation_required',
+    'text_artifact_revision_preservation_policy',
+}
 _GRAPH_PATCH_TERMINAL_REVIEW_REASON = 'terminal_graph_patch_enforced_policy_denied'
 _GRAPH_PATCH_TERMINAL_REVIEW_RUNTIME_EFFECT = 'audit_only_no_execution'
 _GRAPH_PATCH_TERMINAL_SAFE_ENFORCED_CLASSES = frozenset({
@@ -678,6 +719,7 @@ class LateFillRuntimeOwner:
     ] = None
     review_terminal_graph_rebase: Optional[Callable[..., dict[str, Any]]] = None
     prepare_terminal_graph_patch_successor: Optional[Callable[..., dict[str, Any]]] = None
+    project_terminal_closure_repair: Optional[Callable[..., dict[str, Any]]] = None
     load_latest_response_state: Optional[Callable[..., Mapping[str, Any]]] = None
     load_latest_response_observation_state: Optional[
         Callable[..., Mapping[str, Any]]
@@ -1190,8 +1232,6 @@ class LateFillRuntimeOwner:
         artifact_gap: Optional[Mapping[str, Any]],
     ) -> bool:
         gap = artifact_gap if isinstance(artifact_gap, Mapping) else {}
-        if not cls._artifact_gap_is_required_text_materialization(gap):
-            return False
         artifact_request = (
             gap.get('artifact_request')
             if isinstance(gap.get('artifact_request'), Mapping)
@@ -1221,7 +1261,7 @@ class LateFillRuntimeOwner:
             or artifact_request.get('source')
             or ''
         ).strip()
-        return (
+        authoritative_source = (
             content_payload_source in {
                 'closure_html_css_selector_binding_review',
                 'closure_linked_artifact_binding_review',
@@ -1229,6 +1269,7 @@ class LateFillRuntimeOwner:
                 'closure_composed_page_image_representation',
                 'closure_hero_image_composition',
                 'closure_text_artifact_syntax_sanity',
+                'terminal_web_runtime_binding_review',
             }
             or text_artifact_source in {
                 'closure_link_rebind',
@@ -1237,8 +1278,24 @@ class LateFillRuntimeOwner:
                 'closure_hero_image_composition',
                 'closure_selector_binding_repair',
                 'closure_syntax_repair',
+                'closure_web_binding_repair',
             }
         )
+        if not authoritative_source:
+            return False
+        if cls._artifact_gap_is_required_text_materialization(gap):
+            return True
+        # Persisted pending branches are intentionally compact and may omit
+        # stage_direction/requires_artifact.  A target-bound Closure repair
+        # remains authoritative when its artifact request preserves the file
+        # identity, extension, recovery action, and repair provenance.
+        extension = str(
+            gap.get('text_artifact_extension')
+            or artifact_request.get('extension')
+            or Path(target_path).suffix
+            or ''
+        ).strip().lower().lstrip('.')
+        return extension in TEXT_ARTIFACT_EXTENSIONS
 
     @staticmethod
     def _artifact_gap_is_required_image_materialization(artifact_gap: Optional[Mapping[str, Any]]) -> bool:
@@ -3086,6 +3143,14 @@ class LateFillRuntimeOwner:
             'diagnostic_artifact',
             'external_execution',
             'coalesced_text_artifact_recovery',
+            'saved_text_path',
+            'text_artifact_target_path',
+            'text_artifact_extension',
+            'text_artifact_source_name',
+            'syntax_sanity_status',
+            'syntax_sanity_issue_count',
+            'syntax_sanity_issues',
+            'saved_file_syntax_failure',
         ):
             value = raw.get(key) if raw else None
             if value not in (None, '', [], {}):
@@ -3169,6 +3234,11 @@ class LateFillRuntimeOwner:
             or 'promoted obligation' in message.lower()
             or 'rebuild_from_promoted_obligations' in message.lower()
         )
+        saved_text_syntax_failure = bool(
+            code == 'TEXT_ARTIFACT_SYNTAX_SANITY_FAILED'
+            and error.get('saved_file_syntax_failure') is True
+            and str(error.get('saved_text_path') or '').strip()
+        )
         if rebuild_promoted_obligations:
             suggested_action = RECOVERY_ACTION_REBUILD_FROM_PROMOTED_OBLIGATIONS
         elif branch_contract_repair:
@@ -3177,6 +3247,8 @@ class LateFillRuntimeOwner:
             suggested_action = RECOVERY_ACTION_REBIND_DEPENDENCY_EVIDENCE
         elif dependency_input_missing:
             suggested_action = RECOVERY_ACTION_REPAIR_DEPENDENCY_CHAIN
+        elif saved_text_syntax_failure:
+            suggested_action = RECOVERY_ACTION_RETRY_SAME_BRANCH
         elif not retryable:
             suggested_action = RECOVERY_ACTION_MANUAL_REVIEW
         elif code == 'NO_COMPATIBLE_INSTANCE':
@@ -3232,6 +3304,22 @@ class LateFillRuntimeOwner:
         if dependency_input_missing:
             payload['repair_required'] = True
             payload['blocked_by_dependency_input'] = True
+        if saved_text_syntax_failure:
+            payload['repair_required'] = True
+            payload['target_bound_syntax_repair'] = True
+            for key in (
+                'saved_text_path',
+                'text_artifact_target_path',
+                'text_artifact_extension',
+                'text_artifact_source_name',
+                'syntax_sanity_status',
+                'syntax_sanity_issue_count',
+                'syntax_sanity_issues',
+                'saved_file_syntax_failure',
+            ):
+                value = error.get(key)
+                if value not in (None, '', [], {}):
+                    payload[key] = copy.deepcopy(value)
         for key in (
             'materialization_blocked',
             'blocked_scope',
@@ -3365,6 +3453,109 @@ class LateFillRuntimeOwner:
             else _AUTO_EXECUTABLE_REPAIR_DEFAULT_MAX_ATTEMPTS
         )
 
+    @staticmethod
+    def _branch_has_target_bound_saved_text_syntax_repair_attempt(
+        branch: Mapping[str, Any],
+    ) -> bool:
+        if not isinstance(branch, Mapping):
+            return False
+        for key in ('recovery_attempt', 'recovery_state'):
+            recovery = branch.get(key) if isinstance(branch.get(key), Mapping) else {}
+            if str(recovery.get('trigger') or '').strip() == (
+                _TARGET_BOUND_SAVED_TEXT_SYNTAX_REPAIR_TRIGGER
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _target_bound_saved_text_syntax_repair_evidence(
+        cls,
+        recovery_context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(recovery_context, Mapping):
+            return {}
+        if str(recovery_context.get('error_code') or '').strip().upper() != (
+            'TEXT_ARTIFACT_SYNTAX_SANITY_FAILED'
+        ):
+            return {}
+        if recovery_context.get('target_bound_syntax_repair') is not True:
+            return {}
+        target_path = str(
+            recovery_context.get('saved_text_path')
+            or recovery_context.get('text_artifact_target_path')
+            or ''
+        ).strip()
+        if not target_path:
+            return {}
+        target = Path(target_path).expanduser()
+        try:
+            if not target.is_file() or target.stat().st_size > 512_000:
+                return {}
+            current_content = target.read_text(
+                encoding='utf-8',
+                errors='replace',
+            )
+        except OSError:
+            return {}
+        extension = re.sub(
+            r'[^a-zA-Z0-9]+',
+            '',
+            str(
+                recovery_context.get('text_artifact_extension')
+                or target.suffix
+                or ''
+            ).strip().lower().lstrip('.'),
+        )
+        current_issues = (
+            ResponseSemanticsRuntimeOwner.text_artifact_syntax_sanity_issues_for_extension(
+                extension,
+                strip_enclosing_text_artifact_fence(
+                    current_content,
+                    extension,
+                ),
+            )
+        )
+        if not current_issues:
+            return {}
+        reported_issues = [
+            str(issue).strip()
+            for issue in (recovery_context.get('syntax_sanity_issues') or [])
+            if str(issue).strip()
+        ] if isinstance(recovery_context.get('syntax_sanity_issues'), list) else []
+        if not reported_issues:
+            return {}
+        source_name = str(
+            recovery_context.get('text_artifact_source_name')
+            or target.stem
+            or ''
+        ).strip()
+        content_payload = '\n'.join(
+            [
+                f'Target text artifact: {target_path}',
+                'Deterministic syntax sanity issues:',
+                *[f'- {issue}' for issue in reported_issues],
+                *ResponseSemanticsRuntimeOwner._bounded_repair_content_block(
+                    'Current saved target file content',
+                    current_content,
+                ),
+                (
+                    'Update only the target text artifact. Preserve valid runtime '
+                    'artifact links, copy, and layout intent. Fix the syntax defects '
+                    'above before closure.'
+                ),
+            ]
+        ).strip()
+        if not content_payload:
+            return {}
+        return {
+            'target_path': target_path,
+            'extension': extension,
+            'source_name': source_name,
+            'syntax_sanity_issues': reported_issues,
+            'current_syntax_sanity_issues': current_issues,
+            'content_payload': content_payload,
+        }
+
     def auto_executable_repair_recovery_allowed(
         self,
         branch: Mapping[str, Any],
@@ -3387,13 +3578,35 @@ class LateFillRuntimeOwner:
             and not required_tts_recovery
         ):
             return False
+        syntax_failure = str(
+            recovery_context.get('error_code') or ''
+        ).strip().upper() == 'TEXT_ARTIFACT_SYNTAX_SANITY_FAILED'
+        target_bound_syntax_evidence = (
+            self._target_bound_saved_text_syntax_repair_evidence(
+                recovery_context
+            )
+            if syntax_failure
+            else {}
+        )
+        if syntax_failure and self._branch_has_target_bound_saved_text_syntax_repair_attempt(
+            branch
+        ):
+            return False
+        if (
+            syntax_failure
+            and recovery_context.get('target_bound_syntax_repair') is True
+            and not target_bound_syntax_evidence
+        ):
+            return False
+        if target_bound_syntax_evidence and not required_text_artifact:
+            return False
         try:
             retry_count = int(branch.get('auto_executable_repair_retry_count') or 0)
         except (TypeError, ValueError):
             retry_count = 0
         max_attempts = self.auto_executable_repair_max_attempts(branch)
         max_retries = max(0, max_attempts - 1)
-        if retry_count >= max_retries:
+        if not target_bound_syntax_evidence and retry_count >= max_retries:
             return False
         execution_policy = (
             self._repair_text_from_branch_or_contract(branch, 'repair_execution_policy')
@@ -3455,6 +3668,11 @@ class LateFillRuntimeOwner:
             retry_count = int(branch.get('auto_executable_repair_retry_count') or 0)
         except (TypeError, ValueError):
             retry_count = 0
+        target_bound_syntax_evidence = (
+            self._target_bound_saved_text_syntax_repair_evidence(
+                recovery_context
+            )
+        )
         tts_auto_recovery = (
             self._required_tts_auto_recovery_allowed(
                 branch,
@@ -3464,9 +3682,16 @@ class LateFillRuntimeOwner:
         resolved_trigger = (
             _TTS_AUTO_RECOVERY_TRIGGER
             if tts_auto_recovery
+            else _TARGET_BOUND_SAVED_TEXT_SYNTAX_REPAIR_TRIGGER
+            if target_bound_syntax_evidence
             else str(trigger or '').strip() or 'auto_executable_repair_retry'
         )
         max_attempts = self.auto_executable_repair_max_attempts(branch)
+        retry_max_attempts = (
+            min(max_attempts, retry_count + 2)
+            if target_bound_syntax_evidence
+            else max_attempts
+        )
         retry_branch = {
             key: value
             for key, value in dict(branch).items()
@@ -3496,6 +3721,8 @@ class LateFillRuntimeOwner:
             recovery_context.get('suggested_action') or recovery_state.get('suggested_action'),
             default=RECOVERY_ACTION_RETRY_SAME_BRANCH,
         )
+        if target_bound_syntax_evidence:
+            action = RECOVERY_ACTION_RETRY_SAME_BRANCH
         retry_recovery_state = dict(recovery_state)
         retry_recovery_state.update(
             {
@@ -3572,6 +3799,16 @@ class LateFillRuntimeOwner:
                     ),
                 }
             )
+        elif target_bound_syntax_evidence:
+            recovery_attempt.update(
+                {
+                    'attempt_number': 1,
+                    'maximum_attempts': 1,
+                    'prior_error_code': (
+                        'TEXT_ARTIFACT_SYNTAX_SANITY_FAILED'
+                    ),
+                }
+            )
         retry_branch.update(
             {
                 'status': 'pending',
@@ -3582,7 +3819,7 @@ class LateFillRuntimeOwner:
                 'recovery_action': action,
                 'suggested_action': action,
                 'auto_executable_repair_retry_count': retry_count + 1,
-                'auto_executable_repair_max_attempts': max_attempts,
+                'auto_executable_repair_max_attempts': retry_max_attempts,
                 'recovery_context': dict(recovery_context),
                 'recovery_state': {
                     key: value
@@ -3603,6 +3840,64 @@ class LateFillRuntimeOwner:
         if tts_auto_recovery:
             retry_branch['recovery_policy_id'] = (
                 _TTS_AUTO_RECOVERY_POLICY_ID
+            )
+        if target_bound_syntax_evidence:
+            target_path = str(
+                target_bound_syntax_evidence.get('target_path') or ''
+            ).strip()
+            extension = str(
+                target_bound_syntax_evidence.get('extension') or ''
+            ).strip()
+            source_name = str(
+                target_bound_syntax_evidence.get('source_name') or ''
+            ).strip()
+            for key in (
+                'artifact_prompt',
+                'artifact_prompt_source',
+                'batch_prompts',
+                'batch_prompts_source',
+                'phase_summary',
+            ):
+                retry_branch.pop(key, None)
+            retry_branch.update(
+                {
+                    'check_kind': 'text_artifact_syntax_sanity',
+                    'role': 'text_artifact_syntax_repair',
+                    'repair_scope': 'syntax_only',
+                    'resource_class': 'text_io',
+                    'dependency_policy': 'target_artifact_snapshot_only',
+                    'runtime_scheduling_context': {
+                        'repair_scope': 'syntax_only',
+                        'resource_class': 'text_io',
+                        'dependency_policy': (
+                            'target_artifact_snapshot_only'
+                        ),
+                    },
+                    'content_payload': target_bound_syntax_evidence[
+                        'content_payload'
+                    ],
+                    'content_payload_source': (
+                        'closure_text_artifact_syntax_sanity'
+                    ),
+                    'stage_direction': (
+                        'materialize_requested_text_artifact'
+                    ),
+                    'requires_artifact': True,
+                    'text_artifact_extension': extension,
+                    'text_artifact_source_name': source_name,
+                    'text_artifact_source': 'closure_syntax_repair',
+                    'text_artifact_target_path': target_path,
+                    'artifact_request': {
+                        'extension': extension,
+                        'source_name': source_name,
+                        'source': 'closure_syntax_repair',
+                        'target_path': target_path,
+                    },
+                    'review_criteria': [
+                        'html_css_syntax_sanity',
+                        'preserve_runtime_artifact_links',
+                    ],
+                }
             )
         return retry_branch
 
@@ -4175,6 +4470,32 @@ class LateFillRuntimeOwner:
             'graph_patch_successor_reopen',
             'graph_rebase_partial_successor',
         }
+        execution_contract = (
+            artifact_gap_payload.get('execution_contract')
+            if isinstance(artifact_gap_payload.get('execution_contract'), Mapping)
+            else {}
+        )
+        graph_branch_execution = bool(
+            artifact_gap_payload.get('branch_id')
+            or artifact_gap_payload.get('phase_id')
+            or execution_contract.get('branch_id')
+            or execution_contract.get('phase_id')
+        )
+        if graph_branch_execution:
+            # The normalized request is a frozen root envelope. A graph branch
+            # may restore only materialization authority explicitly carried by
+            # that branch; sibling/root publication must not leak into it.
+            inherited_materialization_fields = (
+                _BRANCH_LOCAL_MATERIALIZATION_FIELDS
+                | _BRANCH_LOCAL_PUBLICATION_FIELDS
+                | {
+                    key
+                    for key in late_fill_payload
+                    if str(key).startswith('saved_')
+                }
+            )
+            for key in inherited_materialization_fields:
+                late_fill_payload.pop(key, None)
         for key in (
             'execution_contract',
             'workload_task_ref',
@@ -4256,6 +4577,7 @@ class LateFillRuntimeOwner:
             'text_artifact_revision_preservation_required',
             'text_artifact_revision_preservation_policy',
             'text_artifact_requests',
+            'text_artifact_request',
             'artifact_request',
             'file_path',
             'input_artifacts',
@@ -4475,7 +4797,7 @@ class LateFillRuntimeOwner:
             and content_payload
         ):
             late_fill_payload['prompt'] = content_payload
-            late_fill_payload['_prompt_hint'] = original_prompt or content_payload
+            late_fill_payload['_prompt_hint'] = content_payload
             late_fill_payload['suppress_reference_file_context'] = True
         elif (
             normalized_expected_capability == 'chat'
@@ -4530,8 +4852,20 @@ class LateFillRuntimeOwner:
                 root_scoped_execution=root_scoped_execution,
             )
         late_fill_payload.pop('ghost_preview', None)
+        semantic_review_stage = str(
+            artifact_gap_payload.get('stage_direction') or ''
+        ).strip() in {
+            'run_global_semantic_closure_review',
+            'run_branch_semantic_review',
+        }
+        if semantic_review_stage:
+            # Semantic reviewers receive the explicit bounded evidence packet,
+            # never a second prompt path through carried conversation history.
+            for key in ('input', 'messages', 'ghost_messages', 'batch_prompts'):
+                late_fill_payload.pop(key, None)
         should_attach_ghost_messages = (
             not successor_branch_execution
+            and not semantic_review_stage
             and (
                 self.parse_bool(late_fill_payload.get('ghost_route'), default=False)
                 or late_fill_trigger == 'execution_planner_deferred_follow_up'
@@ -5684,6 +6018,76 @@ class LateFillRuntimeOwner:
         return _overlay_runtime_phase_statuses(dict(route_graph)) if route_graph else {}
 
     @staticmethod
+    def overlay_graph_branch_with_runtime_state(
+        graph_branch: Mapping[str, Any],
+        runtime_branch: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Overlay branch state without inheriting another branch's publication."""
+
+        graph_payload = dict(graph_branch or {})
+        runtime_payload = dict(runtime_branch or {})
+        publication_fields = _BRANCH_LOCAL_PUBLICATION_FIELDS | {
+            key for key in (*graph_payload.keys(), *runtime_payload.keys())
+            if str(key).startswith('saved_')
+        }
+        explicit_publication = {
+            key: runtime_payload[key]
+            for key in publication_fields
+            if key in runtime_payload and runtime_payload[key] not in (None, '', [], {})
+        }
+        for key in publication_fields:
+            graph_payload.pop(key, None)
+            runtime_payload.pop(key, None)
+        graph_payload.update(runtime_payload)
+        graph_payload.update(explicit_publication)
+        return graph_payload
+
+    @staticmethod
+    def _is_semantic_review_branch(*payloads: Mapping[str, Any]) -> bool:
+        semantic_review_stages = {
+            'run_global_semantic_closure_review',
+            'run_branch_semantic_review',
+        }
+        for payload in payloads:
+            if not isinstance(payload, Mapping):
+                continue
+            stage_direction = str(payload.get('stage_direction') or '').strip().lower()
+            if stage_direction in semantic_review_stages:
+                return True
+            execution_contract = (
+                payload.get('execution_contract')
+                if isinstance(payload.get('execution_contract'), Mapping)
+                else {}
+            )
+            if str(execution_contract.get('stage_direction') or '').strip().lower() in semantic_review_stages:
+                return True
+        return False
+
+    @staticmethod
+    def project_internal_semantic_review_result(
+        infer_result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Keep verdict text while preventing review output from becoming an artifact."""
+
+        projected = dict(infer_result or {})
+        publication_fields = _BRANCH_LOCAL_PUBLICATION_FIELDS | {
+            key for key in projected if str(key).startswith('saved_')
+        }
+        for key in publication_fields:
+            projected.pop(key, None)
+        projected['visibility'] = 'internal'
+        projected['surface_role'] = 'closure_evidence'
+        for contract_key in ('execution_contract', 'output_contract'):
+            contract = projected.get(contract_key)
+            if not isinstance(contract, Mapping):
+                continue
+            projected_contract = dict(contract)
+            projected_contract['visibility'] = 'internal'
+            projected_contract['surface_role'] = 'closure_evidence'
+            projected[contract_key] = projected_contract
+        return projected
+
+    @staticmethod
     def _artifact_record_merge_key(item: Mapping[str, Any]) -> tuple[str, str, str]:
         path = str(item.get('path') or '').strip()
         source_path = str(item.get('source_path') or '').strip()
@@ -6631,7 +7035,19 @@ class LateFillRuntimeOwner:
             result_payload['capability'] = capability
         if not result_payload.get('depends_on') and branch.get('depends_on'):
             result_payload['depends_on'] = list(branch.get('depends_on') or [])
-        if self.late_fill_result_has_missing_dependency_evidence(result_payload):
+        stage_direction = str(
+            branch.get('stage_direction')
+            or result_payload.get('stage_direction')
+            or ''
+        ).strip().lower()
+        semantic_review_branch = stage_direction in {
+            'run_global_semantic_closure_review',
+            'run_branch_semantic_review',
+        }
+        if (
+            not semantic_review_branch
+            and self.late_fill_result_has_missing_dependency_evidence(result_payload)
+        ):
             return {
                 'code': 'DEPENDENCY_CHAIN_REPAIR_REQUIRED',
                 'message': 'Dependency evidence repair required: the branch did not receive or use the artifact evidence it depended on.',
@@ -8223,6 +8639,7 @@ class LateFillRuntimeOwner:
         source_name: str,
         target_path: str,
         revision_required: bool = False,
+        authoritative_bounded_repair: bool = False,
     ) -> list[str]:
         request = cls._required_text_artifact_request(
             branch,
@@ -8248,7 +8665,10 @@ class LateFillRuntimeOwner:
             path = str(path_value or '').strip()
             if not path:
                 return
-            if revision_required and cls._text_artifact_path_matches_target(path, target_path):
+            if (
+                (revision_required or authoritative_bounded_repair)
+                and cls._text_artifact_path_matches_target(path, target_path)
+            ):
                 # The target already existed before this branch. Its bytes are
                 # source evidence, not proof that the backend produced output.
                 return
@@ -8272,7 +8692,7 @@ class LateFillRuntimeOwner:
 
         candidate_sources = (
             (infer_result,)
-            if revision_required
+            if revision_required or authoritative_bounded_repair
             else (infer_result, effective_data, branch)
         )
         for source in candidate_sources:
@@ -8374,6 +8794,11 @@ class LateFillRuntimeOwner:
             infer_result,
             artifact_request,
         )
+        authoritative_bounded_repair = any(
+            self._artifact_gap_is_authoritative_bounded_text_artifact_repair(source)
+            for source in (branch, effective_data, infer_result)
+            if isinstance(source, Mapping)
+        )
         revision_preservation_required = bool(
             revision_required
             and (
@@ -8407,7 +8832,12 @@ class LateFillRuntimeOwner:
             target_path,
             extension=normalized_extension,
         )
-        if not revision_required and existing_payload_error is None and target.is_file():
+        if (
+            not revision_required
+            and not authoritative_bounded_repair
+            and existing_payload_error is None
+            and target.is_file()
+        ):
             try:
                 content = target.read_text(encoding='utf-8', errors='replace')
             except OSError:
@@ -8423,8 +8853,19 @@ class LateFillRuntimeOwner:
                     evidence='target_path_saved_text_artifact_evidence',
                 ), None
 
+        syntax_repair_source = str(
+            branch.get('text_artifact_source')
+            or artifact_request.get('source')
+            or effective_data.get('text_artifact_source')
+            or ''
+        ).strip() in {'closure_syntax_repair'} or str(
+            branch.get('content_payload_source')
+            or effective_data.get('content_payload_source')
+            or ''
+        ).strip() in {'closure_text_artifact_syntax_sanity'}
         if (
             not revision_required
+            and (not authoritative_bounded_repair or syntax_repair_source)
             and
             existing_payload_error
             and existing_payload_error.get('code') == 'TEXT_ARTIFACT_SYNTAX_SANITY_FAILED'
@@ -8489,6 +8930,7 @@ class LateFillRuntimeOwner:
             source_name=source_name,
             target_path=target_path,
             revision_required=revision_required,
+            authoritative_bounded_repair=authoritative_bounded_repair,
         ):
             candidate_content, candidate_error = self._text_artifact_content_payload_error(
                 candidate,
@@ -8585,6 +9027,20 @@ class LateFillRuntimeOwner:
                 'suggested_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
                 'retryable': True,
             }
+        if authoritative_bounded_repair:
+            return infer_result, {
+                'code': 'TEXT_ARTIFACT_REPAIR_OUTPUT_MISSING',
+                'message': (
+                    'Required bounded text artifact repair returned without a valid '
+                    'branch-produced file body. Existing target bytes are repair input '
+                    'only and cannot fulfill the repair obligation.'
+                ),
+                'target_path': target_path,
+                'text_artifact_extension': normalized_extension or None,
+                'text_artifact_source_name': source_name or None,
+                'suggested_action': RECOVERY_ACTION_RETRY_SAME_BRANCH,
+                'retryable': True,
+            }
         return infer_result, None
 
     @classmethod
@@ -8635,7 +9091,10 @@ class LateFillRuntimeOwner:
                     'saved artifact bytes pass syntax checks.'
                 ),
                 'saved_text_path': path,
+                'text_artifact_target_path': path,
                 'text_artifact_extension': normalized_extension or None,
+                'text_artifact_source_name': target.stem or None,
+                'saved_file_syntax_failure': True,
                 'syntax_sanity_status': 'issues',
                 'syntax_sanity_issue_count': len(syntax_issues),
                 'syntax_sanity_issues': syntax_issues[:12],
@@ -9065,6 +9524,8 @@ class LateFillRuntimeOwner:
     ) -> dict[str, Any]:
         if not self._branch_is_required_text_artifact(branch):
             return {}
+        if self._artifact_gap_is_authoritative_bounded_text_artifact_repair(branch):
+            return {}
         if self._text_artifact_revision_required(branch) and not any(
             isinstance(payload, Mapping)
             and self._text_artifact_revision_write_proven(branch, payload)
@@ -9151,6 +9612,11 @@ class LateFillRuntimeOwner:
     ) -> bool:
         if self._text_artifact_revision_required(branch):
             return self._text_artifact_revision_write_proven(branch, payload)
+        if self._artifact_gap_is_authoritative_bounded_text_artifact_repair(branch):
+            return self._authoritative_bounded_text_artifact_repair_has_write_evidence(
+                branch,
+                payload,
+            )
         artifact_request = branch.get('artifact_request') if isinstance(branch.get('artifact_request'), Mapping) else {}
         extension = str(
             branch.get('text_artifact_extension')
@@ -9175,6 +9641,82 @@ class LateFillRuntimeOwner:
                 target_path=target_path,
             )
         )
+
+    @classmethod
+    def _authoritative_bounded_text_artifact_repair_has_write_evidence(
+        cls,
+        branch: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> bool:
+        artifact_request = (
+            branch.get('artifact_request')
+            if isinstance(branch.get('artifact_request'), Mapping)
+            else {}
+        )
+        target_path = (
+            cls._text_artifact_target_path_from_mapping(branch)
+            or cls._text_artifact_target_path_from_mapping(artifact_request)
+        )
+        if not target_path:
+            return False
+        late_fill = (
+            payload.get('late_fill')
+            if isinstance(payload.get('late_fill'), Mapping)
+            else {}
+        )
+
+        def path_matches(record: Mapping[str, Any]) -> bool:
+            candidate = str(
+                record.get('target_path')
+                or record.get('to_path')
+                or record.get('saved_text_path')
+                or record.get('path')
+                or ''
+            ).strip()
+            return bool(
+                candidate
+                and cls._text_artifact_path_matches_target(candidate, target_path)
+            )
+
+        for collection_key in (
+            'linked_artifact_rebinds',
+            'syntax_sanity_repairs',
+            'composed_page_image_representation_repairs',
+            'hero_image_composition_repairs',
+        ):
+            for raw_record in late_fill.get(collection_key) or []:
+                if not isinstance(raw_record, Mapping):
+                    continue
+                if (
+                    str(raw_record.get('status') or '').strip().lower() == 'applied'
+                    and path_matches(raw_record)
+                ):
+                    return True
+
+        write_sources = {
+            'target_path_authoritative_repair_output',
+            'target_path_deterministic_syntax_repair',
+            'canonical_text_artifact_deterministic_syntax_repair',
+        }
+        record_collections = [
+            payload.get('artifacts') or [],
+            payload.get('saved_text_artifacts') or [],
+            late_fill.get('fill_results') or [],
+        ]
+        for collection in record_collections:
+            for raw_record in collection:
+                if not isinstance(raw_record, Mapping) or not path_matches(raw_record):
+                    continue
+                source = str(raw_record.get('text_artifact_source') or '').strip()
+                if source in write_sources:
+                    return True
+                repair = raw_record.get('target_path_authoritative_repair')
+                if (
+                    isinstance(repair, Mapping)
+                    and str(repair.get('status') or '').strip().lower() == 'applied'
+                ):
+                    return True
+        return False
 
     def _reconcile_satisfied_failed_text_artifact_branches(
         self,
@@ -9488,7 +10030,15 @@ class LateFillRuntimeOwner:
             path = self._artifact_record_path(record)
             if not artifact_type and path:
                 extension = Path(path).suffix.lower().lstrip('.')
-                artifact_type = 'image' if extension in _LINK_REBIND_IMAGE_EXTENSIONS else 'text'
+                extension_families = self._link_rebind_extension_families(extension)
+                artifact_type = next(
+                    (
+                        family
+                        for family in ('image', 'audio', 'video', 'font', 'style', 'script')
+                        if family in extension_families
+                    ),
+                    'text',
+                )
                 record['type'] = artifact_type
                 record.setdefault('kind', artifact_type)
             key = (
@@ -9509,10 +10059,18 @@ class LateFillRuntimeOwner:
         if isinstance(raw_artifacts, Mapping):
             for key in ('output', 'reference', 'input'):
                 for artifact in raw_artifacts.get(key) or []:
-                    add_record(artifact)
+                    add_record(
+                        artifact,
+                        defaults={
+                            '_link_rebind_public_output': key == 'output',
+                        },
+                    )
         else:
             for artifact in raw_artifacts or []:
-                add_record(artifact)
+                add_record(
+                    artifact,
+                    defaults={'_link_rebind_public_output': True},
+                )
         for key in ('input_artifacts', 'reference_artifacts', 'selected_reference_artifacts'):
             for artifact in payload.get(key) or []:
                 add_record(artifact)
@@ -9525,6 +10083,8 @@ class LateFillRuntimeOwner:
             add_record({'type': 'text', 'path': payload.get('saved_text_path')})
         if str(payload.get('saved_image_path') or '').strip():
             add_record({'type': 'image', 'path': payload.get('saved_image_path')})
+        if str(payload.get('saved_audio_path') or '').strip():
+            add_record({'type': 'audio', 'path': payload.get('saved_audio_path')})
 
         late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
         batch_prompts = [
@@ -9611,6 +10171,15 @@ class LateFillRuntimeOwner:
                         'prompt': prompt_text or None,
                         'artifact_prompt': prompt_text or None,
                         'link_rebind_search_text': prompt_text or None,
+                    },
+                    defaults=defaults,
+                )
+            if str(result.get('saved_audio_path') or '').strip():
+                add_record(
+                    {
+                        'type': 'audio',
+                        'path': result.get('saved_audio_path'),
+                        'mime_type': result.get('audio_mimetype'),
                     },
                     defaults=defaults,
                 )
@@ -10029,7 +10598,8 @@ class LateFillRuntimeOwner:
         tag_start = str(content or '').rfind('<', 0, max(0, match_start))
         if tag_start < 0:
             return ''
-        tag_prefix = str(content or '')[tag_start:match_start].lower()
+        source = str(content or '')
+        tag_prefix = source[tag_start:match_start].lower()
         tag_match = re.match(r'<\s*([a-z0-9:-]+)', tag_prefix)
         tag_name = tag_match.group(1) if tag_match else ''
         if tag_name in {'img', 'picture'}:
@@ -10038,6 +10608,22 @@ class LateFillRuntimeOwner:
             return 'audio'
         if tag_name == 'video':
             return 'video'
+        if tag_name == 'source':
+            tag_end = source.find('>', match_start)
+            tag_text = source[tag_start : tag_end + 1 if tag_end >= 0 else match_start].lower()
+            type_match = re.search(r'\btype\s*=\s*[\'"]?(audio|video)/', tag_text)
+            if type_match:
+                return str(type_match.group(1) or '')
+            preceding = source[:tag_start].lower()
+            audio_open = preceding.rfind('<audio')
+            video_open = preceding.rfind('<video')
+            picture_open = preceding.rfind('<picture')
+            if audio_open > preceding.rfind('</audio') and audio_open > max(video_open, picture_open):
+                return 'audio'
+            if video_open > preceding.rfind('</video') and video_open > max(audio_open, picture_open):
+                return 'video'
+            if picture_open > preceding.rfind('</picture') and picture_open > max(audio_open, video_open):
+                return 'image'
         if tag_name == 'script':
             return 'script'
         if tag_name == 'link':
@@ -10230,14 +10816,15 @@ class LateFillRuntimeOwner:
         target_path: str,
         target_record: Mapping[str, Any],
         asset_records: list[dict[str, Any]],
+        fallback_asset_records: Optional[list[dict[str, Any]]] = None,
         static_fetch_asset_records: Optional[list[dict[str, Any]]] = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         changes: list[dict[str, Any]] = []
         used_asset_paths: set[str] = set()
 
-        def is_html_sibling_link(url: str) -> bool:
+        def is_exact_named_text_link(url: str) -> bool:
             extension = Path(str(url or '').split('?', 1)[0].split('#', 1)[0]).suffix.lower().lstrip('.')
-            return extension in {'html', 'htm'}
+            return extension in _LINK_REBIND_TEXT_EXTENSIONS
 
         def choose_asset_record(
             url: str,
@@ -10250,24 +10837,22 @@ class LateFillRuntimeOwner:
             ]
             if not viable_candidates:
                 return None
+            if is_exact_named_text_link(url):
+                # A named local text dependency is one logical file even when
+                # repair attempts left sibling candidates behind. Repeated
+                # links must keep resolving to the same first canonical
+                # identity instead of consuming a different sibling per use.
+                return self._exact_asset_record_for_url(url, viable_candidates)
             unused_candidates = [
                 record
                 for record in viable_candidates
                 if self._artifact_record_path(record) not in used_asset_paths
             ]
-            record = (
-                self._exact_asset_record_for_url(url, unused_candidates)
-                if is_html_sibling_link(url)
-                else self._preferred_asset_for_url(url, unused_candidates)
-            )
-            if not record and unused_candidates and not is_html_sibling_link(url):
+            record = self._preferred_asset_for_url(url, unused_candidates)
+            if not record and unused_candidates:
                 record = unused_candidates[0]
             if not record:
-                record = (
-                    self._exact_asset_record_for_url(url, viable_candidates)
-                    if is_html_sibling_link(url)
-                    else self._preferred_asset_for_url(url, viable_candidates) or viable_candidates[0]
-                )
+                record = self._preferred_asset_for_url(url, viable_candidates) or viable_candidates[0]
             if not record:
                 return None
             linked_path = self._artifact_record_path(record)
@@ -10287,6 +10872,38 @@ class LateFillRuntimeOwner:
                 return url, None
             return self._relative_artifact_link(from_path=target_path, to_path=linked_path), record
 
+        def unique_same_response_family_fallback(
+            extension: str,
+            preferred_family: str,
+        ) -> tuple[list[dict[str, Any]], str]:
+            family = str(preferred_family or '').strip().lower()
+            if not family:
+                extension_families = self._link_rebind_extension_families(extension)
+                if len(extension_families) == 1:
+                    family = next(iter(extension_families))
+            if family not in {'image', 'audio', 'video', 'font'}:
+                return [], ''
+            family_records = self._unique_artifact_records_by_path(
+                self._link_rebind_records_for_family(
+                    family,
+                    list(fallback_asset_records or []),
+                )
+            )
+            concrete_records: list[dict[str, Any]] = []
+            for record in family_records:
+                path = self._artifact_record_path(record)
+                if not path:
+                    continue
+                try:
+                    if not Path(path).expanduser().is_file():
+                        continue
+                except OSError:
+                    continue
+                concrete_records.append(record)
+            if len(concrete_records) != 1:
+                return [], ''
+            return concrete_records, family
+
         def replace_attr(match: re.Match[str]) -> str:
             url = match.group('url')
             if self._link_rebind_url_matches_record_identity(url, target_record):
@@ -10298,6 +10915,12 @@ class LateFillRuntimeOwner:
                 asset_records,
                 preferred_family=preferred_family,
             )
+            fallback_family = ''
+            if not candidates:
+                candidates, fallback_family = unique_same_response_family_fallback(
+                    extension,
+                    preferred_family,
+                )
             if not self._link_url_needs_rebind(
                 url,
                 candidates,
@@ -10317,6 +10940,16 @@ class LateFillRuntimeOwner:
                         'external_image_attribute_link'
                         if _EXTERNAL_LINK_RE.match(str(url or '').strip())
                         else 'attribute_link'
+                    ),
+                    **(
+                        {
+                            'selection_policy': (
+                                'unique_same_response_family_fallback_after_declared_dependency_gap'
+                            ),
+                            'fallback_family': fallback_family,
+                        }
+                        if fallback_family
+                        else {}
                     ),
                 }
             )
@@ -10569,6 +11202,15 @@ class LateFillRuntimeOwner:
                     available_asset_records,
                 )
             )
+            fallback_asset_records = (
+                [
+                    item
+                    for item in available_asset_records
+                    if item.get('_link_rebind_public_output') is True
+                ]
+                if dependency_ids
+                else []
+            )
             try:
                 target = Path(target_path).expanduser()
                 if not target.is_file() or target.stat().st_size > 512_000:
@@ -10588,6 +11230,7 @@ class LateFillRuntimeOwner:
                     target_path=target_path,
                     target_record=record,
                     asset_records=consumer_asset_records,
+                    fallback_asset_records=fallback_asset_records,
                     static_fetch_asset_records=available_asset_records,
                 )
             if not changes or rebound == original:
@@ -11260,8 +11903,15 @@ class LateFillRuntimeOwner:
 
         updated_payload = dict(payload or {})
         refreshed_by_path: dict[str, dict[str, Any]] = {}
+        path_by_artifact_ref: dict[str, str] = {}
         refresh_entries: list[dict[str, Any]] = []
         for record in text_records:
+            artifact_ref = str(
+                record.get('artifact_ref') or record.get('ref') or ''
+            ).strip()
+            record_path = normalize_path(self._artifact_record_path(record))
+            if artifact_ref and record_path:
+                path_by_artifact_ref.setdefault(artifact_ref, record_path)
             refreshed, metadata = refresh_text_artifact_record_from_saved_path(record)
             if metadata.get('final_text_artifact_refresh_status') != 'refreshed':
                 continue
@@ -11307,12 +11957,21 @@ class LateFillRuntimeOwner:
                 return raw_record
             record = dict(raw_record)
             path = normalize_path(self._artifact_record_path(record))
+            if not path:
+                artifact_ref = str(
+                    record.get('artifact_ref') or record.get('ref') or ''
+                ).strip()
+                path = path_by_artifact_ref.get(artifact_ref, '')
             refreshed = refreshed_by_path.get(path)
             if not refreshed:
                 return record
             record.update(refreshed)
             content = refreshed.get('content')
             if isinstance(content, str):
+                if 'value' in record:
+                    record['value'] = content
+                if 'text' in record:
+                    record['text'] = content
                 if 'result_text' in record:
                     record['result_text'] = content
                 if 'content_payload' in record:
@@ -11329,6 +11988,27 @@ class LateFillRuntimeOwner:
                 refresh_text_record(item)
                 for item in updated_payload.get('saved_text_artifacts') or []
             ]
+        if isinstance(updated_payload.get('outputs'), list):
+            updated_payload['outputs'] = [
+                refresh_text_record(item)
+                for item in updated_payload.get('outputs') or []
+            ]
+        if isinstance(updated_payload.get('output_slots'), list):
+            updated_payload['output_slots'] = [
+                refresh_text_record(item)
+                for item in updated_payload.get('output_slots') or []
+            ]
+        output = (
+            dict(updated_payload.get('output') or {})
+            if isinstance(updated_payload.get('output'), Mapping)
+            else None
+        )
+        if output is not None and isinstance(output.get('outputs'), list):
+            output['outputs'] = [
+                refresh_text_record(item)
+                for item in output.get('outputs') or []
+            ]
+            updated_payload['output'] = output
         late_fill = (
             dict(updated_payload.get('late_fill') or {})
             if isinstance(updated_payload.get('late_fill'), Mapping)
@@ -11883,35 +12563,74 @@ class LateFillRuntimeOwner:
     ) -> dict[str, Any]:
         target_extension = str(extension or '').strip().lower().lstrip('.')
         target_source_name = str(source_name or '').strip().lower()
-        normalized_target_path = str(target_path or '').strip()
-        for branch_key in ('completed_branches', 'pending_branches', 'active_branches', 'failed_branches'):
-            for branch in late_fill.get(branch_key) or []:
-                if not isinstance(branch, Mapping):
-                    continue
-                artifact_request = (
-                    branch.get('artifact_request')
-                    if isinstance(branch.get('artifact_request'), Mapping)
-                    else {}
-                )
-                branch_extension = str(
+        normalized_target_path = self._normalized_text_artifact_path_for_match(
+            target_path
+        )
+        candidate_branches = [
+            branch
+            for branch_key in (
+                'completed_branches',
+                'pending_branches',
+                'active_branches',
+                'failed_branches',
+            )
+            for branch in (late_fill.get(branch_key) or [])
+            if isinstance(branch, Mapping)
+        ]
+
+        def branch_artifact_identity(
+            branch: Mapping[str, Any],
+        ) -> tuple[str, str, str]:
+            artifact_request = (
+                branch.get('artifact_request')
+                if isinstance(branch.get('artifact_request'), Mapping)
+                else {}
+            )
+            return (
+                str(
                     branch.get('text_artifact_extension')
                     or artifact_request.get('extension')
                     or ''
-                ).strip().lower().lstrip('.')
-                branch_source_name = str(
+                ).strip().lower().lstrip('.'),
+                str(
                     branch.get('text_artifact_source_name')
                     or artifact_request.get('source_name')
                     or ''
-                ).strip().lower()
-                branch_target_path = str(
+                ).strip().lower(),
+                str(
                     branch.get('text_artifact_target_path')
                     or artifact_request.get('target_path')
                     or ''
-                ).strip()
-                if normalized_target_path and branch_target_path and normalized_target_path == branch_target_path:
+                ).strip(),
+            )
+
+        if normalized_target_path:
+            for branch in candidate_branches:
+                _branch_extension, _branch_source_name, branch_target_path = (
+                    branch_artifact_identity(branch)
+                )
+                if branch_target_path and self._text_artifact_path_matches_target(
+                    branch_target_path,
+                    normalized_target_path,
+                ):
                     return dict(branch)
-                if target_extension and target_source_name and branch_extension == target_extension and branch_source_name == target_source_name:
-                    return dict(branch)
+
+        # Source-name fallback is only for incomplete target metadata.  Two
+        # explicit unequal targets are distinct artifact authorities even when
+        # their extension and source name are identical.
+        for branch in candidate_branches:
+            branch_extension, branch_source_name, branch_target_path = (
+                branch_artifact_identity(branch)
+            )
+            if normalized_target_path and branch_target_path:
+                continue
+            if (
+                target_extension
+                and target_source_name
+                and branch_extension == target_extension
+                and branch_source_name == target_source_name
+            ):
+                return dict(branch)
         return {}
 
     def _terminal_unresolved_local_dependency_link_open_checks(
@@ -13716,21 +14435,6 @@ class LateFillRuntimeOwner:
         if not open_checks:
             return dict(late_fill or {})
         updated = dict(late_fill or {})
-        blocking_branch_ids = {
-            str(check.get('branch_id') or check.get('phase_id') or '').strip()
-            for check in open_checks
-            if str(check.get('branch_id') or check.get('phase_id') or '').strip()
-        }
-        repair_evidence_tokens = {
-            'terminal_linked_artifact_rebind_applied',
-            'terminal_inline_text_artifact_materialized',
-            'canonical_text_artifact_evidence',
-        }
-        repair_roles = {
-            'linked_artifact_binding_review',
-            'text_artifact_syntax_repair',
-            'text_artifact_output',
-        }
         completed_records = [
             dict(item)
             for item in (updated.get('completed_branches') or [])
@@ -13751,10 +14455,6 @@ class LateFillRuntimeOwner:
         compact_checks = self._compact_terminal_materialization_checks(open_checks)
 
         def check_matches_branch(check: Mapping[str, Any], branch: Mapping[str, Any]) -> bool:
-            branch_id = self.branch_id(branch)
-            check_id = str(check.get('branch_id') or check.get('phase_id') or '').strip()
-            if branch_id and check_id and branch_id == check_id:
-                return True
             branch_request = branch.get('artifact_request') if isinstance(branch.get('artifact_request'), Mapping) else {}
             check_request = check.get('artifact_request') if isinstance(check.get('artifact_request'), Mapping) else {}
             branch_target = str(
@@ -13767,7 +14467,14 @@ class LateFillRuntimeOwner:
                 or check_request.get('target_path')
                 or ''
             ).strip()
-            if branch_target and check_target and branch_target == check_target:
+            if branch_target and check_target:
+                return self._text_artifact_path_matches_target(
+                    branch_target,
+                    check_target,
+                )
+            branch_id = self.branch_id(branch)
+            check_id = str(check.get('branch_id') or check.get('phase_id') or '').strip()
+            if branch_id and check_id and branch_id == check_id:
                 return True
             branch_extension = str(
                 branch.get('text_artifact_extension')
@@ -13842,15 +14549,13 @@ class LateFillRuntimeOwner:
 
         for branch in completed_records:
             branch_id = self.branch_id(branch)
-            evidence = str(branch.get('evidence') or '').strip()
-            role = str(branch.get('role') or '').strip()
+            matching_check = any(
+                isinstance(check, Mapping) and check_matches_branch(check, branch)
+                for check in open_checks
+            )
             should_demote = bool(
                 branch_id
-                and (
-                    branch_id in blocking_branch_ids
-                    or evidence in repair_evidence_tokens
-                    or role in repair_roles
-                )
+                and matching_check
                 and str(branch.get('status') or '').strip().lower() == 'fulfilled'
             )
             if not should_demote:
@@ -13873,6 +14578,7 @@ class LateFillRuntimeOwner:
                 pending_records.append(demoted)
                 pending_ids.add(branch_id)
         if not demoted_records:
+            updated.pop('materialization_contract_current_demoted_branches', None)
             return updated
         updated['completed_branches'] = retained_completed
         updated['completed_branch_count'] = len(retained_completed)
@@ -13884,6 +14590,10 @@ class LateFillRuntimeOwner:
             if isinstance(item, Mapping)
         ]
         updated['materialization_contract_demoted_branches'] = previous_demoted + demoted_records
+        # Keep the complete current execution set separate from the compact
+        # user-facing check diagnostics. Projection must support N exact
+        # branches and must not inherit the diagnostic display cap.
+        updated['materialization_contract_current_demoted_branches'] = demoted_records
         return updated
 
     def _review_terminal_graph_rebase_if_available(
@@ -14110,6 +14820,18 @@ class LateFillRuntimeOwner:
                 branch_id = self.branch_id(branch)
                 if str(branch_id or '').startswith('branch-repair-'):
                     continue
+                if branch_id and any(
+                    str(
+                        check.get('branch_id') or check.get('phase_id') or ''
+                    ).strip()
+                    == branch_id
+                    for check in open_checks
+                    if isinstance(check, Mapping)
+                ):
+                    # The authoritative contract check already explains why
+                    # this branch is open; avoid a second generic blocker for
+                    # the same repair owner.
+                    continue
                 branch_state_open_checks.append(
                     {
                         'check_kind': 'late_fill_branch_state',
@@ -14155,6 +14877,23 @@ class LateFillRuntimeOwner:
                 late_fill['skip_reason'] = 'final_materialization_contract_unmet'
                 late_fill['skip_kind'] = 'materialization_contract_unmet'
             updated_payload = self.attach_late_fill_state(updated_payload, late_fill)
+            # A terminal repair can reveal a new, narrower materialization
+            # defect (for example shared-CSS drift after HTML syntax repair).
+            # If Closure promoted that exact defect as executable, continue
+            # through the existing bounded successor instead of freezing a
+            # user-visible needs-attention state. Non-executable or exhausted
+            # checks remain terminally repair-needed below.
+            updated_payload, terminal_repair_gap = self._project_terminal_closure_repair(
+                updated_payload,
+            )
+            if terminal_repair_gap:
+                updated_payload = self.refresh_runtime_graph_repair_evidence(updated_payload)
+                projection_status = str(
+                    terminal_repair_gap.get('terminal_closure_projection_status') or 'queued'
+                ).strip().lower()
+                return updated_payload, (
+                    'pending' if projection_status == 'queued' else 'repair_needed'
+                )
             updated_payload = self.refresh_runtime_graph_repair_evidence(updated_payload)
             updated_payload = self._review_terminal_graph_rebase_if_available(
                 updated_payload,
@@ -14205,6 +14944,15 @@ class LateFillRuntimeOwner:
             route_payload=route_payload,
             artifact_gap=artifact_gap,
         )
+        updated_payload, terminal_repair_gap = self._project_terminal_closure_repair(
+            updated_payload,
+        )
+        if terminal_repair_gap:
+            updated_payload = self.refresh_runtime_graph_repair_evidence(updated_payload)
+            projection_status = str(
+                terminal_repair_gap.get('terminal_closure_projection_status') or 'queued'
+            ).strip().lower()
+            return updated_payload, ('pending' if projection_status == 'queued' else 'repair_needed')
         updated_payload = self.refresh_runtime_graph_repair_evidence(updated_payload)
         updated_payload = self._review_terminal_graph_rebase_if_available(
             updated_payload,
@@ -14212,6 +14960,263 @@ class LateFillRuntimeOwner:
             route_payload=route_payload,
         )
         return updated_payload, effective_status
+
+    def _project_terminal_closure_repair(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        if not callable(self.project_terminal_closure_repair):
+            return payload, None
+        try:
+            projection = self.project_terminal_closure_repair(payload)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning('Could not project terminal Closure repair work: %s', exc)
+            return self._blocked_terminal_closure_projection(payload, str(exc))
+        projection_status = str(
+            projection.get('status') if isinstance(projection, Mapping) else ''
+        ).strip().lower()
+        if projection_status == 'not_applicable':
+            projected_payload = (
+                projection.get('response_payload')
+                if isinstance(projection, Mapping)
+                and isinstance(projection.get('response_payload'), dict)
+                else payload
+            )
+            return projected_payload, None
+        if projection_status != 'queued':
+            projected_payload = (
+                projection.get('response_payload')
+                if isinstance(projection, Mapping)
+                and isinstance(projection.get('response_payload'), dict)
+                else payload
+            )
+            reason = (
+                str(projection.get('reason') or '').strip()
+                if isinstance(projection, Mapping)
+                else 'terminal_closure_projection_invalid'
+            )
+            return self._blocked_terminal_closure_projection(projected_payload, reason)
+        updated_payload = (
+            dict(projection.get('response_payload'))
+            if isinstance(projection.get('response_payload'), Mapping)
+            else dict(payload)
+        )
+        repair_gap = (
+            dict(projection.get('artifact_gap'))
+            if isinstance(projection.get('artifact_gap'), Mapping)
+            else {}
+        )
+        pending_branches = self.normalize_late_fill_branches(repair_gap.get('pending_branches'))
+        if not pending_branches:
+            return self._blocked_terminal_closure_projection(
+                updated_payload,
+                'terminal_closure_projection_has_no_pending_branches',
+            )
+        response_frame = (
+            updated_payload.get('response_frame')
+            if isinstance(updated_payload.get('response_frame'), Mapping)
+            else {}
+        )
+        parent_frame_id = str(
+            response_frame.get('frame_id') or updated_payload.get('id') or ''
+        ).strip()
+        execution_identity = {
+            'parent_frame_id': parent_frame_id,
+            'branch_ids': sorted(
+                self.branch_id(branch)
+                for branch in pending_branches
+                if self.branch_id(branch)
+            ),
+            'contract_ids': sorted(
+                str(branch.get('repair_contract_id') or '').strip()
+                for branch in pending_branches
+                if str(branch.get('repair_contract_id') or '').strip()
+            ),
+        }
+        execution_key = 'terminal-closure-repair-' + hashlib.sha256(
+            json.dumps(execution_identity, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        ).hexdigest()[:24]
+        pending_branches = [
+            {
+                **dict(branch),
+                'terminal_closure_repair_execution_key': execution_key,
+                'terminal_closure_repair_parent_frame_id': parent_frame_id,
+            }
+            for branch in pending_branches
+        ]
+        pending_capabilities = self.normalize_capability_list(
+            [self.branch_capability(branch) for branch in pending_branches if self.branch_capability(branch)]
+        )
+        prior_late_fill = (
+            dict(updated_payload.get('late_fill'))
+            if isinstance(updated_payload.get('late_fill'), Mapping)
+            else {}
+        )
+        reopen_record = {
+            'kind': 'ollmo.terminal_closure_repair_reopen',
+            'status': 'queued',
+            'authority': 'terminal_graph_closure_review',
+            'branch_ids': [self.branch_id(branch) for branch in pending_branches if self.branch_id(branch)],
+            'contract_ids': list(
+                dict.fromkeys(
+                    str(branch.get('repair_contract_id') or '').strip()
+                    for branch in pending_branches
+                    if str(branch.get('repair_contract_id') or '').strip()
+                )
+            ),
+            'parent_frame_id': parent_frame_id,
+            'execution_key': execution_key,
+        }
+        repair_gap.update(
+            {
+                'pending_branches': pending_branches,
+                'pending_capabilities': pending_capabilities,
+                'expected_capability': (
+                    self.normalize_capability(repair_gap.get('expected_capability'))
+                    or (pending_capabilities[0] if pending_capabilities else None)
+                ),
+                'active_capability': (
+                    self.normalize_capability(repair_gap.get('active_capability'))
+                    or (pending_capabilities[0] if pending_capabilities else None)
+                ),
+                'authoritative_pending_branches': True,
+                'pending_branch_scope': 'exact_terminal_closure_repair',
+                'terminal_closure_projection_status': 'queued',
+            }
+        )
+        pending_late_fill = self.build_late_fill_state(
+            repair_gap,
+            status='pending',
+            prior_state=prior_late_fill,
+            extra={
+                'pending_branches': pending_branches,
+                'pending_capabilities': pending_capabilities,
+                'active_branches': [],
+                'fill_results': prior_late_fill.get('fill_results') or [],
+                'completed_branches': prior_late_fill.get('completed_branches') or [],
+                'failed_branches': prior_late_fill.get('failed_branches') or [],
+                'cancelled_branches': prior_late_fill.get('cancelled_branches') or [],
+                'final_materialization_contract_status': prior_late_fill.get(
+                    'final_materialization_contract_status'
+                ),
+                'materialization_contract_unmet': prior_late_fill.get('materialization_contract_unmet'),
+                'terminal_closure_repair_reopen': reopen_record,
+            },
+        )
+        return self.attach_late_fill_state(updated_payload, pending_late_fill), repair_gap
+
+    def _blocked_terminal_closure_projection(
+        self,
+        payload: dict[str, Any],
+        reason: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        updated_payload = dict(payload or {})
+        late_fill = (
+            dict(updated_payload.get('late_fill'))
+            if isinstance(updated_payload.get('late_fill'), Mapping)
+            else {}
+        )
+        late_fill['status'] = 'repair_needed'
+        late_fill['terminal_closure_repair_reopen'] = {
+            'kind': 'ollmo.terminal_closure_repair_reopen',
+            'status': 'blocked',
+            'authority': 'terminal_graph_closure_review',
+            'reason': str(reason or 'terminal_closure_projection_blocked').strip(),
+        }
+        updated_payload = self.attach_late_fill_state(updated_payload, late_fill)
+        return updated_payload, {
+            'terminal_closure_projection_status': 'blocked',
+            'reason': late_fill['terminal_closure_repair_reopen']['reason'],
+        }
+
+    @staticmethod
+    def _terminal_closure_repair_execution_key(payload: Any) -> str:
+        if not isinstance(payload, Mapping):
+            return ''
+        late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+        reopen = (
+            late_fill.get('terminal_closure_repair_reopen')
+            if isinstance(late_fill.get('terminal_closure_repair_reopen'), Mapping)
+            else {}
+        )
+        return str(reopen.get('execution_key') or '').strip()
+
+    @classmethod
+    def _payload_has_terminal_closure_repair_execution(
+        cls,
+        payload: Any,
+        execution_key: str,
+    ) -> bool:
+        if not isinstance(payload, Mapping) or not execution_key:
+            return False
+        late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+        for key in ('completed_branches', 'failed_branches', 'cancelled_branches'):
+            records = late_fill.get(key) if isinstance(late_fill.get(key), list) else []
+            if any(
+                isinstance(branch, Mapping)
+                and str(branch.get('terminal_closure_repair_execution_key') or '').strip()
+                == execution_key
+                for branch in records
+            ):
+                return True
+        return False
+
+    def _terminal_closure_repair_handoff(
+        self,
+        response_payload: Mapping[str, Any],
+        *,
+        request_payload: Mapping[str, Any],
+        assistant_message: str,
+        source_route_payload: Optional[Mapping[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        late_fill = response_payload.get('late_fill') if isinstance(response_payload.get('late_fill'), Mapping) else {}
+        reopen = (
+            late_fill.get('terminal_closure_repair_reopen')
+            if isinstance(late_fill.get('terminal_closure_repair_reopen'), Mapping)
+            else {}
+        )
+        pending_branches = self.normalize_late_fill_branches(late_fill.get('pending_branches'))
+        if str(reopen.get('status') or '').strip().lower() != 'queued' or not pending_branches:
+            return None
+        pending_capabilities = self.normalize_capability_list(
+            [self.branch_capability(branch) for branch in pending_branches if self.branch_capability(branch)]
+        )
+        artifact_gap = {
+            'code': str(late_fill.get('code') or 'closure_review_repair').strip(),
+            'trigger': str(late_fill.get('trigger') or 'ghost_repair_feedback').strip(),
+            'expected_capability': (
+                self.normalize_capability(late_fill.get('expected_capability'))
+                or (pending_capabilities[0] if pending_capabilities else None)
+            ),
+            'active_capability': (
+                self.normalize_capability(late_fill.get('active_capability'))
+                or (pending_capabilities[0] if pending_capabilities else None)
+            ),
+            'missing_artifact_type': str(late_fill.get('missing_artifact_type') or '').strip() or None,
+            'pending_branches': pending_branches,
+            'pending_capabilities': pending_capabilities,
+            'authoritative_pending_branches': True,
+            'pending_branch_scope': 'exact_terminal_closure_repair',
+            'ghost_repair_feedback': late_fill.get('ghost_repair_feedback'),
+            'repair_loop': late_fill.get('repair_loop'),
+            'repair_rebuild_contracts': late_fill.get('repair_rebuild_contracts'),
+            'terminal_closure_repair_reopen': dict(reopen),
+        }
+        return {
+            'response_payload': dict(response_payload),
+            'request_payload': dict(request_payload),
+            'assistant_message': str(assistant_message or '').strip(),
+            'artifact_gap': {
+                key: value
+                for key, value in artifact_gap.items()
+                if value not in (None, '', [], {})
+            },
+            'source_route_payload': (
+                dict(source_route_payload)
+                if isinstance(source_route_payload, Mapping)
+                else None
+            ),
+        }
 
     @staticmethod
     def _post_artifact_follow_up_instruction(
@@ -16471,6 +17476,13 @@ class LateFillRuntimeOwner:
 
     def execute_prepared_late_fill_branch(self, plan: dict[str, Any]) -> dict[str, Any]:
         infer_payload = plan.get('infer_payload') if isinstance(plan.get('infer_payload'), dict) else {}
+        semantic_review_execution = self._is_semantic_review_branch(
+            plan,
+            infer_payload,
+            plan.get('effective_data')
+            if isinstance(plan.get('effective_data'), Mapping)
+            else {},
+        )
         late_fill_instance = (
             plan.get('instance')
             if isinstance(plan.get('instance'), Mapping)
@@ -16595,12 +17607,11 @@ class LateFillRuntimeOwner:
                     'mode': 'external_chat_phase',
                     'external_execution': dict(external_execution),
                 }
-                infer_result = (
-                    self._materialize_external_chat_text_artifact_outputs(
+                if not semantic_review_execution:
+                    infer_result = self._materialize_external_chat_text_artifact_outputs(
                         plan,
                         infer_result,
                     )
-                )
             else:
                 raise RuntimeError(
                     'External graph-owned chat phase returned no terminal status.'
@@ -16660,6 +17671,18 @@ class LateFillRuntimeOwner:
             if obligation_id not in (None, '', [], {}):
                 infer_result.setdefault('obligation_id', obligation_id)
                 infer_result.setdefault('output_obligation_ref', dict(output_obligation_ref))
+        if (
+            self._is_semantic_review_branch(
+                plan,
+                infer_payload,
+                plan.get('effective_data')
+                if isinstance(plan.get('effective_data'), Mapping)
+                else {},
+                execution_contract,
+            )
+            and isinstance(infer_result, dict)
+        ):
+            infer_result = self.project_internal_semantic_review_result(infer_result)
         if (
             isinstance(infer_result, dict)
             and self.normalize_capability(plan.get('capability'))
@@ -18237,6 +19260,25 @@ class LateFillRuntimeOwner:
                 else {}
             )
             explicit_payload = response_payload if isinstance(response_payload, Mapping) else {}
+            terminal_closure_execution_key = self._terminal_closure_repair_execution_key(
+                explicit_payload,
+            )
+            if (
+                terminal_closure_execution_key
+                and self._payload_has_terminal_closure_repair_execution(
+                    recovered_payload,
+                    terminal_closure_execution_key,
+                )
+            ):
+                self.log_unified_event(
+                    category='responses',
+                    action='terminal_closure_repair_reopen',
+                    status='stale_handoff_ignored',
+                    response_id=response_id,
+                    execution_key=terminal_closure_execution_key,
+                    message='Ignored stale terminal Closure handoff after durable branch completion.',
+                )
+                return
             if self._durable_graph_patch_successor_descends_from_parent(
                 recovered_payload,
                 explicit_payload,
@@ -18520,15 +19562,22 @@ class LateFillRuntimeOwner:
                     output_text=str(finalized_payload.get('output_text') or ''),
                     response_payload=finalized_payload,
                 )
-                finalized_payload, successor_handoff = (
-                    self._prepare_terminal_graph_patch_successor_handoff(
-                        finalized_payload,
-                        request_payload=request_payload,
-                        assistant_message=assistant_message,
-                        artifact_gap=artifact_gap,
-                        source_route_payload=source_route_payload,
-                    )
+                successor_handoff = self._terminal_closure_repair_handoff(
+                    finalized_payload,
+                    request_payload=request_payload,
+                    assistant_message=assistant_message,
+                    source_route_payload=source_route_payload,
                 )
+                if successor_handoff is None:
+                    finalized_payload, successor_handoff = (
+                        self._prepare_terminal_graph_patch_successor_handoff(
+                            finalized_payload,
+                            request_payload=request_payload,
+                            assistant_message=assistant_message,
+                            artifact_gap=artifact_gap,
+                            source_route_payload=source_route_payload,
+                        )
+                    )
                 if successor_handoff is None:
                     self.schedule_terminal_substrate_hygiene(
                         finalized_payload,
@@ -18632,15 +19681,22 @@ class LateFillRuntimeOwner:
                         response_payload=current_payload,
                     )
                     if not pending_branches:
-                        current_payload, successor_handoff = (
-                            self._prepare_terminal_graph_patch_successor_handoff(
-                                current_payload,
-                                request_payload=last_effective_request_payload,
-                                assistant_message=assistant_message,
-                                artifact_gap=artifact_gap,
-                                source_route_payload=source_route_payload,
-                            )
+                        successor_handoff = self._terminal_closure_repair_handoff(
+                            current_payload,
+                            request_payload=last_effective_request_payload,
+                            assistant_message=assistant_message,
+                            source_route_payload=source_route_payload,
                         )
+                        if successor_handoff is None:
+                            current_payload, successor_handoff = (
+                                self._prepare_terminal_graph_patch_successor_handoff(
+                                    current_payload,
+                                    request_payload=last_effective_request_payload,
+                                    assistant_message=assistant_message,
+                                    artifact_gap=artifact_gap,
+                                    source_route_payload=source_route_payload,
+                                )
+                            )
                         if successor_handoff is None:
                             self.schedule_terminal_substrate_hygiene(
                                 current_payload,
@@ -18671,10 +19727,10 @@ class LateFillRuntimeOwner:
                     if self.branch_id(branch)
                 }
                 active_branches = [
-                    {
-                        **dict(branch),
-                        **pending_branch_by_id.get(self.branch_id(branch), {}),
-                    }
+                    self.overlay_graph_branch_with_runtime_state(
+                        branch,
+                        pending_branch_by_id.get(self.branch_id(branch)),
+                    )
                     for branch in active_branches
                 ]
                 active_branches, scheduling_policy = self.shape_active_late_fill_branches(
@@ -19114,6 +20170,9 @@ class LateFillRuntimeOwner:
                         if (
                             self._branch_is_required_text_artifact(branch)
                             and not self._text_artifact_revision_required(branch)
+                            and not self._artifact_gap_is_authoritative_bounded_text_artifact_repair(
+                                branch
+                            )
                         ):
                             artifact_request = (
                                 branch.get('artifact_request')
@@ -19528,6 +20587,12 @@ class LateFillRuntimeOwner:
                     current_payload = self.merge_late_fill_result_fields(current_payload, infer_result)
                     _remember_branch(completed_branch_records, completed_branches, branch, status='fulfilled')
                     last_effective_request_payload = effective_data or last_effective_request_payload
+                    semantic_review_branch = self._is_semantic_review_branch(
+                        branch,
+                        effective_data,
+                        execution_contract,
+                        infer_result,
+                    )
                     fill_record = {
                         'branch_id': branch_id,
                         'phase_id': str(branch.get('phase_id') or branch_id).strip() or branch_id,
@@ -19539,6 +20604,9 @@ class LateFillRuntimeOwner:
                         'route_source': str((late_fill_route_info or {}).get('route_source') or '').strip() or None,
                         'route_reason': str((late_fill_route_info or {}).get('route_reason') or '').strip() or None,
                     }
+                    if semantic_review_branch:
+                        fill_record['visibility'] = 'internal'
+                        fill_record['surface_role'] = 'closure_evidence'
                     late_fill_route_runtime = (
                         late_fill_route_info.get('route_runtime')
                         if isinstance(
@@ -19567,7 +20635,11 @@ class LateFillRuntimeOwner:
                             branch.get('recovery_attempt') or {}
                         )
                     if execution_contract:
-                        fill_record['execution_contract'] = execution_contract
+                        fill_record_contract = dict(execution_contract)
+                        if semantic_review_branch:
+                            fill_record_contract['visibility'] = 'internal'
+                            fill_record_contract['surface_role'] = 'closure_evidence'
+                        fill_record['execution_contract'] = fill_record_contract
                         workload_task_ref = (
                             execution_contract.get('workload_task_ref')
                             if isinstance(execution_contract.get('workload_task_ref'), Mapping)
@@ -19666,6 +20738,8 @@ class LateFillRuntimeOwner:
                         'tts_audio_integrity_evidence',
                         'tts_stt_semantic_evidence',
                     ):
+                        if semantic_review_branch and key in _BRANCH_LOCAL_PUBLICATION_FIELDS:
+                            continue
                         value = infer_result.get(key)
                         if value in (None, '', [], {}):
                             value = effective_data.get(key)
@@ -19679,6 +20753,8 @@ class LateFillRuntimeOwner:
                         'derived_from',
                         'artifacts',
                     ):
+                        if semantic_review_branch and key in _BRANCH_LOCAL_PUBLICATION_FIELDS:
+                            continue
                         value = infer_result.get(key)
                         if value not in (None, '', [], {}):
                             fill_record[key] = value
@@ -19746,10 +20822,10 @@ class LateFillRuntimeOwner:
                     if self.branch_id(branch)
                 }
                 next_active_branches = [
-                    {
-                        **dict(branch),
-                        **next_pending_branch_by_id.get(self.branch_id(branch), {}),
-                    }
+                    self.overlay_graph_branch_with_runtime_state(
+                        branch,
+                        next_pending_branch_by_id.get(self.branch_id(branch)),
+                    )
                     for branch in next_active_branches
                 ]
                 next_active_capabilities = self.normalize_capability_list(
@@ -19956,15 +21032,22 @@ class LateFillRuntimeOwner:
                     ),
                 )
                 if terminal_without_pending:
-                    current_payload, successor_handoff = (
-                        self._prepare_terminal_graph_patch_successor_handoff(
-                            current_payload,
-                            request_payload=request_payload,
-                            assistant_message=assistant_message,
-                            artifact_gap=next_gap,
-                            source_route_payload=source_route_payload,
-                        )
+                    successor_handoff = self._terminal_closure_repair_handoff(
+                        current_payload,
+                        request_payload=request_payload,
+                        assistant_message=assistant_message,
+                        source_route_payload=source_route_payload,
                     )
+                    if successor_handoff is None:
+                        current_payload, successor_handoff = (
+                            self._prepare_terminal_graph_patch_successor_handoff(
+                                current_payload,
+                                request_payload=request_payload,
+                                assistant_message=assistant_message,
+                                artifact_gap=next_gap,
+                                source_route_payload=source_route_payload,
+                            )
+                        )
                     if successor_handoff is None:
                         self.schedule_terminal_substrate_hygiene(
                             current_payload,
@@ -20064,25 +21147,42 @@ class LateFillRuntimeOwner:
         finally:
             self.release_response_late_fill(response_id)
             if successor_handoff and successor_handoff.get('skip_schedule') is not True:
+                successor_gap = (
+                    successor_handoff.get('artifact_gap')
+                    if isinstance(successor_handoff.get('artifact_gap'), dict)
+                    else {}
+                )
+                terminal_closure_reopen = isinstance(
+                    successor_gap.get('terminal_closure_repair_reopen'),
+                    Mapping,
+                )
                 try:
                     scheduled = self.schedule_response_late_fill(**successor_handoff)
                 except Exception as exc:  # noqa: BLE001
                     scheduled = False
-                    logging.warning('Could not schedule graph-patch successor Late Fill: %s', exc)
+                    logging.warning(
+                        'Could not schedule %s Late Fill: %s',
+                        'terminal Closure repair' if terminal_closure_reopen else 'graph-patch successor',
+                        exc,
+                    )
                 if not scheduled:
                     execution = (
-                        successor_handoff.get('artifact_gap', {}).get('successor_reopen_execution')
-                        if isinstance(successor_handoff.get('artifact_gap'), dict)
+                        successor_gap.get('successor_reopen_execution')
+                        if isinstance(successor_gap, dict)
                         else {}
                     )
                     self.log_unified_event(
                         category='responses',
-                        action='graph_patch_successor_reopen',
+                        action=(
+                            'terminal_closure_repair_reopen'
+                            if terminal_closure_reopen
+                            else 'graph_patch_successor_reopen'
+                        ),
                         status='pending',
                         response_id=response_id,
                         successor_execution_key=(execution or {}).get('successor_execution_key'),
                         message=(
-                            'Successor frame is durable but its Late Fill worker was not newly claimed; '
+                            'Pending continuation truth is durable but its Late Fill worker was not newly claimed; '
                             'an existing worker or explicit recovery remains authoritative.'
                         ),
                     )

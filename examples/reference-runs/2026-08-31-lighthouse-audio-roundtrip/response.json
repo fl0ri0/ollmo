@@ -1,0 +1,146 @@
+{
+  "artifacts": [
+    {
+      "artifact_ref": "artifact:audio_d7a40b845c02c728a6f02d88",
+      "branch_id": "branch-text_to_speech-1",
+      "channels": 1,
+      "duration_seconds": 10.88,
+      "mime_type": "audio/wav",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/audio/narration.wav",
+      "sample_rate_hz": 24000,
+      "sample_width_bits": 16,
+      "sha256": "152656608fbf11a1754d10c726d17b810a0e545bedf03e764c2cdbae832ccbfe",
+      "size_bytes": 522284,
+      "type": "audio"
+    },
+    {
+      "artifact_ref": "artifact:text_60524983ed60bb639ca2c5f8",
+      "branch_id": "branch-speech_to_text-1",
+      "mime_type": "text/plain",
+      "phase_id": "phase-3",
+      "published_path": "artifacts/transcripts/transcript.md",
+      "sha256": "df5d2d403c8cc7ff4bf0c699a981a6cacdb955d82e3c7ad4e9302a5c7fd3f586",
+      "size_bytes": 200,
+      "type": "text"
+    }
+  ],
+  "bundle": null,
+  "integrity": {
+    "frame_identity_verified": true,
+    "index_only_wire_lookup": true,
+    "ledger_fallback_used": false,
+    "observation_snapshot_digests_verified": true,
+    "source_frame_record_sha256": "34e6f5a00aed33d32f90c16c55a165e551890a08ad6eb41f3dd9ad46a4d4572c",
+    "source_frame_record_size_bytes": 765722,
+    "verified_response_map": true
+  },
+  "outputs": [
+    {
+      "branch_id": "phase-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-1",
+      "slot_id": "output-phase-1",
+      "status": "fulfilled",
+      "text": "Thick, grey fog rolls heavily against the base of the coastal lighthouse, obscuring the lantern room from view. The rhythmic pulse of the light struggles to pierce through the dense, damp atmosphere.",
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:audio_d7a40b845c02c728a6f02d88",
+      "branch_id": "branch-text_to_speech-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-2",
+      "published_path": "artifacts/audio/narration.wav",
+      "slot_id": "output-phase-2",
+      "status": "fulfilled",
+      "type": "audio"
+    },
+    {
+      "artifact_ref": "artifact:text_60524983ed60bb639ca2c5f8",
+      "branch_id": "branch-speech_to_text-1",
+      "lifecycle": "materialized_output",
+      "phase_id": "phase-3",
+      "published_path": "artifacts/transcripts/transcript.md",
+      "slot_id": "output-phase-3",
+      "status": "fulfilled",
+      "type": "text"
+    }
+  ],
+  "provenance": {
+    "original_runtime_truth_remains_authoritative": true,
+    "raw_frame_published": false,
+    "runtime_effect": "none",
+    "source": "indexed final response frame and canonical artifact bytes"
+  },
+  "request": {
+    "prompt_path": "prompt.txt",
+    "prompt_sha256": "cfa5b2e5e31013bd3f6ff3f83c0388215a84e85d09655b615f7bb64cea8e0a81",
+    "runtime_request_sha256": "8b85e909e1d7852bcdbbda10dfe69b94f3a7b46d2193ca415b840617fe67373f",
+    "verified": true
+  },
+  "response": {
+    "frame_id": "resp_1788207207762_eb84aee2876de8:frame-2",
+    "frame_sequence": 2,
+    "frame_version": 9,
+    "id": "resp_1788207207762_eb84aee2876de8",
+    "lifecycle_state": "completed",
+    "status": "completed",
+    "status_semantics": {
+      "has_actionable_repair": false,
+      "has_open_continuation": false,
+      "is_terminal": true,
+      "terminal": true
+    }
+  },
+  "runtime_truth": {
+    "closure": {
+      "continuation_required": false,
+      "counts": {
+        "blocked": 0,
+        "deferred": 0,
+        "fulfilled": 3,
+        "pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "obligation_count": 3,
+      "pending_branch_count": 0,
+      "status": "fulfilled"
+    },
+    "late_fill": {
+      "counts": {
+        "cancelled": 0,
+        "completed": 2,
+        "failed": 0,
+        "pending": 0
+      },
+      "final_materialization_contract_status": "fulfilled",
+      "status": "completed"
+    },
+    "surface": {
+      "active_categories": [
+        "completed",
+        "reconsiderable",
+        "controlled_attention_advisory",
+        "aspiration_advisory",
+        "commitment_advisory"
+      ],
+      "category_counts": {
+        "aspiration_advisory": 6,
+        "blocked": 0,
+        "commitment_advisory": 12,
+        "completed": 3,
+        "controlled_attention_advisory": 80,
+        "open": 0,
+        "reconsiderable": 3,
+        "repair_pending": 0,
+        "semantic_review_pending": 0,
+        "superseded": 0,
+        "waived": 0
+      },
+      "status": "fulfilled"
+    }
+  },
+  "schema": "ollmo.public_reference_run.v1",
+  "version": 1
+}
