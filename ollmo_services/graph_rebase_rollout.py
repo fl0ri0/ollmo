@@ -10,6 +10,8 @@ graph-mutation authority.
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 import hashlib
@@ -586,6 +588,7 @@ def _project_readiness_records(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+@observe_state('readiness.project', 'response_or_observation', 'readiness_projection', labels=('NEW_REPRESENTATION',))
 def project_graph_rebase_readiness_observation(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:

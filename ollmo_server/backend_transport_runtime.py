@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.events import observe_call
+
 import json
 import logging
 from dataclasses import dataclass
@@ -38,6 +40,9 @@ class BackendTransportRuntimeOwner:
     def _hook(self, name: str) -> Any:
         return self.hooks[name]
 
+    @observe_call('backend_transport.execute_chat_backend_request',
+                  record_kind='model_invocation',
+                  inputs=lambda a: {k: v for k, v in a.items() if k != 'self'})
     def execute_chat_backend_request(
         self,
         *,
@@ -403,12 +408,14 @@ class BackendTransportRuntimeOwner:
             content_type=content_type,
         )
 
-    def ollama_chat(self, port: int, model_name: str, messages: list[dict]) -> dict:
+    def ollama_chat(
+        self, port: int, model_name: str, messages: list[dict], *, timeout_sec: int = 180,
+    ) -> dict:
         return self.ollama_chat_with_options(
             port=port,
             model_name=model_name,
             messages=messages,
-            timeout_sec=180,
+            timeout_sec=timeout_sec,
             allow_port_fallback=False,
         )
 

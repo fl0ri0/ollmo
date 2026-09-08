@@ -13,7 +13,10 @@ Resolve the active checkout from the current working directory or an explicit
 the operator explicitly promotes one to the active workspace. Historical
 plans can describe superseded intermediate paths and are not edit targets.
 
-For practical repo navigation, start with [Vision Alignment](docs/VISION_ALIGNMENT.md), [Core Contracts](docs/CORE_CONTRACTS.md), [Canonical Stack](docs/CANONICAL_STACK.md), [Principles](docs/PRINCIPLES.md), [Patterns](docs/PATTERNS.md), [Control Knobs](docs/CONTROL_KNOBS.md), [Ghost Runtime Policy](GHOST.md), and [Ghost Router](docs/GHOST_ROUTER.md). Use [Architecture Map](docs/ARCHITECTURE_MAP.md) for code ownership and repo navigation.
+For development, start with [CONTRIBUTING.md](CONTRIBUTING.md) and use
+[Architecture Map](docs/ARCHITECTURE_MAP.md) for detailed code ownership.
+The portable [Ollmo skill](skills/ollmo/SKILL.md) covers client task selection,
+checkout discovery and the observation/execution/lifecycle boundaries.
 
 Runtime-policy note:
 
@@ -43,7 +46,7 @@ Direct Python entrypoint:
 
 Agent safety:
 
-- prefer read-only status, manifest, Ghost, and route-preview checks unless the user explicitly asks for lifecycle changes
+- use passive status/manifest/Ghost evidence for observation; an authorized generation task may execute its ordinary steps, while lifecycle/recovery remains separately scoped
 - do not run clean, archive, reset, start, stop, or execution commands just to inspect docs or route policy
 - do not use `/api/responses` for observation or route selection; use runtime files, manifest/running-instance status, Ghost status, or route preview
 - read-like `ollmoctl` status helpers default to no control-plane recovery; use the top-level `--recover-control-plane` flag only when you explicitly want local control-plane recovery/start behavior. For strict no-mutation observation, prefer local runtime files first.
@@ -175,6 +178,13 @@ Ghost boundary note:
 
 ## Recovery Order
 
+This sequence applies only within authorized recovery work. Read-only diagnosis
+may identify the next recovery action but must not perform it. Starting a model,
+restarting the control plane, refreshing status, cleaning or resetting state are
+distinct actions; existing authorization covers only its stated scope. A denied
+localhost connection is not proof of service failure: check permitted file or
+already-collected runtime evidence before recommending recovery.
+
 1. If commands hit `connection refused` on `127.0.0.1:5001`, restore the control plane first.
 2. If `5001` is up but no instances are running, start the required model.
 3. If an instance is failed, unreachable, or live process/port/backend truth proves it unusable, inspect the runtime state before stopping/restarting that instance.
@@ -280,7 +290,11 @@ Prefer `./ollmo ctl graph-rebase readiness|inspect|adjudicate|stage|authorize-pa
 
 The accepted partial path appends a `graph_rebase_partial_successor` frame under the same response id, preserves the frozen parent, and schedules only the exact branch-local owed work through normal Late Fill. Full-state and bounded-observation projections must identify the same durable parent, and current root truth is rechecked through replay and the final sink. It must not recover work from the root request, root/current phase, assistant output, phase summary, stage direction, instruction, or criteria when a branch-local payload or dependency binding is absent. `successor_rebase_requests[]` is therefore not a general execution queue: untrusted, staged-only, stale, widened, gate-blocked, or full records remain audit/lineage truth, and only the exact registry-trusted partial request may be consumed. Full successor rebase remains shadow/non-executable under safe partial v1.
 
-Core runtime code, operator scripts, and external integration internals remain gated surfaces rather than autonomous rewrite targets. Broad planning and general agent work should stay with external clients.
+Core runtime code, operator scripts, and external integration internals are not
+autonomous runtime self-modification targets. This boundary does not prohibit
+explicitly authorized engineering work: use AGENTS.md, the affected owner and
+contract, and proportionate validation. Broad planning and general agent work
+remain with external clients; runtime access alone does not authorize code edits.
 
 ## External Integrations
 
@@ -298,6 +312,27 @@ Current boundary:
 - `ollmo_integrations/codex/provider_unsync.py`
 
 Script paths under `scripts/` are operator commands. External sync, cleanup, adapter-manifest metadata, and unsync remain separate from general startup.
+
+Registry writes default to `sync_external=False` in `ollmo_core/registry.py`;
+instance reads default to `prune=False` in `ollmo_core/lifecycle.py`. Existing
+provider-sync helpers are opt-in compatibility operations. Do not infer automatic
+Codex configuration synchronization from a model start/stop, a registry read, or
+older descriptions in a helper. Provider projections are never runtime authority.
+
+The downstream Codex bridge in `ollmo_integrations/codex/execution.py` runs a
+bounded `codex exec` in a neutral temporary directory with `--ephemeral`,
+`--ignore-user-config`, `--ignore-rules` and a read-only sandbox. It supplies no
+model/reasoning override, so global user configuration does not select its model;
+the exposed policy remains the Codex CLI default. `external:codex`, `codex:auto`
+and `codex_cli` are logical integration identities, not an assertion about the
+underlying model. Model selection and full local-provider compatibility are
+separate product decisions; do not change isolation to inherit global settings.
+
+Do not detach this response-bound child merely because independent offline work
+can be detached. Its cancellation, timeout and result collection belong to the
+owning response. Ephemeral execution omits session rollout persistence; it does
+not imply no temporary files or no other execution effects. Preserve the bounded
+task, staged-input and `BLOCKED:` protocol in the skill.
 
 ## Current Boundary
 

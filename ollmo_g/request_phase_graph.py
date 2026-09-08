@@ -1185,6 +1185,189 @@ def _source_artifact_records(*payloads: Mapping[str, Any]) -> list[Mapping[str, 
     return records
 
 
+_RETAINED_INPUT_ALIAS_RE = re.compile(
+    r'\b(?:retain|preserve|copy|keep|save|behalte|behalten|übernimm|uebernimm|kopiere|speichere)\b'
+    r'(?P<context>[^\n]{0,240}?)'
+    r'\b(?:as|to|under\s+(?:the\s+)?name|als|unter\s+(?:dem\s+)?namen?)\s+'
+    r'[`"\']?(?P<target>[A-Za-z0-9][A-Za-z0-9._-]*\.(?:html?|css|json|mjs|cjs|js|md|txt|svg|xml|csv|tsv|ya?ml|py|sh))'
+    r'(?=[`"\'\s,;:)\].!?]|$)',
+    re.IGNORECASE,
+)
+_RETAINED_INPUT_SOURCE_CUE_RE = re.compile(
+    r'\b(?:attached|uploaded|supplied|provided|input|source|data\s*sheet|file|'
+    r'angeh[aä]ngt(?:e|en|er|es)?|hochgeladen(?:e|en|er|es)?|bereitgestellt(?:e|en|er|es)?|'
+    r'eingabe|quelle|datenblatt|datei)\b',
+    re.IGNORECASE,
+)
+_RETAINED_INPUT_SOURCE_FILENAME_RE = re.compile(
+    r'(?<![A-Za-z0-9._-])'
+    r'(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*\.(?:html?|css|json|mjs|cjs|js|md|txt|svg|xml|csv|tsv|ya?ml|py|sh))'
+    r'(?![A-Za-z0-9._-])',
+    re.IGNORECASE,
+)
+_RETAINED_INPUT_ALIAS_NEGATION_RE = re.compile(
+    r'(?:\bdo\s+not|\bdon[\'’]?t|\bnever|\bnot|\bnicht|\bnie|\bkeinesfalls)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _retained_input_alias_requests(
+    prompt: str,
+    *payloads: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Bind explicit retain/copy-as clauses to current input artifacts.
+
+    The source stays immutable.  This function declares a byte-copy output
+    obligation; physical target allocation belongs to Late Fill.
+    """
+
+    text = _clean_text(prompt)
+    if not text:
+        return []
+    source_records: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for payload_index, payload in enumerate(payloads):
+        if not isinstance(payload, Mapping):
+            continue
+        for record in payload.get('input_artifacts') or []:
+            if not isinstance(record, Mapping):
+                continue
+            artifact_type = _clean_text(record.get('type') or record.get('kind')).lower()
+            if artifact_type and artifact_type not in {'text', 'document', 'file'}:
+                continue
+            source_path = _clean_text(
+                record.get('path')
+                or record.get('source_path')
+                or record.get('saved_text_path')
+            )
+            if not source_path or source_path in seen_paths:
+                continue
+            extension = normalize_text_artifact_extension(Path(source_path).suffix) or ''
+            if not extension:
+                continue
+            seen_paths.add(source_path)
+            source_name = _clean_text(record.get('name') or record.get('source_name'))
+            if not source_name:
+                source_name = Path(source_path).name
+            source_records.append(
+                {
+                    'path': source_path,
+                    'name': Path(source_name).name,
+                    'extension': extension,
+                }
+            )
+        if payload_index >= 2:
+            # Direct path fields on a response describe prior outputs, not
+            # current input authority. Only the request and route carriers may
+            # contribute legacy/direct selected-file input paths.
+            continue
+        for key in ('file_path', 'route_artifact_path'):
+            source_path = _clean_text(payload.get(key))
+            if not source_path or source_path in seen_paths:
+                continue
+            extension = normalize_text_artifact_extension(Path(source_path).suffix) or ''
+            if not extension:
+                continue
+            seen_paths.add(source_path)
+            source_records.append(
+                {
+                    'path': source_path,
+                    'name': Path(source_path).name,
+                    'extension': extension,
+                }
+            )
+
+    requests: list[dict[str, Any]] = []
+    seen_targets: set[tuple[str, str]] = set()
+    for match in _RETAINED_INPUT_ALIAS_RE.finditer(text):
+        negation_prefix = text[max(0, match.start() - 40):match.start()]
+        if _RETAINED_INPUT_ALIAS_NEGATION_RE.search(negation_prefix):
+            continue
+        target_name = Path(_clean_text(match.group('target'))).name
+        extension = normalize_text_artifact_extension(Path(target_name).suffix) or ''
+        if not target_name or not extension:
+            continue
+        target_key = (extension, target_name.casefold())
+        if target_key in seen_targets:
+            continue
+        context = _clean_text(match.group('context'))
+        candidates = [
+            record for record in source_records
+            if record.get('extension') == extension
+        ]
+        explicitly_requested_source_names = {
+            Path(_clean_text(source_match.group('name'))).name.casefold()
+            for source_match in _RETAINED_INPUT_SOURCE_FILENAME_RE.finditer(context)
+            if _clean_text(source_match.group('name'))
+        }
+        explicitly_named = [
+            record
+            for record in candidates
+            if _clean_text(record.get('name')).casefold()
+            in explicitly_requested_source_names
+        ]
+        if explicitly_requested_source_names:
+            # An explicit filename is an identity claim, not a hint.  If it
+            # names no current input, retain the missing binding so execution
+            # fails closed instead of silently copying the only same-type file.
+            candidates = explicitly_named
+        elif not _RETAINED_INPUT_SOURCE_CUE_RE.search(context):
+            continue
+
+        request: dict[str, Any] = {
+            'extension': extension,
+            'source': 'retained_input_alias',
+            'source_name': _source_name_from_filename(target_name, extension),
+            'retained_input_alias_required': True,
+            'retained_input_target_name': target_name,
+        }
+        if len(candidates) == 1:
+            source = candidates[0]
+            request.update(
+                {
+                    'retained_input_binding_state': 'bound',
+                    'retained_input_source_path': source['path'],
+                    'retained_input_source_name': source['name'],
+                }
+            )
+        else:
+            request.update(
+                {
+                    'retained_input_binding_state': (
+                        'missing' if not candidates else 'ambiguous'
+                    ),
+                    'retained_input_candidate_count': len(candidates),
+                }
+            )
+        seen_targets.add(target_key)
+        requests.append(request)
+    return requests
+
+
+def _merge_retained_input_alias_requests(
+    explicit_requests: list[dict[str, Any]],
+    retained_requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = [dict(item) for item in explicit_requests]
+    for retained in retained_requests:
+        extension = _clean_text(retained.get('extension')).lower()
+        source_name = _clean_text(retained.get('source_name')).casefold()
+        matched_index = next(
+            (
+                index
+                for index, request in enumerate(merged)
+                if _clean_text(request.get('extension')).lower() == extension
+                and _clean_text(request.get('source_name')).casefold() == source_name
+            ),
+            None,
+        )
+        if matched_index is None:
+            merged.append(dict(retained))
+        else:
+            merged[matched_index] = {**merged[matched_index], **dict(retained)}
+    return merged
+
+
 def _iter_payload_text_values(value: Any) -> list[str]:
     texts: list[str] = []
     if isinstance(value, str):
@@ -2612,12 +2795,17 @@ def _prompt_reserves_materialization_capability(
     if not prompt_text:
         return False
     if normalized == CAPABILITY_IMAGE_GENERATION:
-        return bool(
-            _RESERVED_IMAGE_MATERIALIZATION_RE.search(prompt_text)
-            or (
-                _IMAGE_CANDIDATE_CONTEXT_RE.search(prompt_text)
-                and _RESERVED_OPTION_ONLY_RE.search(prompt_text)
-            )
+        # Reservation belongs to its named object, not a neighboring image
+        # request. Keep pronoun continuations ("keep it reserved") together.
+        clauses = re.split(
+            r'[.,;!?\n]|(?=\b(?:keep|leave|hold|reserve)\s+(?!(?:it|them|this|that)\b))',
+            prompt_text, flags=re.IGNORECASE,
+        )
+        return any(
+            _RESERVED_IMAGE_MATERIALIZATION_RE.search(clause)
+            or (_IMAGE_CANDIDATE_CONTEXT_RE.search(clause)
+                and _RESERVED_OPTION_ONLY_RE.search(clause))
+            for clause in clauses
         )
     return False
 
@@ -3175,7 +3363,7 @@ def _text_artifact_revision_contract(
 
 
 def _text_artifact_request_branches(
-    text_artifact_requests: list[dict[str, str]],
+    text_artifact_requests: list[dict[str, Any]],
     *,
     existing_branches: list[Mapping[str, Any]],
     prompt_analysis: Optional[Mapping[str, Any]] = None,
@@ -3183,6 +3371,16 @@ def _text_artifact_request_branches(
     branches: list[dict[str, Any]] = []
     if not text_artifact_requests:
         return branches
+    # Rebuilding an existing execution graph must reuse its exact file owners,
+    # not append fresh branches with colliding ids and new phase numbers.
+    text_artifact_requests = [request for request in text_artifact_requests
+        if not any(
+            isinstance(branch.get('artifact_request'), Mapping)
+            and branch.get('requires_artifact') is True
+            and not _is_unpromoted_candidate_record(branch)
+            and all(branch['artifact_request'].get(key) == request.get(key)
+                    for key in ('extension', 'source_name', 'target_path'))
+            for branch in existing_branches)]
     remaining_requests = list(text_artifact_requests)
     analysis = prompt_analysis if isinstance(prompt_analysis, Mapping) else {}
     json_request_indexes = [
@@ -3221,7 +3419,10 @@ def _text_artifact_request_branches(
                 else None
             )
         )
-        if artifact_target is not None:
+        if (
+            artifact_target is not None
+            and _clean_text(request.get('source')) != 'retained_input_alias'
+        ):
             source_name = _clean_text(request.get('source_name')) or 'generated-json'
             source = _clean_text(request.get('source')) or 'explicit_text_artifact_request'
             target_path = _clean_text(request.get('target_path'))
@@ -3279,11 +3480,48 @@ def _text_artifact_request_branches(
             request,
             prompt_analysis=analysis,
         )
+        retained_input_contract = {
+            key: value
+            for key, value in request.items()
+            if key.startswith('retained_input_')
+            and value not in (None, '', [], {})
+        }
+        retained_input_alias = bool(
+            source == 'retained_input_alias'
+            and retained_input_contract.get('retained_input_alias_required') is True
+        )
+        retained_binding_state = _clean_text(
+            retained_input_contract.get('retained_input_binding_state')
+        ).lower()
+        retained_contract_error = ''
+        if retained_input_alias and retained_binding_state != 'bound':
+            retained_contract_error = (
+                'retained_input_alias_ambiguous'
+                if retained_binding_state == 'ambiguous'
+                else 'retained_input_alias_unavailable'
+            )
         phase_id = f'phase-{next_phase_number + index - 1}'
         depends_on = ['phase-1']
         image_link_text_artifact = extension in {'html', 'htm', 'css', 'json'}
-        if local_visual_asset_binding_required and image_link_text_artifact and linked_image_phase_ids:
+        if (
+            not retained_input_alias
+            and local_visual_asset_binding_required
+            and image_link_text_artifact
+            and linked_image_phase_ids
+        ):
             depends_on = list(linked_image_phase_ids)
+        artifact_request = {
+            'extension': extension,
+            'source_name': source_name,
+            'source': source,
+            **({'target_path': target_path} if target_path else {}),
+            **{
+                key: value
+                for key, value in revision_contract.items()
+                if key.startswith('text_artifact_')
+            },
+            **retained_input_contract,
+        }
         branch_record = {
             'branch_id': f'branch-text_artifact-{index}',
             'phase_id': phase_id,
@@ -3300,22 +3538,31 @@ def _text_artifact_request_branches(
             'text_artifact_extension': extension,
             'text_artifact_source_name': source_name,
             'text_artifact_source': source,
-            'artifact_request': {
-                'extension': extension,
-                'source_name': source_name,
-                'source': source,
-                **({'target_path': target_path} if target_path else {}),
-                **{
-                    key: value
-                    for key, value in revision_contract.items()
-                    if key.startswith('text_artifact_')
-                },
-            },
-            'content_payload_source': 'current_phase_output',
-            'stage_direction': 'materialize_requested_text_artifact',
+            'artifact_request': artifact_request,
+            'content_payload_source': (
+                'retained_input_alias_source'
+                if retained_input_alias
+                else 'current_phase_output'
+            ),
+            'stage_direction': (
+                'materialize_retained_input_alias'
+                if retained_input_alias
+                else 'materialize_requested_text_artifact'
+            ),
             'phase_summary': f'materialize {extension} artifact {source_name}',
             **revision_contract,
+            **retained_input_contract,
         }
+        if retained_contract_error:
+            branch_record.update(
+                {
+                    'branch_contract_error': retained_contract_error,
+                    'blocked_by_branch_contract': True,
+                    'materialization_blocked': True,
+                    'repair_action': 'clarify_retained_input_source',
+                    'resolution': 'blocked_branch_contract',
+                }
+            )
         if target_path:
             branch_record['text_artifact_target_path'] = target_path
         if depends_on != ['phase-1']:
@@ -3330,6 +3577,135 @@ def _text_artifact_request_branches(
             branch_record
         )
     return branches
+
+
+def _guard_unbound_saved_file_consumers(
+    branches: list[dict[str, Any]], prompt: str,
+) -> None:
+    """Bind the bounded explicit save/read/derive grammar, otherwise fail closed.
+
+    Only a unique new named text producer and named consumer are supported;
+    the execution owner must still supply a verified read of saved bytes.
+    """
+    read_saved_file = False
+    preceding_clauses: list[str] = []
+    producer_candidates: list[dict[str, Any]] = []
+    clauses = re.split(r'(?<=[.!?;])\s+|\n', prompt)
+    for clause_index, clause in enumerate(clauses):
+        read = re.search(r'\b(?:read|reread|re-read|lies|lese)\b', clause, re.IGNORECASE)
+        saved_read = read and not re.search(
+            r'\b(?:not|never|nicht|kein\w*)\b', clause, re.IGNORECASE,
+        ) and re.search(
+            r'\b(?:saved|stored|persisted|gespeichert\w*|gesichert\w*)\b',
+            clause[read.end():], re.IGNORECASE,
+        )
+        if saved_read:
+            read_saved_file = True
+            # A bounded, unambiguous new text producer is executable. Existing
+            # inputs, joins and inferred/anaphoric multiple producers stay blocked.
+            producer_candidates = []
+            for candidate in branches:
+                request = candidate.get('artifact_request')
+                if (not isinstance(request, Mapping) or not _clean_text(request.get('source_name'))
+                        or not _clean_text(request.get('extension'))):
+                    continue
+                name = f"{request.get('source_name', '')}.{request.get('extension', '')}"
+                named = re.escape(name)
+                if (candidate.get('stage_direction') == 'materialize_requested_text_artifact'
+                    and candidate.get('depends_on') == ['phase-1']
+                    and any(re.search(
+                        r'\b(?:save|store|write|create|speichere|schreibe)\b.*?(?<![\w.-])'
+                        + named + r'(?![\w-])', previous, re.IGNORECASE)
+                        and not re.search(r'\b(?:not|never|nicht|kein\w*|maybe|perhaps|possibly|optional)\b', previous, re.IGNORECASE)
+                        for previous in preceding_clauses)):
+                    producer_candidates.append(candidate)
+            named_reads = [candidate for candidate in producer_candidates
+                if re.search(re.escape(candidate['artifact_request']['source_name'] + '.' +
+                    candidate['artifact_request']['extension']), clause, re.IGNORECASE)]
+            explicit_read_names = re.findall(r'(?<![\w.-])[\w-]+\.[a-zA-Z0-9]+\b', clause)
+            if explicit_read_names:
+                producer_candidates = [candidate for candidate in named_reads
+                    if all(name.lower() == (candidate['artifact_request']['source_name'] + '.' +
+                           candidate['artifact_request']['extension']).lower() for name in explicit_read_names)]
+            else:
+                format_refs = re.findall(r'\b(json|html|txt|csv|xml|markdown|md)(?:-Datei| file)?\b', clause, re.IGNORECASE)
+                if format_refs:
+                    producer_candidates = [candidate for candidate in producer_candidates
+                        if all(extension.lower() == candidate['artifact_request']['extension'] for extension in format_refs)]
+        preceding_clauses.append(clause)
+        if not read_saved_file:
+            continue
+        action = re.search(
+            r'\b(?:create|generate|write|build|erstelle|erzeuge|generiere|schreibe)\b',
+            clause, re.IGNORECASE,
+        )
+        if not action or (saved_read and action.start() < read.end()):
+            continue
+        if not re.search(
+            r'\b(?:daraus|aus\s+(?:den\s+|der\s+|dem\s+)?(?:eingelesen\w*|gelesen\w*)|'
+            r'(?:from|using|based\s+on)\s+(?:the\s+)?(?:read|loaded|saved|stored|data|file))\b',
+            clause[action.end():], re.IGNORECASE,
+        ):
+            continue
+        if re.search(r'\b(?:not|never|nicht|kein\w*)\b', clause[:action.start()], re.IGNORECASE):
+            continue
+        targets = []
+        for branch in branches:
+            extension = _clean_text(branch.get('text_artifact_extension'))
+            name = _clean_text(branch.get('text_artifact_source_name'))
+            if not name or not extension:
+                continue
+            match = re.search(
+                r'(?<![\w.-])' + re.escape(f'{name}.{extension}') + r'(?![\w-])',
+                clause[action.end():], re.IGNORECASE,
+            )
+            if match:
+                targets.append((match.start(), branch))
+        if not targets:
+            continue
+        _, consumer = min(targets, key=lambda item: item[0])
+        if (len(producer_candidates) == 1 and producer_candidates[0] is not consumer
+                and isinstance(consumer.get('artifact_request'), Mapping)
+                and consumer['artifact_request'].get('extension')
+                and consumer['artifact_request'].get('source_name')
+                and consumer.get('stage_direction') == 'materialize_requested_text_artifact'
+                and consumer.get('depends_on') in (['phase-1'], [producer_candidates[0]['phase_id']])
+                and not any(re.search(r'\b(?:save|store|write|create|generate|build|read|reread|speichere|schreibe|erstelle|erzeuge|generiere|lies|lese)\b', tail, re.IGNORECASE)
+                            for tail in clauses[clause_index + 1:])):
+            producer = producer_candidates[0]
+            producer_request = dict(producer['artifact_request'])
+            consumer_request = dict(consumer['artifact_request'])
+            # Carry standalone output constraints without replaying a save
+            # clause, preparation text, or the root multi-file task.
+            constraints = [previous for previous in clauses[:clause_index]
+                if re.search(r'\b(?:self[- ]contained|standalone|eigenständig\w*|embedded|inline|eingebettet\w*|external|extern\w*)\b', previous, re.IGNORECASE)
+                and not re.search(r'\b(?:save|store|write|read|reread|create|generate|build|speichere|schreibe|lies|lese|erstelle|erzeuge|generiere)\b', previous, re.IGNORECASE)]
+            contract = {
+                'kind': 'ollmo.saved_file_dependency', 'version': 1,
+                'producer_branch_id': producer['branch_id'],
+                'producer_phase_id': producer['phase_id'],
+                'consumer_branch_id': consumer['branch_id'],
+                'consumer_phase_id': consumer['phase_id'],
+                'producer_request': {key: producer_request[key] for key in
+                    ('extension', 'source_name', 'target_path') if key in producer_request},
+                'consumer_request': {key: consumer_request[key] for key in
+                    ('extension', 'source_name', 'target_path') if key in consumer_request},
+                'consumer_instruction': ' '.join([*constraints, *clauses[clause_index:]]).strip(),
+            }
+            producer['artifact_request'] = {**producer_request, 'saved_file_producer': True}
+            consumer['artifact_request'] = {**consumer_request, 'saved_file_dependency': contract}
+            consumer['depends_on'] = [producer['phase_id']]
+            consumer['dependency_contract'] = 'saved_file_read_required'
+            consumer['content_payload_source'] = 'saved_file_read_required'
+            continue
+        consumer.update({
+            'branch_contract_error': 'saved_file_dependency_unbound',
+            'blocked_by_branch_contract': True,
+            'materialization_blocked': True,
+            'resolution': 'blocked_branch_contract',
+            'repair_action': 'repair_dependency_chain',
+            'dependency_contract': 'saved_file_read_required',
+        })
 
 
 def _branch_has_executable_contract_authority(branch: Mapping[str, Any]) -> bool:
@@ -4280,12 +4656,19 @@ def _normalize_explicit_downstream_branch(
             'text_artifact_revision_source',
             'text_artifact_revision_binding_state',
             'text_artifact_source_is_input',
+            'retained_input_alias_required',
+            'retained_input_binding_state',
+            'retained_input_source_path',
+            'retained_input_source_name',
+            'retained_input_target_name',
+            'retained_input_candidate_count',
             'artifact_request',
             'repair_action',
             'recovery_action',
             'repair_action_reason',
             'blocked_by_dependency_input',
             'blocked_by_branch_contract',
+            'materialization_blocked',
         ):
             value = raw_branch.get(key)
             if value not in (None, '', [], {}):
@@ -5145,6 +5528,15 @@ def build_request_phase_graph(
             response,
         ),
     )
+    text_artifact_requests = _merge_retained_input_alias_requests(
+        text_artifact_requests,
+        _retained_input_alias_requests(
+            normalized_prompt,
+            request,
+            route,
+            response,
+        ),
+    )
     prompt_analysis, graph_refinements = _refine_prompt_analysis_from_response_output(
         prompt_analysis,
         response,
@@ -5232,6 +5624,7 @@ def build_request_phase_graph(
             prompt_analysis=prompt_analysis,
         )
     )
+    _guard_unbound_saved_file_consumers(downstream_branches, normalized_prompt)
     preserved_reference_input_refs, preserved_reference_error = (
         _preserved_visual_reference_input_refs(
             prompt_analysis,
@@ -5480,6 +5873,12 @@ def build_request_phase_graph(
             'text_artifact_revision_source',
             'text_artifact_revision_binding_state',
             'text_artifact_source_is_input',
+            'retained_input_alias_required',
+            'retained_input_binding_state',
+            'retained_input_source_path',
+            'retained_input_source_name',
+            'retained_input_target_name',
+            'retained_input_candidate_count',
             'artifact_request',
             'kind',
             'role',
@@ -5499,6 +5898,7 @@ def build_request_phase_graph(
             'repair_action_reason',
             'blocked_by_dependency_input',
             'blocked_by_branch_contract',
+            'materialization_blocked',
         ):
             value = branch.get(key)
             if value not in (None, '', [], {}):
@@ -5588,6 +5988,12 @@ def build_request_phase_graph(
             'text_artifact_revision_source',
             'text_artifact_revision_binding_state',
             'text_artifact_source_is_input',
+            'retained_input_alias_required',
+            'retained_input_binding_state',
+            'retained_input_source_path',
+            'retained_input_source_name',
+            'retained_input_target_name',
+            'retained_input_candidate_count',
             'artifact_request',
             'kind',
             'role',
@@ -5607,6 +6013,7 @@ def build_request_phase_graph(
             'repair_action_reason',
             'blocked_by_dependency_input',
             'blocked_by_branch_contract',
+            'materialization_blocked',
         ):
             value = item.get(key)
             if value not in (None, '', [], {}):

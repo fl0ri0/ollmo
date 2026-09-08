@@ -40,6 +40,7 @@ Commands:
   version      Show the Ollmo version (alias: --version)
   sync         Manually sync supported external-client provider config
   ctl          Pass through to scripts/ollmoctl.py
+  self-attack  Run isolated adversarial conformance and write JSON/Markdown reports
   send         Shorthand for: ollmo ctl send <instance_id> "<prompt>"
   status       Show quick local stack status
   help         Show this help message
@@ -281,6 +282,13 @@ case "$command" in
     ;;
   ctl)
     run_ollmoctl "$@"
+    ;;
+  self-attack)
+    python_bin="python3"
+    if [[ -x "$ROOT_DIR/.venv/bin/python3" ]]; then
+      python_bin="$ROOT_DIR/.venv/bin/python3"
+    fi
+    exec "$python_bin" "$ROOT_DIR/scripts/ollmo_self_attack.py" "$@"
     ;;
   send)
     run_ollmoctl send "$@"

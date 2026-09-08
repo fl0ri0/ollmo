@@ -1,3 +1,13 @@
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+from ollmo_services.events import (
+    observe_call,
+    causal_snapshot,
+    causal_timing,
+    causal_lineage,
+    measure_operation,
+    exact_target,
+    select_fields,
+)
 # web_server.py
 import copy
 import io
@@ -222,7 +232,10 @@ from ollmo_server.response_semantics_runtime import ResponseSemanticsRuntimeOwne
 from ollmo_server.responses_request_runtime import ResponsesRequestRuntimeOwner
 from ollmo_server.infer_postprocess import GeneratedImagePostprocessOwner
 from ollmo_server.infer_runtime import InferRuntimeOwner
-from ollmo_server.late_fill_runtime import LateFillRuntimeOwner
+from ollmo_server.late_fill_runtime import (
+    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID,
+    LateFillRuntimeOwner,
+)
 from ollmo_server.multi_materialization_runtime import (
     MultiMaterializationRuntimeOwner,
     normalize_max_parallel_workers,
@@ -638,6 +651,8 @@ def _log_unified_event(
     if app.config.get("TESTING"):
         return None
     try:
+        if action != 'causal_observation':
+            fields = {**causal_lineage(), **fields}
         entry = log_event(
             category=category,
             action=action,
@@ -864,6 +879,7 @@ def _preserve_frozen_response_frame_identity(
     return preserved
 
 
+@observe_state('readiness.pass', 'finalized_response_frame', 'readiness_registry_representation', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
 def _register_durable_graph_rebase_readiness_observation(
     framed_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -874,7 +890,8 @@ def _register_durable_graph_rebase_readiness_observation(
     surface; it must never roll the primary append back.
     """
 
-    projection = _project_graph_rebase_readiness_observation(framed_payload)
+    with measure_operation('readiness_projection', role='derived_readiness_evidence'):
+        projection = _project_graph_rebase_readiness_observation(framed_payload)
     readiness_state = (
         projection.get('readiness_state')
         if isinstance(projection.get('readiness_state'), Mapping)
@@ -937,10 +954,11 @@ def _register_durable_graph_rebase_readiness_observation(
             or None,
         }
 
-    verified_epoch = _verify_response_frame_epoch(
-        frames_dir=RESPONSE_FRAMES_DIR,
-        allow_relocated=False,
-    )
+    with measure_operation('readiness_epoch_verification', role='derived_readiness_evidence'):
+        verified_epoch = _verify_response_frame_epoch(
+            frames_dir=RESPONSE_FRAMES_DIR,
+            allow_relocated=False,
+        )
     if verified_epoch.get('ok') is not True:
         return {
             'kind': 'ollmo.graph_rebase_readiness_registry_append',
@@ -953,10 +971,11 @@ def _register_durable_graph_rebase_readiness_observation(
         if isinstance(verified_epoch.get('index_state'), Mapping)
         else {}
     )
-    selection = _select_graph_rebase_observation_response_ids(
-        frames_dir=RESPONSE_FRAMES_DIR,
-        index_state=index_state,
-    )
+    with measure_operation('readiness_selection', role='derived_readiness_evidence'):
+        selection = _select_graph_rebase_observation_response_ids(
+            frames_dir=RESPONSE_FRAMES_DIR,
+            index_state=index_state,
+        )
     if int(selection.get('scan_error_count') or 0) > 0:
         return {
             'kind': 'ollmo.graph_rebase_readiness_registry_append',
@@ -1000,11 +1019,15 @@ def _register_durable_graph_rebase_readiness_observation(
         }
 
 
-    observed_state = _load_latest_response_observation_state(
-        response_id,
-        frames_dir=RESPONSE_FRAMES_DIR,
-        index_state=index_state,
-    )
+    observation_candidates: list[Any] = []
+    with measure_operation('readiness_hydration', role='derived_readiness_evidence'):
+        observed_state = _load_latest_response_observation_state(
+            response_id,
+            frames_dir=RESPONSE_FRAMES_DIR,
+            index_state=index_state,
+            _verified_epoch=verified_epoch,
+            _reuse_candidates=observation_candidates,
+        )
     observed_payload = (
         observed_state.get('response_payload')
         if isinstance(observed_state.get('response_payload'), Mapping)
@@ -1019,9 +1042,10 @@ def _register_durable_graph_rebase_readiness_observation(
             'frame_id': projected_frame_id or None,
             'error': dict(observed_state.get('error') or {}),
         }
-    durable_projection = _project_graph_rebase_readiness_observation(
-        observed_payload
-    )
+    with measure_operation('readiness_durable_projection', role='derived_readiness_evidence'):
+        durable_projection = _project_graph_rebase_readiness_observation(
+            observed_payload
+        )
     durable_readiness_state = (
         durable_projection.get('readiness_state')
         if isinstance(durable_projection.get('readiness_state'), Mapping)
@@ -1051,14 +1075,16 @@ def _register_durable_graph_rebase_readiness_observation(
         )
         else {}
     )
-    append_result = _append_graph_rebase_readiness_observation(
-        durable_projection,
-        source_frame=str(source_frame_digests.get(response_id) or '').strip(),
-        source_epoch=_build_graph_rebase_source_epoch_identity(verified_epoch),
-        verified_epoch=verified_epoch,
-        frames_dir=RESPONSE_FRAMES_DIR,
-        registry_path=_effective_graph_rebase_readiness_registry_path(),
-    )
+    with measure_operation('readiness_registry_append', role='secondary_evidence_registry'):
+        append_result = _append_graph_rebase_readiness_observation(
+            durable_projection,
+            source_frame=str(source_frame_digests.get(response_id) or '').strip(),
+            source_epoch=_build_graph_rebase_source_epoch_identity(verified_epoch),
+            verified_epoch=verified_epoch,
+            _observation_candidate=(observation_candidates[0] if observation_candidates else None),
+            frames_dir=RESPONSE_FRAMES_DIR,
+            registry_path=_effective_graph_rebase_readiness_registry_path(),
+        )
     if append_result.get('ok') is not True:
         return {
             'kind': 'ollmo.graph_rebase_readiness_registry_append',
@@ -1085,6 +1111,12 @@ def _register_durable_graph_rebase_readiness_observation(
     }
 
 
+@observe_call('response_frame.finalize',
+              target=lambda a: {'response_id': a['response_payload'].get('id'),
+                                **exact_target(a['response_payload'].get('response_frame') or {})},
+              inputs=lambda a: {'persist': a['persist'],
+                                'lifecycle_state': a['response_payload'].get('lifecycle_state'),
+                                'late_fill': select_fields(a['response_payload'].get('late_fill'), ('status', 'trigger'))})
 def _finalize_response_frame_payload(
     response_payload: dict[str, Any],
     *,
@@ -1135,6 +1167,8 @@ def _finalize_response_frame_payload(
         finalize_timing['steps'].append(entry)
 
     def _publish_finalize_timing(payload: dict[str, Any]) -> dict[str, Any]:
+        finalize_timing.update(causal_timing())
+        telemetry = causal_snapshot(payload.get('id'))
         finalize_timing['total_elapsed_ms'] = round((time.perf_counter() - total_started_at) * 1000, 3)
         runtime = dict(payload.get('runtime') or {}) if isinstance(payload.get('runtime'), Mapping) else {}
         developer_diagnostics = (
@@ -1142,6 +1176,8 @@ def _finalize_response_frame_payload(
             if isinstance(runtime.get('developer_diagnostics'), Mapping)
             else {}
         )
+        if telemetry is not None:
+            developer_diagnostics['causal_telemetry'] = telemetry
         developer_diagnostics['response_frame_finalize_timing'] = dict(finalize_timing)
         runtime['developer_diagnostics'] = developer_diagnostics
         payload['runtime'] = runtime
@@ -1271,9 +1307,17 @@ def _finalize_response_frame_payload(
     finalized_payload['runtime'] = runtime
     _publish_finalize_timing(finalized_payload)
     step_started_at = time.perf_counter()
-    framed_payload = _hoist_response_output_surfaces(
-        _attach_response_frame(finalized_payload, request_payload=request_payload)
-    )
+    with measure_operation('attach_response_frame', role='canonical_truth'):
+        framed_payload = _attach_response_frame(finalized_payload, request_payload=request_payload)
+    with measure_operation('hoist_response_outputs', role='public_projection'):
+        framed_payload = _hoist_response_output_surfaces(framed_payload)
+    # Artifact identity is adjudicated during frame/output construction. Bind
+    # lifecycle to that final truth before persisting this new frame.
+    framed_payload = _attach_response_status_semantics(framed_payload)
+    current_state = framed_payload['response_frame'].get('current_state')
+    if isinstance(current_state, dict):
+        for key in ('lifecycle_state', 'canonical_status_field', 'status_compatibility', 'status_semantics'):
+            current_state[key] = copy.deepcopy(framed_payload[key])
     if preserve_bounded_successor_relation:
         # The explicit relation applies to this append only. Later frames in the
         # successor wave derive their ordinary parent relation from response_frame.
@@ -2060,6 +2104,7 @@ def _response_lookup_record_should_refresh_from_frame(
     return False
 
 
+@observe_state('response_lookup.get', 'live_record_and_ledger', 'canonical_comparison_or_adoption', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
 def _get_response_lookup_record(
     response_id: str,
     *,
@@ -2087,6 +2132,7 @@ def _get_response_lookup_record(
     return recovered_record
 
 
+@observe_state('response_lookup.recover', 'ledger_and_CAS', 'live_response_record', labels=('RECONSTRUCTION', 'NEW_AUTHORITY_BOUNDARY'), new_authority_boundary=True)
 def _recover_response_lookup_record_from_frames(
     response_id: str,
 ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], int]:
@@ -2551,6 +2597,7 @@ def _response_frame_recovered_cache_valid(
     )
 
 
+@observe_state('response_wire.public_post_projection', 'finalized_response_state', 'final_public_response_projection', labels=('NEW_REPRESENTATION',))
 def _project_response_payload_for_wire(response_payload: dict[str, Any]) -> dict[str, Any]:
     """Serialize public response truth without rehydrating canonical sidecars."""
 
@@ -3041,6 +3088,7 @@ def _estimate_route_context_tokens(*, prompt: str = '', messages: Optional[list[
     return max(1, (total_chars + 3) // 4)
 
 
+@observe_state('request.parse', 'incoming_request', 'parsed_request', labels=('NEW_REPRESENTATION',))
 def _normalize_request_payload(data: Any) -> dict[str, Any]:
     if isinstance(data, dict):
         payload = dict(data)
@@ -3468,6 +3516,8 @@ _INFER_RUNTIME = InferRuntimeOwner(
         'coerce_seed': lambda value: _coerce_seed(value),
         'find_image_artifact_seed': lambda *args, **kwargs: _find_image_artifact_seed(*args, **kwargs),
         'choose_context_strategy': lambda *args, **kwargs: _choose_context_strategy(*args, **kwargs),
+        'resolve_prepare_phase_contract': lambda **kwargs: _resolve_prepare_phase_contract(**kwargs),
+        'build_prepare_phase_system_message': lambda prepare_contract: _build_prepare_phase_system_message(prepare_contract),
         'parse_float_with_bounds': lambda *args, **kwargs: _parse_float_with_bounds(*args, **kwargs),
         'parse_int_with_bounds': lambda *args, **kwargs: _parse_int_with_bounds(*args, **kwargs),
         'parse_bool': lambda value, **kwargs: _parse_bool(value, **kwargs),
@@ -4009,6 +4059,7 @@ _MULTI_MATERIALIZATION_RUNTIME = MultiMaterializationRuntimeOwner(
 
 
 _LATE_FILL_RUNTIME = LateFillRuntimeOwner(
+    resolve_saved_file_input_path=lambda path: _resolve_saved_downloadable_artifact_path(path),
     normalize_request_payload=lambda payload: _normalize_request_payload(payload),
     extract_request_meta=lambda payload: extract_request_meta(payload),
     attach_request_meta=lambda payload: attach_request_meta(payload),
@@ -4900,6 +4951,22 @@ def _build_late_fill_retry_wave_branch(
         'excluded_instance_ids': excluded_instance_ids,
         'retry_wave_anchor_branch_id': anchor_branch_id if anchor_branch_id and anchor_branch_id != branch_id else None,
     }
+    explicit_image_pool_retry = bool(
+        capability == 'image_generation'
+        and prior_error_code == 'NO_COMPATIBLE_INSTANCE'
+    )
+    if explicit_image_pool_retry:
+        recovery_attempt.update(
+            {
+                'recovery_policy_id': (
+                    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+                ),
+                'excluded_reuse_policy_id': (
+                    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+                ),
+                'automatic_follow_up_allowed': False,
+            }
+        )
     recovery_attempt = {
         key: value
         for key, value in recovery_attempt.items()
@@ -4921,6 +4988,18 @@ def _build_late_fill_retry_wave_branch(
         'exclude_instance_ids': excluded_instance_ids,
         'retry_wave_anchor_branch_id': anchor_branch_id if anchor_branch_id and anchor_branch_id != branch_id else None,
     }
+    if explicit_image_pool_retry:
+        retry_recovery_state.update(
+            {
+                'recovery_policy_id': (
+                    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+                ),
+                'excluded_reuse_policy_id': (
+                    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+                ),
+                'automatic_follow_up_allowed': False,
+            }
+        )
     retry_recovery_state = {
         key: value
         for key, value in retry_recovery_state.items()
@@ -4938,6 +5017,18 @@ def _build_late_fill_retry_wave_branch(
         retry_branch['excluded_instance_ids'] = excluded_instance_ids
     retry_branch['recovery_state'] = retry_recovery_state
     retry_branch['recovery_attempt'] = recovery_attempt
+    if explicit_image_pool_retry:
+        retry_branch.update(
+            {
+                'recovery_policy_id': (
+                    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+                ),
+                'excluded_reuse_policy_id': (
+                    EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+                ),
+                'automatic_follow_up_allowed': False,
+            }
+        )
     return retry_branch, retry_recovery_state, recovery_attempt, excluded_instance_ids
 
 
@@ -5882,6 +5973,7 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
         for key in (
             'artifact_prompt',
             'artifact_prompt_source',
+            'availability_wait',
             'batch_prompts_source',
             'batch_prompt_source_phase_id',
             'batch_prompt_expected_count',
@@ -5993,6 +6085,9 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             'cancelled_by',
             'cancelled_at',
             'waiver_reason',
+            'recovery_policy_id',
+            'excluded_reuse_policy_id',
+            'automatic_follow_up_allowed',
         ):
             value = raw_branch.get(key)
             if value not in (None, '', [], {}):
@@ -6030,7 +6125,7 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             value = raw_branch.get(source_key)
             if value not in (None, '', [], {}):
                 branch[target_key] = value
-        if capability == 'text_to_speech':
+        if capability in {'text_to_speech', 'image_generation'}:
             recovery_policy_id = str(
                 raw_branch.get('recovery_policy_id')
                 or raw_branch.get('recoveryPolicyId')
@@ -6038,6 +6133,13 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             ).strip()
             if recovery_policy_id:
                 branch['recovery_policy_id'] = recovery_policy_id
+            excluded_reuse_policy_id = str(
+                raw_branch.get('excluded_reuse_policy_id')
+                or raw_branch.get('excludedReusePolicyId')
+                or ''
+            ).strip()
+            if excluded_reuse_policy_id:
+                branch['excluded_reuse_policy_id'] = excluded_reuse_policy_id
         batch_prompts = [
             str(item).strip()
             for item in (raw_branch.get('batch_prompts') or [])
@@ -6206,6 +6308,7 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
             for source_key, target_key in (
                 ('can_retry', 'can_retry'),
                 ('canRetry', 'can_retry'),
+                ('availability_recheck_required', 'availability_recheck_required'),
                 ('preserve_intent', 'preserve_intent'),
                 ('preserveIntent', 'preserve_intent'),
                 ('repair_required', 'repair_required'),
@@ -6294,10 +6397,12 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 text = str(value or '').strip()
                 if text:
                     branch_recovery_state[target_key] = normalize_capability(text) if target_key == 'capability' else text
-            if capability == 'text_to_speech':
+            if capability in {'text_to_speech', 'image_generation'}:
                 for source_key, target_key in (
                     ('recovery_policy_id', 'recovery_policy_id'),
                     ('recoveryPolicyId', 'recovery_policy_id'),
+                    ('excluded_reuse_policy_id', 'excluded_reuse_policy_id'),
+                    ('excludedReusePolicyId', 'excluded_reuse_policy_id'),
                     ('prior_reason_code', 'prior_reason_code'),
                     ('priorReasonCode', 'prior_reason_code'),
                 ):
@@ -6310,6 +6415,7 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 ('promotionRequired', 'promotion_required'),
                 ('auto_execute', 'auto_execute'),
                 ('autoExecute', 'auto_execute'),
+                ('availability_recheck_required', 'availability_recheck_required'),
                 ('preserve_intent', 'preserve_intent'),
                 ('preserveIntent', 'preserve_intent'),
                 ('repair_required', 'repair_required'),
@@ -6326,6 +6432,8 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 ('repairWorkAvailable', 'repair_work_available'),
                 ('needs_external_input', 'needs_external_input'),
                 ('needsExternalInput', 'needs_external_input'),
+                ('automatic_follow_up_allowed', 'automatic_follow_up_allowed'),
+                ('automaticFollowUpAllowed', 'automatic_follow_up_allowed'),
             ):
                 value = recovery_state.get(source_key)
                 if isinstance(value, bool):
@@ -6389,10 +6497,12 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 text = str(value or '').strip()
                 if text:
                     branch_recovery_attempt[target_key] = normalize_capability(text) if target_key == 'capability' else text
-            if capability == 'text_to_speech':
+            if capability in {'text_to_speech', 'image_generation'}:
                 for source_key, target_key in (
                     ('recovery_policy_id', 'recovery_policy_id'),
                     ('recoveryPolicyId', 'recovery_policy_id'),
+                    ('excluded_reuse_policy_id', 'excluded_reuse_policy_id'),
+                    ('excludedReusePolicyId', 'excluded_reuse_policy_id'),
                     ('prior_reason_code', 'prior_reason_code'),
                     ('priorReasonCode', 'prior_reason_code'),
                 ):
@@ -6405,6 +6515,8 @@ def _normalize_late_fill_branches(values: Any) -> list[dict[str, Any]]:
                 ('autoExecute', 'auto_execute'),
                 ('preserve_intent', 'preserve_intent'),
                 ('preserveIntent', 'preserve_intent'),
+                ('automatic_follow_up_allowed', 'automatic_follow_up_allowed'),
+                ('automaticFollowUpAllowed', 'automatic_follow_up_allowed'),
             ):
                 value = recovery_attempt.get(source_key)
                 if isinstance(value, bool):
@@ -8258,7 +8370,7 @@ def _response_lookup_late_fill_for_ui(payload: Mapping[str, Any]) -> dict[str, A
             if not isinstance(rebind, Mapping):
                 continue
             compact_rebind: dict[str, Any] = {}
-            for key in ('status', 'target_path', 'target_extension', 'change_count'):
+            for key in ('status', 'target_path', 'target_extension', 'change_count', 'branch_id', 'phase_id'):
                 value = rebind.get(key)
                 if value not in (None, '', [], {}):
                     compact_rebind[key] = value
@@ -8363,6 +8475,7 @@ def _response_lookup_output_for_ui(value: Any) -> dict[str, Any]:
         'status',
         'lifecycle',
         'artifact_ref',
+        'artifact_path',
         'path',
         'saved_image_path',
         'saved_audio_path',
@@ -9214,6 +9327,7 @@ def _build_response_lookup_ui_source_payload(record: dict[str, Any]) -> dict[str
     )
 
 
+@observe_state('response_lookup.public_projection', 'response_record', 'public_response_projection', labels=('NEW_REPRESENTATION',))
 def _build_response_ui_lookup_payload(record: dict[str, Any]) -> dict[str, Any]:
     full_payload = _build_response_lookup_ui_source_payload(record)
     status_lookup = (
@@ -9267,28 +9381,15 @@ def _build_response_ui_lookup_payload(record: dict[str, Any]) -> dict[str, Any]:
             ui_payload[key] = value
     if full_payload.get('image_data_url') and not full_payload.get('saved_image_path'):
         ui_payload['image_data_url'] = full_payload.get('image_data_url')
+    response_frame = (
+        full_payload.get('response_frame')
+        if isinstance(full_payload.get('response_frame'), Mapping)
+        else {}
+    )
     if status_lookup.get('frame_sequence') not in (None, '', [], {}):
         ui_payload['frame_sequence'] = status_lookup.get('frame_sequence')
     if status_lookup.get('frame_id'):
         ui_payload['frame_id'] = status_lookup.get('frame_id')
-    response_frame = full_payload.get('response_frame') if isinstance(full_payload.get('response_frame'), Mapping) else {}
-    response_frame_planning = (
-        response_frame.get('planning')
-        if isinstance(response_frame.get('planning'), Mapping)
-        else {}
-    )
-    response_frame_artifact_flow = (
-        response_frame_planning.get('artifact_flow')
-        if isinstance(response_frame_planning.get('artifact_flow'), Mapping)
-        else {}
-    )
-    response_frame_has_output_slots = bool(
-        response_frame_artifact_flow.get('output_slots')
-        if isinstance(response_frame_artifact_flow.get('output_slots'), list)
-        else []
-    )
-    if response_frame and response_frame_has_output_slots:
-        ui_payload['response_frame'] = copy.deepcopy(dict(response_frame))
     for source_key, target_key in (
         ('frame_sequence', 'frame_sequence'),
         ('frame_id', 'frame_id'),
@@ -9302,6 +9403,24 @@ def _build_response_ui_lookup_payload(record: dict[str, Any]) -> dict[str, Any]:
             ui_payload[key] = [_response_lookup_artifact_for_ui(item) for item in values if isinstance(item, Mapping)]
     for key in ('outputs', 'output_slots', 'output_branches'):
         values = full_payload.get(key)
+        if key == 'output_slots':
+            planning = (
+                response_frame.get('planning')
+                if isinstance(response_frame.get('planning'), Mapping)
+                else {}
+            )
+            artifact_flow = (
+                planning.get('artifact_flow')
+                if isinstance(planning.get('artifact_flow'), Mapping)
+                else {}
+            )
+            frame_slots = artifact_flow.get('output_slots')
+            if isinstance(frame_slots, list):
+                # The frame remains internal, but its already-reconciled slot
+                # projection is the canonical public compact slot list. This
+                # avoids exposing stale or duplicate compatibility aliases
+                # from a raw top-level cache.
+                values = frame_slots
         if isinstance(values, list):
             ui_payload[key] = [_response_lookup_output_for_ui(item) for item in values if isinstance(item, Mapping)]
     output_messages = full_payload.get('output')

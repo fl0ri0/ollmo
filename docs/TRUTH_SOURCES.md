@@ -4,6 +4,21 @@ This document names Ollmo's main truth sources and how they relate. It is a smal
 
 Core rule: model prose is evidence. Runtime-owned files, frames, contracts, artifacts, and live process facts decide truth.
 
+## Observation and repair scope
+
+The authority matrix identifies the owner of each fact; its Repair Rule column
+describes engineering or operator work within separately applicable authority.
+It is not permission to repair projections, rebuild indexes or mutate a registry
+during read-only diagnosis. Report discrepancies and missing evidence first.
+
+Cached observer endpoints and `state/runtime_status.json` contain observations
+with collection times, not a fresh process/port probe on every read. Running
+models, transient ports, selected local models, accepted-learning enablement and
+readiness must be derived from current evidence with its freshness stated.
+Explicit `refresh=true` may probe and write refreshed status; it is distinct from
+passive inspection and still does not authorize lifecycle or response execution.
+`model_ports.json` preserves stable identities even when readiness is unavailable.
+
 ## Authority Order
 
 When sources disagree, use the narrowest source that owns the fact:

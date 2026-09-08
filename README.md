@@ -34,6 +34,11 @@ A response is a frozen truthful moment of work: what was requested, what
 became owed work, what runtime evidence exists, what remains pending or
 blocked, and which outputs or artifacts can be referenced later.
 
+Run `./ollmo self-attack` for adversarial conformance across discovered Ghost
+and runtime control profiles. It writes a human-readable report and JSON results;
+see [self-attack conformance](docs/SELF_ATTACK.md) for coverage, live execution,
+budgets and regression replay.
+
 ## Project, Citation, and Collaboration
 
 If Ollmo, its state-substrate architecture, possibility space and selective
@@ -152,6 +157,24 @@ the checkout path when the skill asks.
 
 Installing the skill does not start Ollmo, change Codex model-provider
 settings, or enable cloud routing.
+
+The maintained source is `skills/ollmo/`; an installed copy is a distribution,
+not a second authority. For an explicitly requested update, compare source and
+installed files, preserve any local changes in a protected recovery location,
+then copy the package contents into the existing installed `ollmo/` directory
+using the same copy-based installation process. Compare every shipped file after
+copying, including `NOTICE`, `agents/openai.yaml` and references. Do not silently
+overwrite divergent local customizations or switch discovery directories.
+
+The entrypoint retains essential guardrails; `references/ollmo-contract.md` is
+loaded for the relevant request/result recipe. Detailed contracts are resolved
+from the selected checkout via `OLLMO_HOME` or the documented discovery process,
+so starting Codex in another directory does not break those references.
+Repository contributors should begin with [CONTRIBUTING.md](CONTRIBUTING.md)
+and the architecture/contract reading map below; the operator skill remains
+separately usable. Reload/restart the client as required by its
+instruction-discovery behavior; an existing task's context is not proof of a
+fresh load.
 
 ## Optional ChatGPT Cloud Input
 

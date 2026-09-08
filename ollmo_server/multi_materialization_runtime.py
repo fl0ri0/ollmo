@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from ollmo_services.events import (
+    observe_call,
+    transition_attempt, transition_binding, transition_marker, transition_span,
+    causal_event,
+    causal_timing,
+    exact_target,
+    traced_thread_target,
+)
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import threading
@@ -133,6 +142,8 @@ def normalize_max_parallel_workers(
 def _error_code_for_exception(exc: Exception, *, stage: str, status_code: Optional[int]) -> str:
     message = str(exc or '').strip().lower()
     if stage == 'prepare_branch_plan':
+        if message.startswith('no ready late-fill instance for capability '):
+            return 'INSTANCE_UNAVAILABLE'
         if any(token in message for token in ('no running instance', 'no selectable instance', 'no non-excluded', 'could not resolve')):
             return 'NO_COMPATIBLE_INSTANCE'
         if any(token in message for token in ('unsupported capability', 'capability unsupported')):
@@ -191,6 +202,7 @@ class MultiMaterializationRuntimeOwner:
     def __post_init__(self) -> None:
         self.max_parallel_workers = normalize_max_parallel_workers(self.max_parallel_workers)
 
+    @observe_call('multi_materialization.execute_materialization_branches', record_kind='batch_invocation')
     def execute_materialization_branches(
         self,
         branches: list[dict[str, Any]],
@@ -264,6 +276,8 @@ class MultiMaterializationRuntimeOwner:
                 normalized_plan['capability'] = capability
                 normalized_plan['branch'] = branch
                 prepared_branch_plans.append(normalized_plan)
+                causal_event('multi_materialization', 'plan_ready', target=exact_target(normalized_plan),
+                             predicate='branch_preparation_returned', gates_complete=False)
                 chosen_instance_id = _normalized_token(
                     ((normalized_plan.get('route_info') or {}).get('instance_id') or '')
                 )
@@ -296,7 +310,12 @@ class MultiMaterializationRuntimeOwner:
                     gap['_spread_retry_preferred_instance_ids'] = preferred_ids
                     gap['_spread_retry_reason'] = spread_retry_reason or 'internal_reservation_exhausted'
                     plan_prepare_args['artifact_gap'] = gap
-                return prepare_branch_plan(**plan_prepare_args)
+                with transition_span('multi_materialization.prepare',
+                                     target=exact_target(branch),
+                                     prepare_attempt=prepare_attempt_count) as observation:
+                    prepared = prepare_branch_plan(**plan_prepare_args)
+                    observation['plan_returned'] = True
+                    return prepared
 
             excluded_instance_ids = build_excluded_instance_ids()
             prepare_started_at = time.perf_counter()
@@ -402,7 +421,11 @@ class MultiMaterializationRuntimeOwner:
                 record_prepare_timing(status='error', error=error_payload, excluded=excluded_instance_ids)
 
         if prepared_branch_plans:
+            handoff_observations = {}
+            wave_observation = transition_attempt({})
             instance_locks: dict[str, threading.Lock] = {}
+            lock_predecessors: dict[str, dict[str, Any]] = {}
+            enqueued_events: dict[str, dict[str, Any]] = {}
             concurrency_policy: dict[str, Any] = {}
             branch_timings: dict[str, dict[str, Any]] = {}
             branch_timing_lock = threading.Lock()
@@ -418,20 +441,25 @@ class MultiMaterializationRuntimeOwner:
                 if not on_branch_progress:
                     return
                 try:
-                    on_branch_progress(event)
+                    with transition_binding(handoff_observations.get(event.get('branch_id'))):
+                        with transition_span('multi_materialization.callback'):
+                            on_branch_progress(event)
                 except Exception:  # noqa: BLE001
                     return
 
             def drain_branch_progress() -> None:
                 nonlocal progress_executor
-                for future in progress_futures:
-                    try:
-                        future.result()
-                    except Exception:  # noqa: BLE001
-                        continue
-                if progress_executor is not None:
-                    progress_executor.shutdown(wait=True)
-                    progress_executor = None
+                with transition_binding(wave_observation):
+                    with transition_span('multi_materialization.callback_drain',
+                                         callback_count=len(progress_futures)):
+                        for future in progress_futures:
+                            try:
+                                future.result()
+                            except Exception:  # noqa: BLE001
+                                continue
+                        if progress_executor is not None:
+                            progress_executor.shutdown(wait=True)
+                            progress_executor = None
 
             def compact_branch_error(error: Optional[dict[str, Any]]) -> dict[str, Any]:
                 if not isinstance(error, dict):
@@ -479,24 +507,68 @@ class MultiMaterializationRuntimeOwner:
                     if value not in (None, '', [], {})
                 }
                 if progress_executor is not None:
-                    progress_futures.append(progress_executor.submit(dispatch_branch_progress, compact_event))
+                    progress_futures.append(progress_executor.submit(traced_thread_target(dispatch_branch_progress), compact_event))
                     return
                 dispatch_branch_progress(compact_event)
 
+            @observe_call('multi_materialization.execute_plan', record_kind='branch_invocation',
+                          target=lambda a: exact_target(a['plan']))
             def execute_plan(plan: dict[str, Any]) -> dict[str, Any]:
+                with transition_binding(handoff_observations.get(_normalized_token(plan.get('branch_id')))):
+                    with transition_span('multi_materialization.worker'):
+                        return execute_plan_body(plan)
+
+            def execute_plan_body(plan):
                 branch_id = _normalized_token(plan.get('branch_id'))
+                def execute_branch():
+                    with transition_span('multi_materialization.execution') as observation:
+                        result = execute_prepared_branch(dict(plan))
+                        available = transition_marker('multi_materialization.result', 'available')
+                        if available is not None:
+                            result_id = available['event_id'] + ':result'
+                            observation['result_id'] = result_id
+                            binding = handoff_observations.get(branch_id)
+                            if binding is not None:
+                                binding['predecessor_result_id'] = result_id
+                        return result
+
                 instance_id = _plan_instance_id(plan)
+                dequeued = causal_event('multi_materialization', 'queue_dequeued',
+                    target=exact_target(plan), enqueued_event_id=(enqueued_events.get(branch_id) or {}).get('event_id'))
                 queued_at = time.perf_counter()
                 lock_acquired_at = queued_at
                 finished_at = queued_at
                 status = 'ok'
                 try:
                     if not instance_id:
-                        return execute_prepared_branch(dict(plan))
+                        return execute_branch()
                     lock = instance_locks.setdefault(instance_id, threading.Lock())
+                    waiting = causal_event('multi_materialization.instance_lock', 'wait_started',
+                        target=exact_target(plan), predicate='acquire_same_instance_mutex',
+                        producer_instance_id=instance_id, required_rule='same_instance_mutex',
+                        gates_complete=False, queue_reason='selected_instance_mutual_exclusion')
+                    transition_wait = transition_marker('multi_materialization.instance_lock', 'wait_started',
+                                                        instance_id=instance_id)
                     with lock:
                         lock_acquired_at = time.perf_counter()
-                        return execute_prepared_branch(dict(plan))
+                        transition_marker('multi_materialization.instance_lock', 'acquired',
+                                          wait_event_id=(transition_wait or {}).get('event_id'),
+                                          instance_id=instance_id)
+                        predecessor = lock_predecessors.get(instance_id) or {}
+                        acquired = causal_event('multi_materialization.instance_lock', 'wait_wake',
+                            target=exact_target(plan), wait_id=(waiting or {}).get('event_id'),
+                            predicate='acquire_same_instance_mutex', predicate_satisfied=True,
+                            producer_instance_id=instance_id,
+                            wake_event_id=predecessor.get('event_id'),
+                            producer_target=predecessor.get('target'),
+                            required_rule='same_instance_mutex', gates_complete=False)
+                        try:
+                            return execute_branch()
+                        finally:
+                            release = causal_event('multi_materialization.instance_lock', 'release_boundary',
+                                target=exact_target(plan), producer_instance_id=instance_id,
+                                timing_boundary='immediately_before_context_manager_release')
+                            lock_predecessors[instance_id] = release or {}
                 except Exception:
                     status = 'error'
                     raise
@@ -505,6 +577,9 @@ class MultiMaterializationRuntimeOwner:
                     if branch_id:
                         timing = {
                             'branch_id': branch_id,
+                            'phase_id': plan.get('phase_id'),
+                            'causal': {**causal_timing(), 'dequeued_event_id': (dequeued or {}).get('event_id'),
+                                       'enqueued_event_id': (enqueued_events.get(branch_id) or {}).get('event_id')},
                             'instance_id': instance_id or None,
                             'status': status,
                             'queued_elapsed_ms': round((queued_at - wave_start) * 1000, 3),
@@ -601,11 +676,28 @@ class MultiMaterializationRuntimeOwner:
                     else ('sync' if on_branch_progress else 'none')
                 ),
             }
+            def record_enqueue(plan):
+                branch_id = _normalized_token(plan.get('branch_id'))
+                binding = transition_attempt(plan)
+                if binding is not None:
+                    binding['wave_id'] = (wave_observation or {}).get('handoff_attempt_id')
+                    handoff_observations[branch_id] = binding
+                with transition_binding(binding):
+                    transition_marker('multi_materialization.queue', 'enqueued')
+                enqueued_events[branch_id] = causal_event(
+                    'multi_materialization', 'queue_enqueued', target=exact_target(plan),
+                    queue_reason='existing_worker_pool', worker_count=worker_count,
+                    timing_boundary='immediately_before_submission') or {}
+
+            def submit_plan(executor, plan):
+                record_enqueue(plan)
+                return executor.submit(traced_thread_target(execute_plan), dict(plan))
             try:
                 if worker_count == 1:
                     for plan in execution_branch_plans:
                         branch_id = _normalized_token(plan.get('branch_id'))
                         try:
+                            record_enqueue(plan)
                             branch_results[branch_id] = execute_plan(plan)
                             emit_branch_progress(plan, status='completed')
                         except Exception as exc:  # noqa: BLE001
@@ -615,7 +707,7 @@ class MultiMaterializationRuntimeOwner:
                 else:
                     with ThreadPoolExecutor(max_workers=worker_count) as executor:
                         future_map = {
-                            executor.submit(execute_plan, dict(plan)): dict(plan)
+                            submit_plan(executor, plan): dict(plan)
                             for plan in execution_branch_plans
                         }
                         for future in as_completed(future_map):

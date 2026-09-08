@@ -15,6 +15,7 @@ from ollmo_core.inference import (
     detect_text_artifact_request,
     detect_text_artifact_requests,
     dispatch_infer_request,
+    explicit_svg_artifact_request_spans,
     extract_text_artifact_payload,
     extract_text_artifact_payloads,
     generated_text_is_artifact_self_claim,
@@ -736,6 +737,161 @@ class InferenceServiceTests(unittest.TestCase):
                     ],
                     expected,
                 )
+
+    def test_text_artifact_negation_preserves_wrapped_exclusion_list_scope(self):
+        constraints = (
+            'Do not use placeholders, external image URLs, data URLs, Base64 images,\n'
+            'or an SVG/HTML drawing as a substitute for actual image generation.'
+        )
+        prompt = (
+            'Generate exactly one new image and save it as html-image-01.png.\n'
+            'Create html-image-01.html and a separate html-image-01.css file.\n'
+            + constraints
+        )
+        self.assertEqual(
+            [(item['extension'], item['source_name']) for item in detect_text_artifact_requests(prompt)],
+            [('html', 'html-image-01'), ('css', 'html-image-01')],
+        )
+        self.assertEqual(explicit_svg_artifact_request_spans(prompt), ())
+
+    def test_text_artifact_negation_preserves_long_named_file_exclusions(self):
+        prompt = (
+            'Create index.html. Do not create JavaScript, additional pages, additional images, '
+            'or any other alternative graphic representation named\nreplacement.svg.'
+        )
+        self.assertEqual(
+            [(item['extension'], item['source_name']) for item in detect_text_artifact_requests(prompt)],
+            [('html', 'index')],
+        )
+
+    def test_text_artifact_negation_stops_at_independent_positive_command(self):
+        for boundary in ('. ', '; ', ', but ', ', ', '\n'):
+            prompt = 'Do not create index.html' + boundary + 'create styles.css instead.'
+            with self.subTest(boundary=boundary):
+                self.assertEqual(
+                    [(item['extension'], item['source_name']) for item in detect_text_artifact_requests(prompt)],
+                    [('css', 'styles')],
+                )
+
+        self.assertEqual(
+            [item['extension'] for item in detect_text_artifact_requests(
+                'Create an HTML file with no external dependencies of any kind, '
+                'and create a separate CSS file.'
+            )],
+            ['html', 'css'],
+        )
+        self.assertEqual(
+            [item['extension'] for item in detect_text_artifact_requests(
+                'Create index.html; do not use placeholders, Base64 images,\n'
+                'SVG and JavaScript files.'
+            )],
+            ['html'],
+        )
+
+    def test_text_artifact_negation_keeps_coordinated_command_prohibition(self):
+        for prompt in (
+            'Do not generate PNG and create SVG.',
+            'Do not generate PNG, and create SVG.',
+            'Please do not generate PNG and create an SVG illustration.',
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(detect_text_artifact_requests(prompt), [])
+                self.assertEqual(explicit_svg_artifact_request_spans(prompt), ())
+
+        self.assertEqual(
+            [item['extension'] for item in detect_text_artifact_requests(
+                'Create an HTML file with no external dependencies of any kind, '
+                'and create a separate CSS file.'
+            )],
+            ['html', 'css'],
+        )
+        self.assertEqual(detect_text_artifact_requests('Generate PNG; do not use SVG.'), [])
+        self.assertEqual(
+            [item['extension'] for item in detect_text_artifact_requests(
+                'Do not generate PNG, but create an SVG illustration.'
+            )],
+            ['svg'],
+        )
+
+    def test_explicit_svg_request_uses_text_artifact_format(self):
+        for prompt in (
+            'Create an SVG illustration',
+            'Generate a simple SVG icon of a sailboat.',
+            'Create a detailed SVG illustration.',
+            'Create an illustration as SVG.',
+            'Draw SVG',
+            'Erstelle eine SVG-Grafik.',
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(
+                    detect_text_artifact_requests(prompt),
+                    [{'extension': 'svg', 'source': 'explicit_format_file_cue', 'source_name': 'generated-svg'}],
+                )
+                self.assertEqual(len(explicit_svg_artifact_request_spans(prompt)), 1)
+
+    def test_explicit_svg_request_spans_preserve_independent_image_work(self):
+        prompt = 'Create an SVG illustration of a sailboat; generate one PNG image of a lake.'
+        spans = explicit_svg_artifact_request_spans(prompt)
+        self.assertEqual(
+            [prompt[start:end] for start, end in spans],
+            ['an SVG illustration of a sailboat'],
+        )
+        for boundary in ('; ', ', but ', ', ', '\n'):
+            prompt = 'Do not use SVG' + boundary + 'create an SVG illustration.'
+            with self.subTest(boundary=boundary):
+                self.assertEqual(
+                    [prompt[start:end] for start, end in explicit_svg_artifact_request_spans(prompt)],
+                    ['an SVG illustration'],
+                )
+
+    def test_explicit_svg_request_spans_keep_shared_action_for_raster_targets(self):
+        for prompt, svg_target in (
+            ('Create an SVG illustration and a PNG image.', 'an SVG illustration and '),
+            ('Create one PNG image and an SVG illustration.', 'an SVG illustration'),
+            ('Create an SVG and a PNG illustration.', 'an SVG and '),
+            ('Create a PNG and an SVG illustration.', 'an SVG illustration'),
+            ('Create SVG and PNG.', 'SVG and '),
+        ):
+            with self.subTest(prompt=prompt):
+                spans = explicit_svg_artifact_request_spans(prompt)
+                self.assertEqual([prompt[start:end] for start, end in spans], [svg_target])
+                masked = list(prompt)
+                for start, end in spans:
+                    masked[start:end] = ' ' * (end - start)
+                remaining = ''.join(masked)
+                self.assertTrue(remaining.startswith('Create '))
+                self.assertIn('PNG', remaining)
+                self.assertNotIn('SVG', remaining)
+                self.assertEqual(
+                    [item['extension'] for item in detect_text_artifact_requests(prompt)],
+                    ['svg'],
+                )
+
+    def test_explicit_svg_subject_does_not_request_a_binary_photo(self):
+        from ollmo_g.intent import analyze_prompt_intent
+
+        prompt = 'Create an SVG illustration of a photo on a wall.'
+        self.assertEqual(
+            [prompt[start:end] for start, end in explicit_svg_artifact_request_spans(prompt)],
+            ['an SVG illustration of a photo on a wall'],
+        )
+        self.assertEqual(
+            [item['extension'] for item in detect_text_artifact_requests(prompt)],
+            ['svg'],
+        )
+        self.assertFalse(analyze_prompt_intent(prompt)['requests_visual_output'])
+
+    def test_explicit_svg_request_spans_exclude_negative_literal_and_meta_mentions(self):
+        for prompt in (
+            'Generate PNG; do not create an SVG illustration.',
+            'Do not create placeholders, external URLs, Base64 images,\nor an SVG illustration.',
+            'Explain how to create an SVG illustration.',
+            'Explain "Create an SVG illustration".',
+            'Explain this example:\n```text\nCreate an SVG illustration\n```',
+            'Create a PNG image of an SVG logo.',
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(explicit_svg_artifact_request_spans(prompt), ())
 
     def test_detect_text_artifact_request_ignores_plain_chat(self):
         self.assertIsNone(detect_text_artifact_request('Tell me what HTML means in one sentence.'))
@@ -3530,7 +3686,8 @@ class InferenceServiceTests(unittest.TestCase):
             pdf_synthesize=False,
         )
 
-        def ollama_chat(_port, _model_name, messages):
+        def ollama_chat(_port, _model_name, messages, *, timeout_sec):
+            self.assertEqual(timeout_sec, ctx.infer_timeout_sec)
             self.assertEqual(messages, [{'role': 'user', 'content': 'hello there'}])
             return {'content': 'hi'}
 
@@ -3545,6 +3702,50 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload['mode'], 'chat')
         self.assertEqual(payload['content'], 'hi')
+
+    def test_chat_fallback_sends_phase_system_prompt_separately_with_text_attachment(self):
+        phase_system_prompt = (
+            'Ollmo phase contract: prepare-only.\n'
+            'Return exactly four numbered image prompts before the web files.'
+        )
+        ctx = InferContext(
+            instance_id='chat-ollama-file-prepare-1',
+            backend='ollama',
+            capability='chat',
+            model_name='gemma4:26b',
+            port=11437,
+            prompt='Build the Mon Repos room website from this data.',
+            user_prompt='Build the Mon Repos room website from this data.',
+            infer_timeout_sec=1200,
+            pdf_page_timeout_sec=240,
+            pdf_max_image_side=2400,
+            pdf_synthesize=False,
+            phase_system_prompt=phase_system_prompt,
+        )
+        artifacts = InferArtifacts(
+            file_kind='text',
+            file_name='mon-repos-rooms.json',
+            text_from_file='{"rooms":[{"name":"Lake Room"}]}',
+        )
+
+        def ollama_chat(_port, _model_name, messages, *, timeout_sec):
+            self.assertEqual(timeout_sec, ctx.infer_timeout_sec)
+            self.assertEqual([item['role'] for item in messages], ['system', 'user'])
+            self.assertEqual(messages[0]['content'], phase_system_prompt)
+            self.assertIn('Build the Mon Repos room website', messages[1]['content'])
+            self.assertIn('[Attached file content]', messages[1]['content'])
+            self.assertIn('"Lake Room"', messages[1]['content'])
+            self.assertNotIn(phase_system_prompt, messages[1]['content'])
+            return {'content': 'prepared'}
+
+        payload, status = dispatch_infer_request(
+            ctx,
+            artifacts,
+            {'ollama_chat': ollama_chat},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload['content'], 'prepared')
 
     def test_chat_fallback_uses_mlx_chat_for_mlx_backend(self):
         ctx = InferContext(
@@ -3601,7 +3802,8 @@ class InferenceServiceTests(unittest.TestCase):
             text_from_file_total_bytes=291198,
         )
 
-        def ollama_chat(_port, _model_name, messages):
+        def ollama_chat(_port, _model_name, messages, *, timeout_sec):
+            self.assertEqual(timeout_sec, ctx.infer_timeout_sec)
             self.assertIn('review this code', messages[0]['content'])
             self.assertIn('truncated to first 250000 of 291198 bytes', messages[0]['content'])
             self.assertIn('print("hello")', messages[0]['content'])

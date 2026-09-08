@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "corpus_id": "graph-rebase-shadow-diagnostics-2026-07-19-wave-1",
+  "source": "custom_ollmo_diagnostic",
+  "cases": [
+    {
+      "id": "D1",
+      "wave": 1,
+      "category": "clean_negative_control",
+      "workload_family": "image_generation_vision_analysis_clean_chain",
+      "conversation_key": "graph-rebase-shadow-20260719-d1",
+      "source": "custom_ollmo_diagnostic",
+      "prompt": "Erzeuge ein realistisches quadratisches Bild eines gelben Notizbuchs mit der gut lesbaren Aufschrift \u201ePlan A\u201c. Analysiere danach ausschlie\u00dflich sichtbare Details des tats\u00e4chlich erzeugten Bildes auf Deutsch und fasse sie in genau drei Stichpunkten zusammen.",
+      "expected_capabilities": [
+        "chat",
+        "image_generation",
+        "vision_analysis"
+      ],
+      "expected_evidence": {
+        "intent": "A coherent image-to-vision chain should close without structural graph replacement.",
+        "expected_classification": "clean_negative_no_rebase",
+        "expected_dependency_shape": [
+          "chat->image_generation",
+          "image_generation->vision_analysis",
+          "vision_analysis->chat"
+        ],
+        "acceptable_selected_scopes": [
+          "observe"
+        ],
+        "formal_rebase_proposal_expected": false
+      },
+      "stop_signals": [
+        "unresolved_critical_safety_finding",
+        "formal_rebase_proposal_on_clean_chain",
+        "unexpected_successor_rebase_request"
+      ]
+    },
+    {
+      "id": "D2",
+      "wave": 1,
+      "category": "smaller_scope_control",
+      "workload_family": "linked_web_artifacts_two_images_html_css",
+      "conversation_key": "graph-rebase-shadow-20260719-d2",
+      "source": "custom_ollmo_diagnostic",
+      "prompt": "Erstelle f\u00fcr eine minimalistische Teemarke genau zwei unterschiedliche lokale Bilder, index.html und styles.css. Bild 1 ist eine Teekanne im Morgenlicht, Bild 2 ein Detail loser Teebl\u00e4tter. Jede Bilddatei darf nur in ihrer passenden Section stehen; index.html muss beide realen Bilder und styles.css relativ verlinken. Keine Platzhalter oder externen Medien. Materialisiere exakt vier Artefakte.",
+      "expected_capabilities": [
+        "chat",
+        "image_generation"
+      ],
+      "expected_evidence": {
+        "intent": "Concrete local image and stylesheet bindings should prefer the smallest truthful repair scope.",
+        "expected_classification": "clean_negative_or_smaller_scope_precedence",
+        "expected_dependency_shape": [
+          "chat->image_generation[2]",
+          "image_generation[2]->index.html",
+          "chat->styles.css",
+          "styles.css->index.html:relative_link"
+        ],
+        "acceptable_selected_scopes": [
+          "observe",
+          "add_missing_branch",
+          "repair_binding_dependency",
+          "repair_artifact_ref_identity"
+        ],
+        "formal_rebase_proposal_expected": false
+      },
+      "stop_signals": [
+        "unresolved_critical_safety_finding",
+        "upper_rebase_selected_while_smaller_scope_is_sufficient",
+        "broken_local_link_contract",
+        "unexpected_successor_rebase_request"
+      ]
+    },
+    {
+      "id": "D3",
+      "wave": 1,
+      "category": "partial_scope_mapping_stress",
+      "workload_family": "three_image_three_vision_identity_mapping",
+      "conversation_key": "graph-rebase-shadow-20260719-d3",
+      "source": "custom_ollmo_diagnostic",
+      "prompt": "Erzeuge genau drei unterschiedliche lokale Bilder: A \u2013 ein roter Leuchtturm im Schnee bei Tag; B \u2013 eine gr\u00fcne Bibliothek bei Nacht; C \u2013 ein blaues Gew\u00e4chshaus im Regen. Analysiere danach jedes tats\u00e4chlich erzeugte Bild separat. Gib abschlie\u00dfend im Chat genau eine JSON-Liste mit den Feldern label, artifact_ref und visible_evidence f\u00fcr A, B und C aus. Ordne jede visible_evidence ausschlie\u00dflich dem artifact_ref des gleich bezeichneten Bildes zu.",
+      "expected_capabilities": [
+        "chat",
+        "image_generation",
+        "vision_analysis"
+      ],
+      "expected_evidence": {
+        "intent": "Three independent image-to-vision subtrees must preserve exact one-to-one artifact identity through the final join.",
+        "expected_classification": "clean_negative_or_partial_candidate_after_objective_cross_mapping",
+        "expected_dependency_shape": [
+          "chat->image_generation[3]",
+          "image_generation[A]->vision_analysis[A]",
+          "image_generation[B]->vision_analysis[B]",
+          "image_generation[C]->vision_analysis[C]",
+          "vision_analysis[3]->chat"
+        ],
+        "acceptable_selected_scopes": [
+          "observe",
+          "repair_binding_dependency",
+          "partial_subtree_rebase"
+        ],
+        "formal_rebase_proposal_expected": "only_if_current_runtime_truth_proves_cross_mapping_that_smaller_repair_cannot_preserve"
+      },
+      "stop_signals": [
+        "unresolved_critical_safety_finding",
+        "objective_cross_mapping_with_current_structural_closure_evidence_missing",
+        "validated_graph_rebase_proposal_requires_manual_inspection",
+        "unexpected_successor_rebase_request"
+      ]
+    },
+    {
+      "id": "D4",
+      "wave": 1,
+      "category": "multimodal_dependency_join_stress",
+      "workload_family": "parallel_image_audio_vision_stt_evidence_join",
+      "conversation_key": "graph-rebase-shadow-20260719-d4",
+      "source": "custom_ollmo_diagnostic",
+      "prompt": "Schreibe einen deutschen Szenentext mit genau zwanzig W\u00f6rtern \u00fcber einen Leuchtturm im Sturm. Erzeuge daraus parallel ein Bild und ein Audio. Analysiere danach das tats\u00e4chlich erzeugte Bild und transkribiere das tats\u00e4chlich erzeugte Audio. Vergleiche abschlie\u00dfend im Chat anhand genau dieser beiden realen Evidenzzweige, ob Leuchtturm, Sturm und Nacht in beiden vorkommen. Bildanalyse darf nur vom Bild, Transkription nur vom Audio, der Schluss nur von beiden Evidenzzweigen abh\u00e4ngen.",
+      "expected_capabilities": [
+        "chat",
+        "image_generation",
+        "text_to_speech",
+        "vision_analysis",
+        "speech_to_text"
+      ],
+      "expected_evidence": {
+        "intent": "Parallel visual and audio producers must feed their matching evidence consumers before one final cross-modal join.",
+        "expected_classification": "clean_negative_or_dependency_repair_or_partial_candidate",
+        "expected_dependency_shape": [
+          "chat->image_generation",
+          "chat->text_to_speech",
+          "image_generation->vision_analysis",
+          "text_to_speech->speech_to_text",
+          "vision_analysis+speech_to_text->chat"
+        ],
+        "acceptable_selected_scopes": [
+          "observe",
+          "add_missing_branch",
+          "repair_binding_dependency",
+          "partial_subtree_rebase",
+          "full_successor_rebase:shadow_only"
+        ],
+        "formal_rebase_proposal_expected": "only_if_current_runtime_truth_proves_structural_mismatch_after_smaller_scopes_are_exhausted"
+      },
+      "stop_signals": [
+        "unresolved_critical_safety_finding",
+        "objective_dependency_mismatch_with_current_structural_closure_evidence_missing",
+        "validated_graph_rebase_proposal_requires_manual_inspection",
+        "unexpected_successor_rebase_request"
+      ]
+    }
+  ]
+}

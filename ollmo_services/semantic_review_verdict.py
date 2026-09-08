@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.events import observe_call, select_fields, judgment_summary
+
 import json
 import re
 from collections.abc import Mapping
@@ -261,6 +263,26 @@ def _criterion_identity(value: Any) -> str:
     return re.sub(r'[^a-z0-9_]+', '_', _clean_text(value).lower()).strip('_')
 
 
+def _freeze_causal_inputs(arguments):
+    verdict = arguments['verdict'] if isinstance(arguments['verdict'], Mapping) else {}
+    selected = select_fields(verdict, ('parse_status', 'verdict', 'recommended_transition', 'defects', 'evidence_refs'))
+    selected['declared_schema'] = select_fields(verdict.get('declared_schema'), (
+        'kind', 'verdict', 'recommended_transition', 'defects_is_empty_array',
+        'evidence_refs_is_array', 'criterion_results_is_array',
+    ))
+    selected['criterion_results'] = [select_fields(item, ('criterion', 'status'))
+                                     for item in verdict.get('criterion_results') or []
+                                     if isinstance(item, Mapping)]
+    return {'verdict': selected, 'required_criteria': arguments['required_criteria']}
+
+
+@observe_call('semantic_review_verdict.freeze_acceptance',
+              inputs=_freeze_causal_inputs,
+              evidence=lambda a: select_fields(_freeze_causal_inputs(a)['verdict'], ('evidence_refs', 'criterion_results')),
+              authority=lambda a: {'rule': 'semantic_review_truthful_freeze_v1',
+                                   'required_criteria': a['required_criteria']},
+              required_rule='semantic_review_truthful_freeze_v1', complete=True,
+              result=judgment_summary)
 def semantic_review_verdict_freeze_acceptance(
     verdict: Any,
     *,

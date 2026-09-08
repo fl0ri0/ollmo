@@ -7,7 +7,12 @@ from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 from ollmo_g.request_phase_graph import build_request_phase_graph, downstream_phase_records
-from ollmo_services.artifact_contracts import extract_artifact_ref, sanitize_artifact_record
+from ollmo_services.artifact_contracts import (
+    artifact_authority_rank,
+    artifact_logical_identity,
+    extract_artifact_ref,
+    sanitize_artifact_record,
+)
 from ollmo_services.responses import (
     extract_responses_current_turn_prompt,
     response_item_is_internal_control_work,
@@ -229,6 +234,19 @@ def _expected_text_artifact_path(record: Mapping[str, Any]) -> str:
         or record.get('text_artifact_target_path')
         or request_payload.get('target_path')
     )
+
+
+def _text_artifact_spec_identity(record: Mapping[str, Any]) -> Optional[tuple[str, ...]]:
+    if not _spec_requires_text_artifact(record):
+        return None
+    extension = _expected_text_artifact_extension(record)
+    source_name = _expected_text_artifact_source_name(record)
+    if extension and source_name:
+        return ('named', extension, source_name)
+    target_path = _expected_text_artifact_path(record)
+    if target_path:
+        return ('target', target_path)
+    return None
 
 
 def _error_message_for_response(response_payload: Mapping[str, Any]) -> str:
@@ -878,11 +896,58 @@ def _build_branch_output_specs(
             if value not in (None, '', [], {}):
                 spec[key] = value
         specs.append(spec)
-    return [
+    normalized_specs = [
         item
         for item in specs
         if item.get('branch_id') and item.get('capability') and item.get('output_type')
     ]
+    deduped_specs: list[dict[str, Any]] = []
+    identity_indexes: dict[tuple[str, ...], int] = {}
+    status_rank = {
+        'fulfilled': 5,
+        'completed': 5,
+        'pending': 4,
+        'active': 4,
+        'blocked': 3,
+        'failed': 3,
+        'cancelled': 2,
+        'superseded': 1,
+        'waived': 1,
+    }
+
+    def spec_owner_rank(spec: Mapping[str, Any]) -> int:
+        identifiers = ' '.join(
+            _clean_text(spec.get(key)).lower()
+            for key in ('branch_id', 'phase_id')
+        )
+        if 'repair-' in identifiers:
+            return 0
+        if _clean_text(spec.get('source')).lower() == 'request_phase_graph':
+            return 2
+        return 1
+
+    for spec in normalized_specs:
+        identity = _text_artifact_spec_identity(spec)
+        if identity is None:
+            deduped_specs.append(spec)
+            continue
+        existing_index = identity_indexes.get(identity)
+        if existing_index is None:
+            identity_indexes[identity] = len(deduped_specs)
+            deduped_specs.append(spec)
+            continue
+        existing = deduped_specs[existing_index]
+        incoming_rank = (
+            spec_owner_rank(spec),
+            status_rank.get(_clean_text(spec.get('status')).lower(), 0),
+        )
+        existing_rank = (
+            spec_owner_rank(existing),
+            status_rank.get(_clean_text(existing.get('status')).lower(), 0),
+        )
+        if incoming_rank > existing_rank:
+            deduped_specs[existing_index] = spec
+    return deduped_specs
 
 
 def _artifact_type_aliases(slot_type: str) -> list[str]:
@@ -1082,6 +1147,8 @@ def _pop_text_artifact_by_path_for_spec(
 def _take_text_artifact_for_spec(
     available_artifacts: dict[str, list[dict[str, Any]]],
     spec: Mapping[str, Any],
+    *,
+    response_id: str = '',
 ) -> Optional[dict[str, Any]]:
     bucket = available_artifacts.get('text') or []
     matched_by_path = _pop_text_artifact_by_path_for_spec(bucket, spec)
@@ -1089,9 +1156,22 @@ def _take_text_artifact_for_spec(
         if not bucket:
             available_artifacts.pop('text', None)
         return matched_by_path
-    for index, artifact in enumerate(bucket):
-        if not _text_artifact_matches_spec(artifact, spec):
-            continue
+    candidates = [
+        (index, artifact)
+        for index, artifact in enumerate(bucket)
+        if _text_artifact_matches_spec(artifact, spec)
+    ]
+    if candidates:
+        best_rank = max(
+            artifact_authority_rank(artifact, response_id=response_id)
+            for _index, artifact in candidates
+        )
+        best_candidates = [
+            (index, artifact)
+            for index, artifact in candidates
+            if artifact_authority_rank(artifact, response_id=response_id) == best_rank
+        ]
+        index, _artifact = best_candidates[0]
         matched = bucket.pop(index)
         if not bucket:
             available_artifacts.pop('text', None)
@@ -1219,6 +1299,7 @@ def _build_output_work_nodes(
     branch_text_artifact_specs = [
         spec for spec in branch_specs if _spec_requires_text_artifact(spec)
     ]
+    claimed_text_artifact_identities: set[tuple[str, str]] = set()
     if branch_specs and current_phase_output_type:
         root_status = _slot_status_from_phase_status(current_phase.get('status'))
         if root_status == 'pending' and output_text:
@@ -1285,7 +1366,11 @@ def _build_output_work_nodes(
             spec_saved_text_path = _clean_text(spec.get('saved_text_path'))
             internal_control_work = response_item_is_internal_control_work(spec)
             if _spec_requires_text_artifact(spec) and not internal_control_work:
-                branch_artifact = _take_text_artifact_for_spec(available_artifacts, spec)
+                branch_artifact = _take_text_artifact_for_spec(
+                    available_artifacts,
+                    spec,
+                    response_id=_clean_text(response_payload.get('id')),
+                )
                 if branch_artifact or spec_saved_text_path:
                     slot_status = 'fulfilled'
                 elif slot_status == 'fulfilled':
@@ -1364,6 +1449,19 @@ def _build_output_work_nodes(
                         child_node['status'] = artifact_status
                         child_node['lifecycle'] = artifact_lifecycle
                         child_node['blocked_reason'] = artifact_reason
+                    identity = artifact_logical_identity(artifact)
+                    if identity:
+                        claimed_text_artifact_identities.add(identity)
+                elif _spec_requires_text_artifact(spec):
+                    spec_identity = artifact_logical_identity(
+                        {
+                            'type': 'text',
+                            'text_artifact_extension': _expected_text_artifact_extension(spec),
+                            'text_artifact_source_name': _expected_text_artifact_source_name(spec),
+                        }
+                    )
+                    if spec_identity:
+                        claimed_text_artifact_identities.add(spec_identity)
                 branch_value = _branch_output_value(spec)
                 if branch_value not in (None, '', [], {}):
                     child_node['value'] = branch_value
@@ -1572,6 +1670,11 @@ def _build_output_work_nodes(
     for artifact_list in list(available_artifacts.values()):
         while artifact_list:
             artifact = artifact_list.pop(0)
+            identity = artifact_logical_identity(artifact)
+            if identity and identity in claimed_text_artifact_identities:
+                # Keep superseded siblings in raw artifact diagnostics, but do
+                # not mint a second public output slot for one graph-owned file.
+                continue
             slot_type = artifact.get('type') or 'artifact'
             if slot_type == 'text' and document_output_kind == 'document':
                 slot_type = 'document'

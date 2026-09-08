@@ -56,6 +56,18 @@ class ReferenceExportError(RuntimeError):
     """Raised when a reference run cannot be admitted or verified."""
 
 
+def _required_frame_sequence(value: Any, *, label: str) -> int:
+    if value in (None, '') or isinstance(value, bool):
+        raise ReferenceExportError(f'{label} is missing or malformed.')
+    try:
+        sequence = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ReferenceExportError(f'{label} is missing or malformed.') from exc
+    if sequence <= 0:
+        raise ReferenceExportError(f'{label} is missing or malformed.')
+    return sequence
+
+
 def _json_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + '\n'
@@ -224,12 +236,26 @@ def _read_exact_indexed_record(
         payload = json.loads(row)
     except json.JSONDecodeError as exc:
         raise ReferenceExportError('The exact indexed response row is invalid JSON.') from exc
-    expected_frame_id = str(entry.get('latest_frame_id') or '')
-    expected_sequence = int(entry.get('latest_frame_sequence') or 0)
+    expected_frame_id = str(entry.get('latest_frame_id') or '').strip()
+    if not expected_frame_id:
+        raise ReferenceExportError(
+            'The indexed response frame has no immutable frame identity.'
+        )
+    expected_sequence = _required_frame_sequence(
+        entry.get('latest_frame_sequence'),
+        label='The indexed response frame sequence',
+    )
+    try:
+        payload_sequence = _required_frame_sequence(
+            payload.get('frame_sequence'),
+            label='The exact indexed response frame sequence',
+        )
+    except ReferenceExportError:
+        raise
     if (
         payload.get('response_id') != response_id
         or payload.get('frame_id') != expected_frame_id
-        or int(payload.get('frame_sequence') or 0) != expected_sequence
+        or payload_sequence != expected_sequence
     ):
         raise ReferenceExportError('The exact indexed row has a mismatched identity.')
     return {
@@ -244,6 +270,8 @@ def _load_monitor_report(
     response_id: str,
     *,
     reports_path: Path,
+    expected_frame_id: str | None = None,
+    expected_frame_sequence: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     matches: list[tuple[dict[str, Any], bytes]] = []
     with reports_path.open('rb') as handle:
@@ -254,11 +282,39 @@ def _load_monitor_report(
                 continue
             if str(payload.get('response_id') or '') == response_id:
                 matches.append((payload, line))
-    if len(matches) != 1:
+    if expected_frame_id not in (None, ''):
+        normalized_expected_frame_id = str(expected_frame_id)
+        exact_matches: list[tuple[dict[str, Any], bytes]] = []
+        for item in matches:
+            payload = item[0]
+            if str(payload.get('frame_id') or '') != normalized_expected_frame_id:
+                continue
+            candidate_sequence = payload.get('frame_sequence')
+            if expected_frame_sequence not in (None, '') and candidate_sequence not in (
+                None,
+                '',
+            ):
+                parsed_sequence = _required_frame_sequence(
+                    candidate_sequence,
+                    label='The monitor frame sequence',
+                )
+                if parsed_sequence != int(expected_frame_sequence):
+                    continue
+            exact_matches.append(item)
+        matches = exact_matches
+        if not matches:
+            raise ReferenceExportError(
+                'No monitor record matches the indexed latest frame.'
+            )
+        # Duplicate snapshots for the same immutable frame are harmless; the
+        # last append is the most recent observer record for that frame.
+        payload, raw_line = matches[-1]
+    elif len(matches) != 1:
         raise ReferenceExportError(
             f'Expected exactly one monitor record, found {len(matches)}.'
         )
-    payload, raw_line = matches[0]
+    else:
+        payload, raw_line = matches[0]
     return payload, {
         'record_sha256': _sha256_bytes(raw_line),
         'record_size_bytes': len(raw_line),
@@ -290,11 +346,22 @@ def _require_terminal_truth(
     frame = payload.get('response_frame') or {}
     observed_frame = observed.get('response_frame') or {}
     frame_id = str(indexed_record.get('frame_id') or '')
-    frame_sequence = int(indexed_record.get('frame_sequence') or 0)
+    frame_sequence = _required_frame_sequence(
+        indexed_record.get('frame_sequence'),
+        label='The indexed response frame sequence',
+    )
+    if not frame_id:
+        raise ReferenceExportError(
+            'The indexed response frame has no immutable frame identity.'
+        )
     for candidate in (frame, observed_frame):
+        candidate_sequence = _required_frame_sequence(
+            candidate.get('frame_sequence'),
+            label='A response projection frame sequence',
+        )
         if (
             candidate.get('frame_id') != frame_id
-            or int(candidate.get('frame_sequence') or 0) != frame_sequence
+            or candidate_sequence != frame_sequence
         ):
             raise ReferenceExportError('Response projections disagree on frame identity.')
     semantics = (frame.get('current_state') or {}).get('status_semantics') or {}
@@ -319,10 +386,20 @@ def _require_terminal_truth(
     if invalid:
         raise ReferenceExportError('The response is not cleanly and truthfully complete.')
     artifacts = monitor.get('artifacts') or {}
+    monitor_sequence = monitor.get('frame_sequence')
+    monitor_sequence_matches = True
+    if monitor_sequence not in (None, ''):
+        monitor_sequence_matches = (
+            _required_frame_sequence(
+                monitor_sequence,
+                label='The monitor frame sequence',
+            )
+            == frame_sequence
+        )
     monitor_invalid = (
         monitor.get('response_id') != response_id
         or monitor.get('frame_id') != frame_id
-        or int(monitor.get('frame_sequence') or 0) != frame_sequence
+        or not monitor_sequence_matches
         or monitor.get('verdict') != 'clean'
         or monitor.get('lifecycle_state') != 'completed'
         or monitor.get('late_fill_status') != 'completed'
@@ -931,6 +1008,8 @@ def export_reference_run(
     monitor, monitor_identity = _load_monitor_report(
         response_id,
         reports_path=monitor_reports,
+        expected_frame_id=str(indexed_record.get('frame_id') or ''),
+        expected_frame_sequence=int(indexed_record.get('frame_sequence') or 0),
     )
     payload, observed, closure = _require_terminal_truth(
         response_id,

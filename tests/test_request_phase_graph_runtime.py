@@ -4235,6 +4235,255 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
         self.assertEqual(json_branches[0].get('text_artifact_source'), 'selected_source_edit')
         self.assertEqual(json_branches[0].get('text_artifact_target_path'), source_path)
 
+    def test_retained_uploaded_data_sheet_becomes_bound_byte_copy_branch(self):
+        prompt = (
+            'Build a two-page room website. Use the attached mon-repos-rooms.json as the factual source. '
+            'Create index.html, rooms.html, styles.css, and app.js, retain the supplied data sheet as '
+            'rooms.json, and package everything as one local bundle.'
+        )
+        source_path = '/artifacts/inputs/text/20260902T184249Z_text_mon-repos-rooms.json'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={
+                'ghost_route': True,
+                'prompt': prompt,
+                'input_artifacts': [
+                    {
+                        'type': 'text',
+                        'kind': 'text',
+                        'name': 'mon-repos-rooms.json',
+                        'mime_type': 'application/json',
+                        'path': source_path,
+                    }
+                ],
+            },
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        text_branches = [
+            branch
+            for branch in graph.get('downstream_branches') or []
+            if branch.get('text_artifact_extension')
+        ]
+        retained = [
+            branch
+            for branch in text_branches
+            if branch.get('text_artifact_source') == 'retained_input_alias'
+        ]
+        self.assertEqual(
+            [branch.get('text_artifact_source_name') for branch in text_branches],
+            ['index', 'rooms', 'styles', 'app', 'rooms'],
+        )
+        self.assertEqual(len(retained), 1)
+        branch = retained[0]
+        self.assertEqual(branch['stage_direction'], 'materialize_retained_input_alias')
+        self.assertEqual(branch['retained_input_source_path'], source_path)
+        self.assertEqual(branch['retained_input_source_name'], 'mon-repos-rooms.json')
+        self.assertEqual(branch['retained_input_target_name'], 'rooms.json')
+        self.assertEqual(branch['retained_input_binding_state'], 'bound')
+        self.assertEqual(branch['depends_on'], ['phase-1'])
+        self.assertTrue(branch['artifact_request']['retained_input_alias_required'])
+
+    def test_retained_input_alias_accepts_direct_current_input_path_carriers(self):
+        prompt = 'Retain the attached direct-source.json file as rooms.json.'
+        source_path = '/uploads/direct-source.json'
+
+        for carrier in ('file_path', 'route_artifact_path'):
+            with self.subTest(carrier=carrier):
+                request_payload = {'ghost_route': True, 'prompt': prompt}
+                route_payload = {
+                    'capability': 'chat',
+                    'route_source': 'ghost_carried',
+                }
+                if carrier == 'file_path':
+                    request_payload[carrier] = source_path
+                else:
+                    route_payload[carrier] = source_path
+
+                graph = build_request_phase_graph(
+                    prompt,
+                    request_payload=request_payload,
+                    route_payload=route_payload,
+                )
+
+                retained = [
+                    branch
+                    for branch in graph.get('downstream_branches') or []
+                    if branch.get('text_artifact_source') == 'retained_input_alias'
+                ]
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0]['retained_input_binding_state'], 'bound')
+                self.assertEqual(retained[0]['retained_input_source_path'], source_path)
+                self.assertEqual(retained[0]['retained_input_source_name'], 'direct-source.json')
+                self.assertEqual(retained[0]['retained_input_target_name'], 'rooms.json')
+
+    def test_retained_input_alias_ignores_direct_path_fields_on_response_outputs(self):
+        prompt = 'Retain the attached response-output.json file as rooms.json.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            response_payload={
+                'file_path': '/outputs/response-output.json',
+                'route_artifact_path': '/outputs/response-output.json',
+            },
+        )
+
+        retained = [
+            branch
+            for branch in graph.get('downstream_branches') or []
+            if branch.get('text_artifact_source') == 'retained_input_alias'
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]['retained_input_binding_state'], 'missing')
+        self.assertNotIn('retained_input_source_path', retained[0])
+
+    def test_ambiguous_retained_input_alias_fails_closed(self):
+        prompt = 'Retain the supplied data sheet as rooms.json.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={
+                'ghost_route': True,
+                'prompt': prompt,
+                'input_artifacts': [
+                    {'type': 'text', 'kind': 'text', 'name': 'east.json', 'path': '/uploads/east.json'},
+                    {'type': 'text', 'kind': 'text', 'name': 'west.json', 'path': '/uploads/west.json'},
+                ],
+            },
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        retained = [
+            branch
+            for branch in graph.get('downstream_branches') or []
+            if branch.get('text_artifact_source') == 'retained_input_alias'
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]['retained_input_binding_state'], 'ambiguous')
+        self.assertEqual(retained[0]['branch_contract_error'], 'retained_input_alias_ambiguous')
+        self.assertTrue(retained[0]['materialization_blocked'])
+        self.assertNotIn('retained_input_source_path', retained[0])
+
+    def test_negated_retained_input_alias_does_not_create_materialization_branch(self):
+        prompt = 'Do not retain the supplied data sheet as rooms.json.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={
+                'ghost_route': True,
+                'prompt': prompt,
+                'input_artifacts': [
+                    {
+                        'type': 'text',
+                        'kind': 'text',
+                        'name': 'uploaded-rooms.json',
+                        'path': '/uploads/uploaded-rooms.json',
+                    }
+                ],
+            },
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        self.assertFalse(
+            [
+                branch
+                for branch in graph.get('downstream_branches') or []
+                if branch.get('text_artifact_source') == 'retained_input_alias'
+            ]
+        )
+
+    def test_retained_input_alias_does_not_bind_response_output_as_supplied_input(self):
+        prompt = 'Retain the supplied data sheet as rooms.json.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+            response_payload={'saved_text_path': '/generated/old.json'},
+        )
+
+        retained = [
+            branch
+            for branch in graph.get('downstream_branches') or []
+            if branch.get('text_artifact_source') == 'retained_input_alias'
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]['retained_input_binding_state'], 'missing')
+        self.assertEqual(
+            retained[0]['branch_contract_error'],
+            'retained_input_alias_unavailable',
+        )
+        self.assertNotIn('retained_input_source_path', retained[0])
+
+    def test_retained_input_alias_binds_each_named_clause_locally(self):
+        prompt = (
+            'Retain alpha.json as east.json and copy beta.json as west.json.'
+        )
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={
+                'ghost_route': True,
+                'prompt': prompt,
+                'input_artifacts': [
+                    {'type': 'text', 'name': 'alpha.json', 'path': '/uploads/alpha.json'},
+                    {'type': 'text', 'name': 'beta.json', 'path': '/uploads/beta.json'},
+                ],
+            },
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        retained = [
+            branch
+            for branch in graph.get('downstream_branches') or []
+            if branch.get('text_artifact_source') == 'retained_input_alias'
+        ]
+        self.assertEqual(
+            {
+                branch['retained_input_target_name']: branch['retained_input_source_path']
+                for branch in retained
+            },
+            {
+                'east.json': '/uploads/alpha.json',
+                'west.json': '/uploads/beta.json',
+            },
+        )
+
+    def test_retained_input_alias_unmatched_named_source_fails_closed(self):
+        prompt = 'Retain the attached missing.json file as rooms.json.'
+
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={
+                'ghost_route': True,
+                'prompt': prompt,
+                'input_artifacts': [
+                    {
+                        'type': 'text',
+                        'name': 'east.json',
+                        'path': '/uploads/east.json',
+                    }
+                ],
+            },
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+
+        retained = [
+            branch
+            for branch in graph.get('downstream_branches') or []
+            if branch.get('text_artifact_source') == 'retained_input_alias'
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]['retained_input_binding_state'], 'missing')
+        self.assertEqual(
+            retained[0]['branch_contract_error'],
+            'retained_input_alias_unavailable',
+        )
+        self.assertNotIn('retained_input_source_path', retained[0])
+
     def test_visual_preservation_guard_does_not_suppress_requested_image_edit(self):
         prompt = (
             'Bewahre den bisherigen Seitenaufbau, aber ändere das Bild deutlich und erzeuge eine neue '
@@ -4753,3 +5002,38 @@ class RequestPhaseGraphRuntimeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_reserved_website_cannot_borrow_action_from_promoted_image_sentence():
+    from ollmo_g.request_phase_graph import build_request_phase_graph
+    from ollmo_core.inference import detect_text_artifact_requests
+
+    reserved = ('Now explicitly create one image of a lighthouse. '
+                'A prompt is not the requested image artifact. '
+                'Keep unrelated audio and website ideas reserved.')
+    assert detect_text_artifact_requests(reserved) == []
+    graph = build_request_phase_graph(reserved, request_payload={'prompt': reserved},
+                                      route_payload={'capability': 'image_generation'})
+    assert any(o.get('capability') == 'image_generation' for o in graph['output_obligations'])
+    assert not any(o.get('text_artifact_extension') == 'html' for o in graph['output_obligations'])
+    promoted = reserved + ' Now build the website.'
+    assert any(r['extension'] == 'html' for r in detect_text_artifact_requests(promoted))
+
+
+def test_reserved_website_clause_has_no_promotion_authority():
+    from ollmo_core.inference import detect_text_artifact_requests
+    from ollmo_g.request_phase_graph import build_request_phase_graph
+
+    for separator in ['; ', ', ', '. ', '\n', ' and ']:
+        prompt = f'Create an image{separator}keep website reserved.'
+        for mode in ['repair', 'worker', 'explorer', 'improviser']:
+            graph = build_request_phase_graph(prompt, request_payload={'prompt': prompt, 'ghost_mode': mode},
+                                              route_payload={'capability': 'image_generation'})
+            assert detect_text_artifact_requests(prompt) == []
+            assert not any(o.get('text_artifact_extension') == 'html' for o in graph['output_obligations'])
+            assert any(o.get('capability') == 'image_generation' for o in graph['output_obligations'])
+    for prompt in ['Create an image; now build the website.',
+                   'Create a website, keep image ideas reserved.',
+                   'Keep the website reserved; now build the website.',
+                   'Baue eine Webseite mit einem Bild.']:
+        assert any(r['extension'] == 'html' for r in detect_text_artifact_requests(prompt)), prompt

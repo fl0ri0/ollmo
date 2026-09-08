@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.events import observe_call
+
 import logging
 import re
 from dataclasses import dataclass
@@ -2514,6 +2516,9 @@ class GhostRouteRuntimeOwner:
         helper_status['attached'] = True
         helper_status['reason'] = 'attached'
 
+    @observe_call('ghost_route.resolve_ghost_auto_route', record_kind='routing_invocation',
+                  inputs=lambda a: {'preview_mode': a['preview_mode'],
+                                    'compute_semantics': a['compute_semantics']})
     def resolve_ghost_auto_route(
         self,
         data: Any,

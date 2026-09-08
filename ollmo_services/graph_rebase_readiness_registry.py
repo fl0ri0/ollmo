@@ -8,6 +8,8 @@ operator, staging, authorization, or execution authority.
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
 from collections.abc import Mapping, Sequence
 import fcntl
 import hashlib
@@ -28,6 +30,7 @@ from ollmo_services.response_frames import (
     DEFAULT_RESPONSE_FRAME_LEDGER,
     DEFAULT_RESPONSE_FRAMES_DIR,
     load_latest_response_observation_state,
+    _reuse_response_observation_if_current,
     select_graph_rebase_observation_response_ids,
     verify_response_frame_epoch,
 )
@@ -698,12 +701,14 @@ def append_graph_rebase_readiness_registry_records(
     }
 
 
+@observe_state('readiness.registry_validation_append', 'observation_and_verified_epoch', 'readiness_registry_record', labels=('NEW_AUTHORITY_BOUNDARY', 'REVALIDATION'), new_authority_boundary=True)
 def append_graph_rebase_readiness_observation(
     payload_or_projection: Mapping[str, Any],
     *,
     source_frame: Mapping[str, Any] | str,
     source_epoch: Optional[Mapping[str, Any]] = None,
     verified_epoch: Optional[Mapping[str, Any]] = None,
+    _observation_candidate: Any = None,
     frames_dir: Path | str = DEFAULT_RESPONSE_FRAMES_DIR,
     ledger_name: str = DEFAULT_RESPONSE_FRAME_LEDGER,
     index_name: str = DEFAULT_RESPONSE_FRAME_INDEX,
@@ -844,12 +849,17 @@ def append_graph_rebase_readiness_observation(
             'The supplied observation is not the verified latest source frame.',
             details={'response_id': response_id},
         )
-    observed = load_latest_response_observation_state(
-        response_id,
-        frames_dir=frames_dir,
-        ledger_name=ledger_name,
-        index_state=index_state,
+    observed = _reuse_response_observation_if_current(
+        _observation_candidate, response_id, frames_dir=frames_dir,
+        index_state=index_state, verified_epoch=verified,
     )
+    if observed is None:
+        observed = load_latest_response_observation_state(
+            response_id,
+            frames_dir=frames_dir,
+            ledger_name=ledger_name,
+            index_state=index_state,
+        )
     observed_payload = (
         observed.get('response_payload')
         if isinstance(observed.get('response_payload'), Mapping)

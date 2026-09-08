@@ -37,6 +37,17 @@ class BackendTransportRuntimeTests(unittest.TestCase):
         self.assertEqual(captured['timeout_sec'], 180)
         self.assertFalse(captured['allow_port_fallback'])
 
+    def test_ollama_chat_forwards_explicit_request_timeout(self):
+        owner = self._owner()
+        messages = [{'role': 'system', 'content': 'Prepare only.'},
+                    {'role': 'user', 'content': 'Build the site.'}]
+        with patch('ollmo_server.backend_transport_runtime.ollama_chat_with_options',
+                   return_value={'content': 'ok'}) as transport:
+            owner.ollama_chat(11434, 'test-model', messages, timeout_sec=600)
+        self.assertEqual(transport.call_args.kwargs['timeout_sec'], 600)
+        self.assertEqual(transport.call_args.kwargs['messages'], messages)
+        self.assertFalse(transport.call_args.kwargs['allow_port_fallback'])
+
     def test_mlx_audio_speech_forwards_adaptive_max_tokens(self):
         owner = self._owner()
 

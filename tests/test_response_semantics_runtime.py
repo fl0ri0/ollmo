@@ -35,6 +35,98 @@ def _normalize_capability_list(values):
 
 
 class ResponseSemanticsRuntimeTests(unittest.TestCase):
+    def test_availability_wait_does_not_spend_coalesced_materialization_retry(self):
+        spec = {
+            'branch_id': 'cohort', 'coalesced_text_artifact_wave': True,
+            'text_artifact_requests': [{'extension': 'html', 'source_name': 'index'},
+                                       {'extension': 'css', 'source_name': 'styles'}],
+            'coalesced_text_artifact_branches': [{'branch_id': 'index'}, {'branch_id': 'styles'}],
+        }
+        error = {'code': 'INSTANCE_UNAVAILABLE', 'stage': 'prepare_branch_plan',
+                 'retryable': True, 'route_diagnostics': {'availability_wait': {
+                     'reason': 'live_candidates_in_cooldown', 'candidate_instance_ids': ['chat']}}}
+        result = self.late_fill_owner._retry_failed_coalesced_text_artifact_materializations(
+            [spec], {'branch_errors': {'cohort': error}, 'branch_results': {}},
+            prepare_branch_plan=lambda **kw: self.fail('Must wait before preparing again'),
+            execute_prepared_branch=lambda plan: self.fail('Must not execute during cooldown'),
+        )
+        self.assertEqual(set(result['branch_errors']), {'index', 'styles'})
+        self.assertEqual(result['branch_errors']['index']['route_diagnostics'], error['route_diagnostics'])
+        self.assertNotIn('coalesced_text_artifact_recovery_history', result)
+
+    def test_availability_wait_preserves_budget_and_requires_structured_evidence(self):
+        from unittest.mock import patch
+
+        branch = {'branch_id': 'repair-css', 'capability': 'chat',
+                  'text_artifact_target_path': '/synthetic/styles.css',
+                  'auto_executable_repair_retry_count': 5, 'excluded_instance_ids': ['prior-failure']}
+        error = {'code': 'INSTANCE_UNAVAILABLE', 'stage': 'prepare_branch_plan',
+                 'route_diagnostics': {'availability_wait': {
+                     'reason': 'live_candidates_in_cooldown', 'candidate_instance_ids': ['live-model']}}}
+        with patch('ollmo_server.late_fill_runtime.time.time', return_value=100), \
+             patch.dict('os.environ', {'OLLMO_LATE_FILL_AVAILABILITY_POLL_SEC': '5'}):
+            waiting = self.late_fill_owner.build_availability_wait_branch(branch, error=error)
+            self.assertEqual(self.late_fill_owner.availability_wait_delay(waiting), 5)
+            repeated = self.late_fill_owner.build_availability_wait_branch(waiting, error=error)
+            self.assertEqual(repeated['availability_wait']['check_count'], 2)
+            self.assertEqual(repeated['auto_executable_repair_retry_count'], 5)
+            self.assertEqual(repeated['excluded_instance_ids'], ['prior-failure'])
+            self.assertEqual(repeated['text_artifact_target_path'], branch['text_artifact_target_path'])
+        with patch('ollmo_server.late_fill_runtime.time.time', return_value=105):
+            self.assertEqual(self.late_fill_owner.availability_wait_delay(waiting), 0)
+        self.assertNotIn('availability_wait', branch)
+        self.assertIsNone(self.late_fill_owner.build_availability_wait_branch(
+            branch, error={'code': 'INSTANCE_UNAVAILABLE', 'stage': 'prepare_branch_plan'},
+        ))
+        self.assertIsNone(self.late_fill_owner.build_availability_wait_branch(
+            branch, error={**error, 'code': 'CONTROL_VALIDATION_FAILED'},
+        ))
+        self.assertIsNone(self.late_fill_owner.build_availability_wait_branch(
+            {**branch, 'automatic_follow_up_allowed': False}, error=error,
+        ))
+
+    def test_unavailable_preparation_recovery_requires_fresh_availability(self):
+        error = self.late_fill_owner.normalize_late_fill_error_payload({
+            'message': "No ready late-fill instance for capability 'chat'. Unusable instance ids: chat-1.",
+            'stage': 'prepare_branch_plan',
+        })
+        self.assertEqual(error['code'], 'INSTANCE_UNAVAILABLE')
+        self.assertTrue(error['retryable'])
+        attempt = {'stage': 'prepare_branch_plan', 'instance_id': 'chat-1'}
+        context = self.late_fill_owner.late_fill_recovery_context(error=error, attempt=attempt)
+        self.assertTrue(context['can_retry'])
+        self.assertEqual(context['suggested_action'], 'retry_same_branch')
+        self.assertEqual(context['retry_scope'], 'same_branch')
+        self.assertTrue(context['availability_recheck_required'])
+        self.assertNotIn('blocked_by_branch_contract', context)
+        self.assertNotIn('exclude_instance_ids', context)
+        branch = {'branch_id': 'repair-css', 'capability': 'chat', 'output_type': 'text',
+                  'text_artifact_target_path': '/synthetic/styles.css',
+                  'auto_execute': True, 'output_contract': {'required': True, 'output_type': 'text'}}
+        state = self.late_fill_owner.late_fill_recovery_state(
+            branch, recovery_context=context, attempt=attempt,
+        )
+        self.assertFalse(state['auto_execute'])
+        self.assertTrue(state['availability_recheck_required'])
+        self.assertNotIn('failed_instance_id', state)
+        self.assertIsNone(self.late_fill_owner.build_auto_executable_repair_retry_branch(
+            branch, recovery_context=context, recovery_state=state, attempt=attempt,
+            trigger='late_fill_failure',
+        ))
+        self.assertEqual(branch['text_artifact_target_path'], '/synthetic/styles.css')
+
+    def test_unavailable_preparation_keeps_explicit_contract_failure_blocked(self):
+        error = self.late_fill_owner.normalize_late_fill_error_payload({
+            'code': 'CONTROL_VALIDATION_FAILED', 'retryable': False,
+            'message': "No ready late-fill instance for capability 'chat'.",
+            'stage': 'prepare_branch_plan',
+        })
+        context = self.late_fill_owner.late_fill_recovery_context(error=error, attempt={})
+        self.assertFalse(context['can_retry'])
+        self.assertTrue(context['blocked_by_branch_contract'])
+        self.assertEqual(context['suggested_action'], 'repair_branch_contract')
+        self.assertNotIn('availability_recheck_required', context)
+
     def setUp(self):
         self.owner = ResponseSemanticsRuntimeOwner(
             hooks={
@@ -2097,6 +2189,378 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(payload['batch_prompts_source'], 'semantic_prepare_phase_output')
         self.assertEqual(payload['batch_prompt_source_phase_id'], 'phase-1')
 
+    def test_extract_batch_image_prompts_accepts_natural_instruction_heading_and_wrapped_filenames(self):
+        prepared_text = (
+            '### 📸 Image Generation Instructions\n\n'
+            '1. **`exterior.jpg`**: Wide cinematic daylight photograph of a quiet country house '
+            'beside Lake Geneva, viewed from the garden.\n'
+            '2. **`salon.jpg`**: Natural interior photograph of a restrained lakeside salon with '
+            'linen seating and old oak details.\n'
+            '3. **`room.jpg`**: Calm guest-room photograph with a lake-facing window, warm plaster, '
+            'and simple white bedding.\n'
+            '4. **`breakfast.jpg`**: Morning photograph of a small breakfast table by an open window, '
+            'soft daylight and no staged luxury props.\n\n'
+            '### Web Files\n'
+            '**index.html** and **styles.css** must use the generated images.\n'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(
+            prepared_text,
+            expected_count=4,
+        )
+
+        self.assertEqual(
+            prompts,
+            [
+                'Wide cinematic daylight photograph of a quiet country house beside Lake Geneva, '
+                'viewed from the garden.',
+                'Natural interior photograph of a restrained lakeside salon with linen seating and '
+                'old oak details.',
+                'Calm guest-room photograph with a lake-facing window, warm plaster, and simple '
+                'white bedding.',
+                'Morning photograph of a small breakfast table by an open window, soft daylight and '
+                'no staged luxury props.',
+            ],
+        )
+        self.assertFalse(any('index.html' in prompt or 'styles.css' in prompt for prompt in prompts))
+
+    def test_extract_batch_image_prompts_accepts_unnumbered_stacked_filename_wrappers(self):
+        prepared_text = (
+            '### 📸 Image Generation Instructions\n\n'
+            '**`exterior.jpg`**: Wide cinematic daylight photograph of a quiet country house '
+            'beside Lake Geneva, viewed from the garden.\n'
+            '**`salon.jpg`**: Natural interior photograph of a restrained lakeside salon with '
+            'linen seating and old oak details.\n'
+            '**`room.jpg`**: Calm guest-room photograph with a lake-facing window, warm plaster, '
+            'and simple white bedding.\n'
+            '**`breakfast.jpg`**: Morning photograph of a small breakfast table by an open window, '
+            'soft daylight and no staged luxury props.\n\n'
+            '### Web Files\n'
+            '**index.html** and **styles.css** must use the generated images.\n'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(
+            prepared_text,
+            expected_count=4,
+        )
+
+        self.assertEqual(
+            prompts,
+            [
+                'Wide cinematic daylight photograph of a quiet country house beside Lake Geneva, '
+                'viewed from the garden.',
+                'Natural interior photograph of a restrained lakeside salon with linen seating and '
+                'old oak details.',
+                'Calm guest-room photograph with a lake-facing window, warm plaster, and simple '
+                'white bedding.',
+                'Morning photograph of a small breakfast table by an open window, soft daylight and '
+                'no staged luxury props.',
+            ],
+        )
+        self.assertFalse(any('index.html' in prompt or 'styles.css' in prompt for prompt in prompts))
+
+    def test_exact_image_manifest_rejects_non_image_filename_rows(self):
+        prepared_text = (
+            '### Image Generation Instructions\n\n'
+            '1. index.html: Build the primary page structure and navigation.\n'
+            '2. rooms.html: Build the room selection page and filters.\n'
+            '3. rooms.json: Store the complete room data and prices.\n'
+            '4. styles.css: Define the shared typography and responsive layout.\n'
+        )
+
+        self.assertEqual(
+            self.owner.extract_batch_image_prompts(
+                prepared_text,
+                expected_count=4,
+            ),
+            [],
+        )
+
+    def test_exact_image_manifest_strips_filename_labels_from_named_image_rows(self):
+        prepared_text = (
+            '### Image Generation Instructions\n\n'
+            '1. exterior.jpg: A cinematic exterior photograph in soft daylight.\n'
+            '2. salon.jpg: A natural salon photograph with linen and oak.\n'
+            '3. room.jpg: A calm guest-room photograph facing the lake.\n'
+            '4. breakfast.jpg: A morning breakfast photograph by an open window.\n'
+        )
+
+        prompts = self.owner.extract_batch_image_prompts(
+            prepared_text,
+            expected_count=4,
+        )
+
+        self.assertEqual(len(prompts), 4)
+        self.assertTrue(prompts[0].startswith('A cinematic exterior photograph'))
+        self.assertFalse(any('.jpg' in prompt for prompt in prompts))
+
+    def test_build_response_semantic_phase_payload_fails_closed_for_incomplete_counted_image_batch(self):
+        image_branches = [
+            {
+                'phase_id': f'phase-image-{index}',
+                'branch_id': f'branch-image-{index}',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'depends_on': ['phase-prepare'],
+                'queue_index': index,
+            }
+            for index in range(1, 5)
+        ]
+        phase_graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'mode': 'phase_chain',
+            'current_phase_id': 'phase-prepare',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'prompt_intent': {'requested_visual_output_count': 4},
+            'phases': [
+                {
+                    'phase_id': 'phase-prepare',
+                    'kind': 'prepare',
+                    'role': 'text_preparation',
+                    'capability': 'chat',
+                    'status': 'completed',
+                },
+                *image_branches,
+            ],
+            'downstream_phase_ids': [branch['phase_id'] for branch in image_branches],
+            'downstream_branches': image_branches,
+            'downstream_capabilities': ['image_generation'],
+            'is_multi_phase': True,
+            'continuation_required': True,
+        }
+        prepared_text = (
+            '### Image Generation Instructions\n\n'
+            '1. **`exterior.jpg`**: Wide daylight photograph of a country house by Lake Geneva.\n'
+            '2. **`salon.jpg`**: Natural interior photograph of a quiet lakeside salon.\n'
+            '3. **`room.jpg`**: Calm guest-room photograph with a lake-facing window.\n\n'
+            '### Web Files\nCreate index.html, rooms.html, styles.css, app.js, and rooms.json.'
+        )
+
+        payload = self.owner.build_response_semantic_phase_payload(
+            output_text=prepared_text,
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            request_payload={'prompt': 'Create four photos and a multi-page room website.'},
+            capability='chat',
+        )
+
+        self.assertEqual(payload['branch_contract_error'], 'incomplete_image_prompt_batch')
+        self.assertEqual(payload['batch_prompt_expected_count'], 4)
+        self.assertEqual(payload['batch_prompt_actual_count'], 3)
+        self.assertTrue(payload['materialization_blocked'])
+        self.assertEqual(payload['repair_action'], 'repair_branch_contract')
+        self.assertNotIn('artifact_prompt', payload)
+        self.assertNotIn('batch_prompts', payload)
+
+    def test_build_response_semantic_phase_payload_rechecks_prepare_output_over_stale_shared_fields(self):
+        image_branches = [
+            {
+                'phase_id': f'phase-image-{index}',
+                'branch_id': f'branch-image-{index}',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'depends_on': ['phase-prepare'],
+                'queue_index': index,
+            }
+            for index in range(1, 5)
+        ]
+        phase_graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'mode': 'phase_chain',
+            'current_phase_id': 'phase-prepare',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'prompt_intent': {'requested_visual_output_count': 4},
+            'phases': [
+                {
+                    'phase_id': 'phase-prepare',
+                    'kind': 'prepare',
+                    'role': 'text_preparation',
+                    'capability': 'chat',
+                    'status': 'completed',
+                },
+                *image_branches,
+            ],
+            'downstream_phase_ids': [branch['phase_id'] for branch in image_branches],
+            'downstream_branches': image_branches,
+            'downstream_capabilities': ['image_generation'],
+            'is_multi_phase': True,
+            'continuation_required': True,
+        }
+        prepared_text = (
+            '### Image Generation Instructions\n\n'
+            '1. **`exterior.jpg`**: Wide daylight photograph of a country house by Lake Geneva.\n'
+            '2. **`salon.jpg`**: Natural interior photograph of a quiet lakeside salon.\n'
+            '3. **`room.jpg`**: Calm guest-room photograph with a lake-facing window.\n\n'
+            '### Web Files\nCreate index.html, rooms.html, styles.css, and app.js.'
+        )
+        stale_full_response = (
+            'STALE SHARED PREPARATION RESPONSE with code, file names, and remote image URLs.'
+        )
+
+        payload = self.owner.build_response_semantic_phase_payload(
+            output_text=prepared_text,
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            request_payload={'prompt': 'Create four photos and a multi-page room website.'},
+            source_payload={
+                'content_payload': stale_full_response,
+                'content_payload_source': 'shared_content_payload',
+                'artifact_prompt': stale_full_response,
+                'artifact_prompt_source': 'full_display_text',
+                'batch_prompt_expected_count': 4,
+            },
+            capability='chat',
+        )
+
+        self.assertEqual(payload['branch_contract_error'], 'incomplete_image_prompt_batch')
+        self.assertEqual(payload['batch_prompt_expected_count'], 4)
+        self.assertEqual(payload['batch_prompt_actual_count'], 3)
+        self.assertTrue(payload['materialization_blocked'])
+        self.assertEqual(payload['repair_action'], 'repair_branch_contract')
+        self.assertNotIn('artifact_prompt', payload)
+        self.assertNotIn('batch_prompts', payload)
+        self.assertNotIn(stale_full_response, str(payload))
+
+    def test_semantic_image_payload_does_not_rehydrate_blocked_batch_from_display_text(self):
+        payload = {
+            'content_payload': (
+                'Three image instructions followed by index.html, styles.css, and app.js.'
+            ),
+            'content_payload_source': 'full_display_text',
+            'batch_prompt_expected_count': 4,
+            'batch_prompt_actual_count': 3,
+            'branch_contract_error': 'incomplete_image_prompt_batch',
+            'candidate_extraction_issue': 'missing_exact_branch_local_image_prompt_batch',
+            'materialization_blocked': True,
+            'repair_action': 'repair_branch_contract',
+        }
+
+        semantic = self.owner.semantic_payload_for_capability(
+            payload,
+            capability='image_generation',
+        )
+
+        self.assertNotIn('artifact_prompt', semantic)
+        self.assertEqual(
+            semantic['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertTrue(semantic['materialization_blocked'])
+
+    def test_semantic_image_payload_rejects_incomplete_counted_batch_from_shared_content(self):
+        shared_full_response = (
+            'Full preparation response with HTML, CSS, remote image URLs, and all room data.'
+        )
+        semantic = self.owner.semantic_payload_for_capability(
+            {
+                'content_payload': shared_full_response,
+                'content_payload_source': 'shared_content_payload',
+                'artifact_prompt': shared_full_response,
+                'artifact_prompt_source': 'shared_content_payload',
+                'batch_prompt_expected_count': 4,
+            },
+            capability='image_generation',
+        )
+
+        self.assertNotIn('artifact_prompt', semantic)
+        self.assertNotIn('batch_prompts', semantic)
+        self.assertEqual(
+            semantic['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertEqual(semantic['batch_prompt_expected_count'], 4)
+        self.assertEqual(semantic['batch_prompt_actual_count'], 0)
+        self.assertTrue(semantic['materialization_blocked'])
+        self.assertEqual(semantic['repair_action'], 'repair_branch_contract')
+
+    def test_semantic_image_payload_rejects_invalid_count_without_shared_fallback(self):
+        shared_full_response = (
+            'Full preparation response with HTML, CSS, remote image URLs, and all room data.'
+        )
+        semantic = self.owner.semantic_payload_for_capability(
+            {
+                'content_payload': shared_full_response,
+                'content_payload_source': 'full_display_text',
+                'batch_prompt_expected_count': 'four images',
+            },
+            capability='image_generation',
+        )
+
+        self.assertNotIn('artifact_prompt', semantic)
+        self.assertNotIn('batch_prompts', semantic)
+        self.assertEqual(
+            semantic['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertEqual(
+            semantic['candidate_extraction_issue'],
+            'invalid_image_prompt_batch_count',
+        )
+        self.assertTrue(semantic['batch_prompt_expected_count_invalid'])
+        self.assertTrue(semantic['materialization_blocked'])
+        self.assertTrue(semantic['counted_batch_prompt_carriers_blocked'])
+        self.assertEqual(semantic['repair_action'], 'repair_branch_contract')
+
+    def test_build_response_semantic_phase_payload_rejects_invalid_graph_count_without_value_error(self):
+        phase_graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'mode': 'phase_chain',
+            'current_phase_id': 'phase-prepare',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'prompt_intent': {'requested_visual_output_count': 'four'},
+            'phases': [
+                {
+                    'phase_id': 'phase-prepare',
+                    'kind': 'prepare',
+                    'role': 'text_preparation',
+                    'capability': 'chat',
+                    'status': 'completed',
+                },
+                {
+                    'phase_id': 'phase-image-1',
+                    'branch_id': 'branch-image-1',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'depends_on': ['phase-prepare'],
+                    'queue_index': 1,
+                },
+                {
+                    'phase_id': 'phase-image-2',
+                    'branch_id': 'branch-image-2',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'depends_on': ['phase-prepare'],
+                    'queue_index': 2,
+                },
+            ],
+            'downstream_capabilities': ['image_generation'],
+            'is_multi_phase': True,
+            'continuation_required': True,
+        }
+
+        payload = self.owner.build_response_semantic_phase_payload(
+            output_text=(
+                'Full preparation response with HTML, CSS, and remote image URLs.'
+            ),
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            request_payload={'prompt': 'Create two images and a website.'},
+            capability='chat',
+        )
+
+        self.assertEqual(
+            payload['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertEqual(
+            payload['candidate_extraction_issue'],
+            'invalid_image_prompt_batch_count',
+        )
+        self.assertTrue(payload['batch_prompt_expected_count_invalid'])
+        self.assertTrue(payload['materialization_blocked'])
+        self.assertNotIn('artifact_prompt', payload)
+        self.assertNotIn('batch_prompts', payload)
+
     def test_build_response_semantic_phase_payload_rejects_plain_alpha_without_exact_image_slots(self):
         phase_graph = {
             'kind': 'ollmo.request_phase_graph',
@@ -3398,6 +3862,533 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertIn('../images/four.png', updated)
         self.assertIn('../images/five.png', updated)
         self.assertNotIn('ollmo-generated-media', updated)
+
+    def test_composed_site_image_closure_fans_out_target_bound_cohort_repairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents = root / 'documents'
+            images = root / 'images'
+            documents.mkdir()
+            images.mkdir()
+            index_path = documents / 'index.html'
+            rooms_path = documents / 'rooms.html'
+            styles_path = documents / 'styles.css'
+            app_path = documents / 'app.js'
+            image_paths = [images / f'image-{index:02d}.png' for index in range(1, 5)]
+            for image_path in image_paths:
+                image_path.write_bytes(b'png')
+            index_source = (
+                '<!doctype html><html><head><link rel="stylesheet" href="styles.css"></head>'
+                '<body><section class="hero"></section><main><h1>Mon Repos</h1></main>'
+                '</body></html>'
+            )
+            rooms_source = (
+                '<!doctype html><html><head><link rel="stylesheet" href="styles.css"></head>'
+                '<body><main><div id="room-grid" class="room-grid"></div></main>'
+                '<script src="app.js"></script></body></html>'
+            )
+            styles_source = (
+                f'.hero {{ background-image: url("../images/{image_paths[0].name}"); }}\n'
+                '.room-grid { display: grid; }\n.room-card { padding: 1rem; }\n'
+            )
+            app_source = (
+                'const roomData = ['
+                '{id:"lake-room",name:"Lake Room"},'
+                '{id:"garden-suite",name:"Garden Suite"},'
+                '{id:"house-maisonette",name:"House Maisonette"}'
+                '];\nroomData.forEach(room => { const card = document.createElement("article"); '
+                'card.className = "room-card"; card.innerHTML = `<h3>${room.name}</h3>`; });\n'
+            )
+            for path, source in (
+                (index_path, index_source),
+                (rooms_path, rooms_source),
+                (styles_path, styles_source),
+                (app_path, app_source),
+            ):
+                path.write_text(source, encoding='utf-8')
+            text_specs = [
+                (index_path, 'html', 'index', 'branch-text-artifact-1', 'phase-6'),
+                (rooms_path, 'html', 'rooms', 'branch-text-artifact-2', 'phase-7'),
+                (styles_path, 'css', 'styles', 'branch-text-artifact-3', 'phase-8'),
+                (app_path, 'js', 'app', 'branch-text-artifact-4', 'phase-9'),
+            ]
+            payload = {
+                'id': 'resp_composed_site_cohort_repair',
+                'artifacts': [
+                    *[
+                        {
+                            'type': 'text',
+                            'path': str(path),
+                            'artifact_ref': f'artifact:{name}',
+                            'branch_id': branch_id,
+                            'phase_id': phase_id,
+                            'text_artifact_extension': extension,
+                            'text_artifact_source_name': name,
+                        }
+                        for path, extension, name, branch_id, phase_id in text_specs
+                    ],
+                    *[
+                        {
+                            'type': 'image',
+                            'path': str(image_path),
+                            'artifact_ref': f'artifact:image-{index}',
+                            'branch_id': f'branch-image_generation-{index}',
+                            'phase_id': f'phase-{index + 1}',
+                        }
+                        for index, image_path in enumerate(image_paths, start=1)
+                    ],
+                ],
+                'late_fill': {
+                    'status': 'completed',
+                    'batch_prompt_expected_count': 4,
+                    'batch_prompts': [
+                        'Cinematic exterior of Mon Repos beside Lake Geneva.',
+                        'Interior of the "Lake Room" with a writing desk and lake view.',
+                        'Interior of the "Garden Suite" opening to a private terrace.',
+                        'Interior of the "House Maisonette" with a stone fireplace.',
+                    ],
+                    'completed_branches': [
+                        *[
+                            {
+                                'branch_id': f'branch-image_generation-{index}',
+                                'phase_id': f'phase-{index + 1}',
+                                'capability': 'image_generation',
+                                'output_type': 'image',
+                                'status': 'fulfilled',
+                            }
+                            for index in range(1, 5)
+                        ],
+                        *[
+                            {
+                                'branch_id': branch_id,
+                                'phase_id': phase_id,
+                                'capability': 'chat',
+                                'output_type': 'text',
+                                'status': 'fulfilled',
+                            }
+                            for _path, _extension, _name, branch_id, phase_id in text_specs
+                        ],
+                    ],
+                    'fill_results': [
+                        *[
+                            {
+                                'branch_id': f'branch-image_generation-{index}',
+                                'phase_id': f'phase-{index + 1}',
+                                'capability': 'image_generation',
+                                'saved_image_path': str(image_path),
+                            }
+                            for index, image_path in enumerate(image_paths, start=1)
+                        ],
+                        *[
+                            {
+                                'branch_id': branch_id,
+                                'phase_id': phase_id,
+                                'capability': 'chat',
+                                'saved_text_path': str(path),
+                                'text_artifact_extension': extension,
+                                'text_artifact_source_name': name,
+                            }
+                            for path, extension, name, branch_id, phase_id in text_specs
+                        ],
+                    ],
+                },
+            }
+
+            repaired = self.late_fill_owner._repair_terminal_composed_page_image_representation(payload)
+            checks = self.late_fill_owner._terminal_composed_page_image_representation_open_checks(payload)
+            demoted = self.late_fill_owner._demote_terminal_materialization_branches_with_open_checks(
+                payload['late_fill'],
+                checks,
+            )
+
+            self.assertEqual(repaired, payload)
+            self.assertEqual(index_path.read_text(encoding='utf-8'), index_source)
+            self.assertEqual(rooms_path.read_text(encoding='utf-8'), rooms_source)
+            self.assertEqual(styles_path.read_text(encoding='utf-8'), styles_source)
+            self.assertEqual(app_path.read_text(encoding='utf-8'), app_source)
+            self.assertEqual(len(checks), 4)
+            self.assertEqual(
+                {Path(check['artifact_request']['target_path']).name for check in checks},
+                {'index.html', 'rooms.html', 'styles.css', 'app.js'},
+            )
+            self.assertEqual(len({check['branch_id'] for check in checks}), 4)
+            self.assertTrue(all(check['layout_binding_defect'] for check in checks))
+            for check in checks:
+                self.assertEqual(check['repair_action'], 'rebind_dependency_evidence')
+                self.assertEqual(
+                    check['content_payload_source'],
+                    'closure_composed_site_image_composition',
+                )
+                self.assertEqual(
+                    check['execution_contract']['repair_mode'],
+                    'composed_site_image_cohort_target',
+                )
+                self.assertIn('Lake Room', check['content_payload'])
+                self.assertIn('Garden Suite', check['content_payload'])
+                self.assertIn('House Maisonette', check['content_payload'])
+                self.assertIn('Do not create a new sibling file', check['content_payload'])
+            demoted_targets = {
+                Path(branch['artifact_request']['target_path']).name
+                for branch in demoted['materialization_contract_current_demoted_branches']
+            }
+            self.assertEqual(
+                demoted_targets,
+                {'index.html', 'rooms.html', 'styles.css', 'app.js'},
+            )
+            self.assertTrue(
+                all(
+                    branch['auto_execute'] is True
+                    and branch['execution_contract']['repair_mode']
+                    == 'composed_site_image_cohort_target'
+                    for branch in demoted['materialization_contract_current_demoted_branches']
+                )
+            )
+
+    def test_link_rebind_preserves_dynamic_template_image_selection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            images = [root / f'room-{i}.png' for i in range(3)]
+            for path in images:
+                path.write_bytes(b'png')
+            records = [{'type': 'image', 'path': str(path)} for path in images]
+            source = (
+                'const roomImages = {"lake":"room-0.png",'
+                '"garden":"room-1.png","house":"room-2.png"};\n'
+                'const render = room => `<img src="${roomImages[room.id]}" alt="${room.id}">`;'
+            )
+            for extension, content in [
+                ('js', source), ('mjs', source), ('cjs', source),
+                ('html', f'<script>{source}</script>'),
+            ]:
+                with self.subTest(extension=extension):
+                    target = str(root / f'app.{extension}')
+                    rebound, changes = self.late_fill_owner._rebind_text_artifact_content(
+                        content, target_path=target, target_record={'type': 'text', 'path': target},
+                        asset_records=records,
+                    )
+                    self.assertEqual(rebound, content)
+                    self.assertEqual(changes, [])
+                    self.assertFalse(
+                        self.late_fill_owner._terminal_content_has_unresolved_link_placeholder(
+                            rebound, records, target_path=target,
+                        )
+                    )
+
+    def test_link_rebind_dynamic_template_preserves_css_and_static_repairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / 'actual.png'
+            image.write_bytes(b'png')
+            records = [{'type': 'image', 'path': str(image)}]
+            dynamic = 'const render = item => `<div style="background-image:url(${item.image})"></div>`;'
+            for extension, content, preserved in [
+                ('js', dynamic, True),
+                ('html', f'<script>{dynamic}</script>', True),
+                ('html', '<img src="${image}">', False),
+                ('html', '<img src="missing.png">', False),
+                ('js', 'const render = () => `<img src="placeholder.png">`;', False),
+                ('js', 'const render = () => `<img src="\\${image}">`;', False),
+            ]:
+                with self.subTest(content=content):
+                    target = str(root / f'app.{extension}')
+                    rebound, changes = self.late_fill_owner._rebind_text_artifact_content(
+                        content, target_path=target, target_record={'type': 'text', 'path': target},
+                        asset_records=records,
+                    )
+                    if preserved:
+                        self.assertEqual(rebound, content)
+                        self.assertEqual(changes, [])
+                    else:
+                        self.assertIn('actual.png', rebound)
+                        self.assertTrue(changes)
+                    repeated, repeated_changes = self.late_fill_owner._rebind_text_artifact_content(
+                        rebound, target_path=target, target_record={'type': 'text', 'path': target},
+                        asset_records=records,
+                    )
+                    self.assertEqual(repeated, rebound)
+                    self.assertEqual(repeated_changes, [])
+
+    def test_empty_image_source_binds_only_unique_declared_existing_dependency(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / 'actual.png'
+            sibling = root / 'sibling.png'
+            image.write_bytes(b'png')
+            sibling.write_bytes(b'other png')
+            target = str(root / 'index.html')
+            source = '<div class="hero"><img src="" alt="Lighthouse"></div>'
+            exact = {'type': 'image', 'path': str(image), 'artifact_ref': 'artifact:producer'}
+            other = {'type': 'image', 'path': str(sibling), 'artifact_ref': 'artifact:sibling'}
+            for records, fallback, expected in [
+                ([exact], [other], True),
+                ([exact, other], [], False),
+                ([], [exact], False),
+                ([dict(exact, path=str(root / 'missing.png'))], [], False),
+            ]:
+                with self.subTest(records=records, fallback=fallback):
+                    rebound, changes = self.late_fill_owner._rebind_text_artifact_content(
+                        source, target_path=target, target_record={'type': 'text', 'path': target},
+                        asset_records=records, fallback_asset_records=fallback,
+                    )
+                    if expected:
+                        self.assertIn('src="actual.png"', rebound)
+                        self.assertEqual(changes[0]['linked_path'], str(image))
+                        repeated, more = self.late_fill_owner._rebind_text_artifact_content(
+                            rebound, target_path=target, target_record={'type': 'text', 'path': target},
+                            asset_records=records,
+                        )
+                        self.assertEqual((repeated, more), (rebound, []))
+                        graph = build_request_phase_graph('Create index.html with the generated image.')
+                        checks = self.owner._linked_artifact_binding_checks(
+                            request_payload={'prompt': 'Create index.html with the generated image.'},
+                            artifact_payload={'artifacts': [exact, {'type': 'text', 'path': target, 'content': rebound}]},
+                            request_phase_graph=graph,
+                        )
+                        self.assertEqual(checks, [])
+                    else:
+                        self.assertEqual((rebound, changes), (source, []))
+            for source in ['<a href="">home</a>', '<script src=""></script>']:
+                rebound, changes = self.late_fill_owner._rebind_text_artifact_content(
+                    source, target_path=target, target_record={'type': 'text', 'path': target},
+                    asset_records=[exact],
+                )
+                self.assertEqual((rebound, changes), (source, []))
+
+    def test_dynamic_template_dependency_checks_keep_static_missing_links(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = Path(tmpdir) / 'app.js'
+            app.write_text(
+                'const render = item => `<script src="${item.module}.js"></script>`;\n'
+                'const staticMarkup = `<script src="missing.js"></script>`;',
+                encoding='utf-8',
+            )
+            checks = self.late_fill_owner._terminal_unresolved_local_dependency_link_open_checks(
+                {'artifacts': [{'type': 'text', 'path': str(app)}]}
+            )
+            self.assertEqual([check['missing_dependency_url'] for check in checks], ['missing.js'])
+
+    def test_link_rebind_prefers_public_output_over_internal_repair_sibling(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = root / 'index.html'
+            public_rooms_path = root / '20260905T093027Z_chat_text_artifact_rooms.html'
+            repair_rooms_path = root / '20260905T090021Z_chat_text_artifact_rooms.html'
+            index_path.write_text(
+                f'<html><body><a href="{repair_rooms_path.name}">Rooms</a></body></html>',
+                encoding='utf-8',
+            )
+            public_rooms_path.write_text('<html><body>Public rooms</body></html>', encoding='utf-8')
+            repair_rooms_path.write_text('<html><body>Repair sibling</body></html>', encoding='utf-8')
+            payload = {
+                'id': 'resp_public_rooms_wins',
+                'outputs': [
+                    {
+                        'type': 'document',
+                        'artifact_ref': 'artifact:rooms-public',
+                        'path': str(public_rooms_path),
+                        'branch_id': 'branch-text_artifact-2',
+                        'phase_id': 'phase-7',
+                    }
+                ],
+                'response_frame': {
+                    'output': {
+                        'outputs': [
+                            {
+                                'type': 'document',
+                                'artifact_ref': 'artifact:rooms-public',
+                                'path': str(public_rooms_path),
+                                'branch_id': 'branch-text_artifact-2',
+                                'phase_id': 'phase-7',
+                            }
+                        ]
+                    }
+                },
+                'output_slots': [
+                    {
+                        'slot_id': 'output-phase-7',
+                        'artifact_ref': 'artifact:rooms-public',
+                        'branch_id': 'branch-text-artifact-2',
+                        'phase_id': 'phase-7',
+                    },
+                    {
+                        'slot_id': 'output-repair-chat-11',
+                        'artifact_ref': 'artifact:rooms-repair',
+                        'branch_id': 'repair-chat-11',
+                        'phase_id': 'repair-chat-11',
+                    },
+                ],
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(index_path),
+                        'artifact_ref': 'artifact:index',
+                        'branch_id': 'branch-text-artifact-1',
+                        'phase_id': 'phase-6',
+                        'text_artifact_extension': 'html',
+                        'text_artifact_source_name': 'index',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(public_rooms_path),
+                        'artifact_ref': 'artifact:rooms-public',
+                        'branch_id': 'branch-text-artifact-2',
+                        'phase_id': 'phase-7',
+                        'source_response_id': 'resp_public_rooms_wins',
+                        'text_artifact_extension': 'html',
+                        'text_artifact_source_name': 'rooms',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(repair_rooms_path),
+                        'artifact_ref': 'artifact:rooms-repair',
+                        'branch_id': 'repair-chat-11',
+                        'phase_id': 'repair-chat-11',
+                        'source_response_id': 'resp_public_rooms_wins',
+                        'text_artifact_extension': 'html',
+                        'text_artifact_source_name': 'rooms',
+                    },
+                ],
+            }
+
+            records = self.late_fill_owner._collect_link_rebind_artifact_records(payload)
+            rooms_records = [
+                record
+                for record in records
+                if self.late_fill_owner._artifact_record_source_name(record) == 'rooms'
+            ]
+            rebound = self.late_fill_owner.rebind_terminal_linked_artifacts(payload)
+
+            self.assertEqual(len(rooms_records), 1)
+            self.assertEqual(rooms_records[0]['path'], str(public_rooms_path))
+            self.assertTrue(rooms_records[0]['_link_rebind_public_output'])
+            self.assertIn(public_rooms_path.name, index_path.read_text(encoding='utf-8'))
+            self.assertNotIn(repair_rooms_path.name, index_path.read_text(encoding='utf-8'))
+            self.assertEqual(
+                rebound['late_fill']['linked_artifact_rebinds'][0]['changes'][0]['linked_path'],
+                str(public_rooms_path),
+            )
+
+    def test_composed_site_image_closure_rejects_detached_dump_and_accepts_role_bound_layout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents = root / 'documents'
+            images = root / 'images'
+            documents.mkdir()
+            images.mkdir()
+            index_path = documents / 'index.html'
+            rooms_path = documents / 'rooms.html'
+            styles_path = documents / 'styles.css'
+            app_path = documents / 'app.js'
+            image_paths = [images / f'image-{index:02d}.png' for index in range(1, 5)]
+            for image_path in image_paths:
+                image_path.write_bytes(b'png')
+            index_path.write_text(
+                '<html><body><section class="hero"></section>'
+                '<section class="ollmo-generated-media" '
+                'data-ollmo-repair="composed-page-image-representation">'
+                + ''.join(
+                    f'<img src="../images/{image_path.name}">'
+                    for image_path in image_paths[1:]
+                )
+                + '</section></body></html>',
+                encoding='utf-8',
+            )
+            rooms_path.write_text(
+                '<html><body><div id="room-grid" class="room-grid"></div>'
+                '<script src="app.js"></script></body></html>',
+                encoding='utf-8',
+            )
+            styles_path.write_text(
+                f'.hero {{ background-image: url("../images/{image_paths[0].name}"); }}',
+                encoding='utf-8',
+            )
+            app_path.write_text(
+                'const rooms = ["Lake Room", "Garden Suite", "House Maisonette"];',
+                encoding='utf-8',
+            )
+            text_specs = [
+                (index_path, 'html', 'index', 'branch-text-artifact-1', 'phase-6'),
+                (rooms_path, 'html', 'rooms', 'branch-text-artifact-2', 'phase-7'),
+                (styles_path, 'css', 'styles', 'branch-text-artifact-3', 'phase-8'),
+                (app_path, 'js', 'app', 'branch-text-artifact-4', 'phase-9'),
+            ]
+            payload = {
+                'artifacts': [
+                    *[
+                        {
+                            'type': 'text', 'path': str(path), 'artifact_ref': f'artifact:{name}',
+                            'branch_id': branch_id, 'phase_id': phase_id,
+                            'text_artifact_extension': extension, 'text_artifact_source_name': name,
+                        }
+                        for path, extension, name, branch_id, phase_id in text_specs
+                    ],
+                    *[
+                        {
+                            'type': 'image', 'path': str(image_path),
+                            'artifact_ref': f'artifact:image-{index}',
+                            'branch_id': f'branch-image_generation-{index}',
+                            'phase_id': f'phase-{index + 1}',
+                        }
+                        for index, image_path in enumerate(image_paths, start=1)
+                    ],
+                ],
+                'late_fill': {
+                    'batch_prompts': [
+                        'Cinematic exterior of Mon Repos.',
+                        'Interior of the "Lake Room".',
+                        'Interior of the "Garden Suite".',
+                        'Interior of the "House Maisonette".',
+                    ],
+                    'completed_branches': [
+                        {
+                            'branch_id': f'branch-image_generation-{index}',
+                            'phase_id': f'phase-{index + 1}',
+                            'capability': 'image_generation',
+                            'output_type': 'image',
+                        }
+                        for index in range(1, 5)
+                    ],
+                    'fill_results': [
+                        {
+                            'branch_id': f'branch-image_generation-{index}',
+                            'phase_id': f'phase-{index + 1}',
+                            'capability': 'image_generation',
+                            'saved_image_path': str(image_path),
+                        }
+                        for index, image_path in enumerate(image_paths, start=1)
+                    ],
+                },
+            }
+
+            detached_checks = self.late_fill_owner._terminal_composed_page_image_representation_open_checks(payload)
+
+            self.assertEqual(len(detached_checks), 4)
+            self.assertTrue(all(check['detached_repair_section_present'] for check in detached_checks))
+            self.assertTrue(all(check['missing_image_count'] == 0 for check in detached_checks))
+
+            index_path.write_text(
+                '<html><body><section class="hero"></section></body></html>',
+                encoding='utf-8',
+            )
+            app_path.write_text(
+                'const rooms = ['
+                f'{{name:"Lake Room",image:"../images/{image_paths[1].name}"}},'
+                f'{{name:"Garden Suite",image:"../images/{image_paths[2].name}"}},'
+                f'{{name:"House Maisonette",image:"../images/{image_paths[3].name}"}}];\n'
+                'card.innerHTML = `<img class="room-image" src="${room.image}" alt="${room.name}">`;',
+                encoding='utf-8',
+            )
+            styles_path.write_text(
+                f'.hero {{ background-image: url("../images/{image_paths[0].name}"); }}\n'
+                '.room-card .room-image { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; }\n'
+                '.room-grid { display: grid; grid-template-columns: repeat(3, 1fr); }\n',
+                encoding='utf-8',
+            )
+
+            self.assertEqual(
+                self.late_fill_owner._terminal_composed_page_image_representation_open_checks(payload),
+                [],
+            )
 
     def test_composed_page_repair_avoids_content_rich_repeat_gallery_container(self):
         content = (
@@ -6267,6 +7258,181 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertEqual(branches[0]['capability'], 'image_generation')
         self.assertEqual(branches[0]['branch_id'], 'branch-image_generation-1')
 
+    def test_pending_image_branch_dedupes_matching_obligation_alias_and_keeps_prompt(self):
+        image_branch = {
+            'branch_id': 'branch-image',
+            'phase_id': 'phase-image',
+            'obligation_id': 'obligation-image',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'status': 'pending',
+            'depends_on': ['phase-1'],
+            'artifact_prompt': 'A deterministic alpine room image.',
+        }
+        graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'current_phase_id': 'phase-1',
+            'phases': [
+                {'phase_id': 'phase-1', 'capability': 'chat', 'status': 'completed'},
+                dict(image_branch),
+            ],
+            'downstream_branches': [dict(image_branch)],
+            'output_obligations': [
+                {
+                    'obligation_id': 'obligation-image',
+                    'phase_id': 'phase-image',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'required': True,
+                }
+            ],
+        }
+
+        branches = self.owner.extract_pending_deferred_branches(
+            route_payload={'route_runtime': {'request_phase_graph': graph}},
+        )
+
+        self.assertEqual(len(branches), 1)
+        self.assertEqual(branches[0]['branch_id'], 'branch-image')
+        self.assertEqual(branches[0]['phase_id'], 'phase-image')
+        self.assertEqual(branches[0]['obligation_id'], 'obligation-image')
+        self.assertEqual(
+            branches[0]['artifact_prompt'],
+            'A deterministic alpine room image.',
+        )
+
+    def test_pending_image_branches_keep_two_distinct_obligations(self):
+        image_branches = [
+            {
+                'branch_id': f'branch-image-{index}',
+                'phase_id': f'phase-image-{index}',
+                'obligation_id': f'obligation-image-{index}',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'status': 'pending',
+                'depends_on': ['phase-1'],
+                'artifact_prompt': f'Distinct image prompt {index}.',
+            }
+            for index in (1, 2)
+        ]
+        graph = {
+            'kind': 'ollmo.request_phase_graph',
+            'current_phase_id': 'phase-1',
+            'phases': [
+                {'phase_id': 'phase-1', 'capability': 'chat', 'status': 'completed'},
+                *image_branches,
+            ],
+            'downstream_branches': list(image_branches),
+            'output_obligations': [
+                {
+                    'obligation_id': branch['obligation_id'],
+                    'phase_id': branch['phase_id'],
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'required': True,
+                }
+                for branch in image_branches
+            ],
+        }
+
+        branches = self.owner.extract_pending_deferred_branches(
+            route_payload={'route_runtime': {'request_phase_graph': graph}},
+        )
+
+        self.assertEqual(len(branches), 2)
+        self.assertEqual(
+            [branch['obligation_id'] for branch in branches],
+            ['obligation-image-1', 'obligation-image-2'],
+        )
+        self.assertEqual(
+            [branch['artifact_prompt'] for branch in branches],
+            ['Distinct image prompt 1.', 'Distinct image prompt 2.'],
+        )
+
+    def test_persisted_pending_image_aliases_are_deduped_conservatively(self):
+        branches = self.owner.extract_pending_deferred_branches(
+            artifact_payload={
+                'late_fill': {
+                    'pending_branches': [
+                        {
+                            'phase_id': 'phase-image',
+                            'obligation_id': 'obligation-image',
+                            'capability': 'image_generation',
+                            'output_type': 'image',
+                            'artifact_prompt': 'Generic obligation projection.',
+                            'requires_artifact': True,
+                        },
+                        {
+                            'branch_id': 'branch-image',
+                            'phase_id': 'phase-image',
+                            'obligation_id': 'obligation-image',
+                            'capability': 'image_generation',
+                            'output_type': 'image',
+                            'depends_on': ['phase-1'],
+                            'artifact_prompt': 'Preserve this exact image prompt.',
+                        },
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(len(branches), 1)
+        self.assertEqual(
+            branches[0]['artifact_prompt'],
+            'Preserve this exact image prompt.',
+        )
+        self.assertTrue(branches[0]['requires_artifact'])
+
+    def test_pending_alias_dedupe_keeps_conflicting_contract_identities_distinct(self):
+        shared = {
+            'branch_id': 'branch-shared',
+            'phase_id': 'phase-shared',
+            'status': 'pending',
+        }
+        variants = {
+            'obligation': [
+                {
+                    **shared,
+                    'obligation_id': 'obligation-image-1',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                },
+                {
+                    **shared,
+                    'obligation_id': 'obligation-image-2',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                },
+            ],
+            'capability': [
+                {**shared, 'capability': 'image_generation', 'output_type': 'image'},
+                {**shared, 'capability': 'text_to_speech', 'output_type': 'audio'},
+            ],
+            'queue_index': [
+                {
+                    **shared,
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'queue_index': 1,
+                },
+                {
+                    **shared,
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'queue_index': 2,
+                },
+            ],
+        }
+
+        for label, pending_branches in variants.items():
+            with self.subTest(label=label):
+                branches = self.owner.extract_pending_deferred_branches(
+                    artifact_payload={
+                        'late_fill': {'pending_branches': pending_branches}
+                    }
+                )
+                self.assertEqual(len(branches), 2)
+
     def test_selected_tts_late_fill_focuses_to_one_candidate(self):
         payload = self.late_fill_owner.focus_late_fill_branch_gap_payload(
             {
@@ -6289,6 +7455,86 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertNotIn('Verlorenes Wissen', payload['content_payload'])
         self.assertEqual(payload['content_payload_source'], 'selected_candidate_from_phase_output')
         self.assertEqual(payload['selection_policy_applied'], 'best_candidate_only')
+
+    def test_counted_image_prepare_contract_requires_exact_prompt_section_before_web_files(self):
+        prompt = (
+            'Build a local two-page room website from the attached room data. '
+            'Generate exactly four cohesive local images: one exterior followed by '
+            'one interior for each of three rooms. Create index.html, rooms.html, '
+            'styles.css, app.js, and rooms.json, then bundle everything.'
+        )
+        request_payload = {
+            'prompt': prompt,
+            'file_path': '/tmp/mon-repos-rooms.json',
+        }
+        phase_graph = build_request_phase_graph(
+            prompt,
+            intent_prompt=prompt,
+            request_payload=request_payload,
+            route_payload={'capability': 'chat'},
+        )
+        prepare_contract = {
+            'phase_graph': phase_graph,
+            'current_phase': phase_graph['phases'][0],
+            'downstream_capabilities': phase_graph['downstream_capabilities'],
+            'reason': 'prepare exact image prompts and local web files',
+        }
+
+        system_message = self.owner.build_prepare_phase_system_message(
+            prepare_contract
+        )
+
+        self.assertIsNotNone(system_message)
+        content = system_message['content']
+        self.assertIn(
+            'Start the response with exactly one `### Image Generation Prompts` section.',
+            content,
+        )
+        self.assertIn(
+            'exactly 4 numbered image prompts using labels 1. through 4.',
+            content,
+        )
+        self.assertIn(
+            'Each numbered prompt feeds exactly one downstream image-generation branch.',
+            content,
+        )
+        self.assertIn(
+            'After image prompt 4, continue with separately labeled substantive content',
+            content,
+        )
+        self.assertNotIn('one clean reusable body', content)
+        self.assertNotIn(
+            'Do not add headings, labels, prompt wrappers, bullet framing',
+            content,
+        )
+
+        prepared_text = (
+            '### Image Generation Prompts\n\n'
+            '1. Wide cinematic daylight exterior of the lakeside house, cohesive natural stone and garden palette.\n'
+            '2. Lake Room interior with a writing desk, stone bathroom details, and a clear Lake Geneva view.\n'
+            '3. Garden Suite interior with a separate sitting area, terrace doors, and the same restrained palette.\n'
+            '4. Attic Room interior beneath timber rafters, compact reading nook, and soft mountain light.\n\n'
+            '### index.html\n```html\n<!doctype html><html></html>\n```\n\n'
+            '### styles.css\n```css\nbody { margin: 0; }\n```'
+        )
+        semantic_payload = self.owner.build_response_semantic_phase_payload(
+            output_text=prepared_text,
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            request_payload=request_payload,
+            capability='chat',
+        )
+
+        self.assertEqual(len(semantic_payload['batch_prompts']), 4)
+        self.assertEqual(
+            semantic_payload['batch_prompt_expected_count'],
+            4,
+        )
+        self.assertEqual(
+            semantic_payload['batch_prompts_source'],
+            'semantic_prepare_phase_output',
+        )
+        self.assertNotIn('branch_contract_error', semantic_payload)
+        self.assertNotIn('materialization_blocked', semantic_payload)
 
     def test_numbered_audio_prepare_contract_keeps_two_tts_bodies_distinct(self):
         tts_branches = [
@@ -8119,6 +9365,65 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
         self.assertIn('/tmp/aethelgard-abyss-7.png', binding_checks[0]['content_payload'])
         self.assertIn('placeholder', binding_checks[0]['content_payload'])
 
+    def test_closure_review_does_not_require_page_specific_script_on_every_html_page(self):
+        prompt = 'Create index.html, rooms.html, styles.css, and app.js as a two-page room website.'
+        graph = build_request_phase_graph(
+            prompt,
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            route_payload={'capability': 'chat', 'route_source': 'ghost_carried'},
+        )
+        payload = {
+            'id': 'resp_page_specific_script',
+            'output_text': 'Artifacts generated.',
+            'runtime': {'request_phase_graph': graph},
+            'artifacts': [
+                {
+                    'type': 'text',
+                    'path': '/tmp/index.html',
+                    'name': 'index',
+                    'content': (
+                        '<!doctype html><link rel="stylesheet" href="styles.css">'
+                        '<a href="rooms.html">Rooms</a><main>Mon Repos</main>'
+                    ),
+                },
+                {
+                    'type': 'text',
+                    'path': '/tmp/rooms.html',
+                    'name': 'rooms',
+                    'content': (
+                        '<!doctype html><link rel="stylesheet" href="styles.css">'
+                        '<a href="index.html">Home</a><main id="room-list"></main>'
+                        '<script src="app.js"></script>'
+                    ),
+                },
+                {
+                    'type': 'text',
+                    'path': '/tmp/styles.css',
+                    'name': 'styles',
+                    'content': 'body { color: #222; }',
+                },
+                {
+                    'type': 'text',
+                    'path': '/tmp/app.js',
+                    'name': 'app',
+                    'content': 'const roomList = document.getElementById("room-list");',
+                },
+            ],
+        }
+
+        review = self.owner.build_graph_closure_review(
+            payload['output_text'],
+            request_payload={'ghost_route': True, 'prompt': prompt},
+            artifact_payload=payload,
+        )
+
+        binding_checks = [
+            item
+            for item in review['checks']
+            if item.get('check_kind') == 'linked_artifact_binding'
+        ]
+        self.assertFalse(binding_checks)
+
     def test_terminal_dependency_review_blocks_only_missing_static_local_fetch_target(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -8179,6 +9484,21 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                 checks[0]['artifact_request']['target_path'],
                 str(pricing_path.resolve(strict=False)),
             )
+            self.assertEqual(
+                checks[0]['target_artifact_path'],
+                str(pricing_path.resolve(strict=False)),
+            )
+            self.assertEqual(checks[0]['dependency_consumer_path'], str(html_path))
+            self.assertNotEqual(
+                checks[0]['target_artifact_path'],
+                checks[0]['dependency_consumer_path'],
+            )
+            self.assertIn(
+                'Dependency consumer file content (diagnostic context only; not target bytes)',
+                checks[0]['content_payload'],
+            )
+            self.assertNotIn('Current saved source file content', checks[0]['content_payload'])
+            self.assertIsNone(checks[0].get('branch_id'))
 
             pricing_path.write_text('{"materials": []}\n', encoding='utf-8')
             self.assertEqual(
@@ -8188,7 +9508,7 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
                 [],
             )
 
-    def test_terminal_link_rebind_preserves_html_self_links_and_matches_siblings_by_identity(self):
+    def test_terminal_link_rebind_materializes_html_self_links_and_matches_siblings_by_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             index_path = root / 'generated_index.html'
@@ -8225,11 +9545,50 @@ class ResponseSemanticsRuntimeTests(unittest.TestCase):
 
             index = index_path.read_text(encoding='utf-8')
             configurator = configurator_path.read_text(encoding='utf-8')
-            self.assertIn('href="index.html"', index)
+            self.assertIn('href="generated_index.html"', index)
             self.assertIn('href="generated_configurator.html"', index)
-            self.assertIn('href="configurator.html"', configurator)
+            self.assertIn('href="generated_configurator.html"', configurator)
             self.assertIn('href="generated_index.html"', configurator)
             self.assertIn('href="missing.html"', index)
+
+    def test_terminal_link_rebind_recognizes_singular_json_image_field(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / 'generated_rooms.json'
+            image_path = root / 'generated_lake-room.png'
+            image_path.write_bytes(b'png')
+            data_path.write_text(
+                json.dumps({'rooms': [{'name': 'Lake Room', 'image': 'lake-room.png'}]}),
+                encoding='utf-8',
+            )
+            payload = {
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(data_path),
+                        'name': 'rooms',
+                        'artifact_ref': 'artifact:rooms',
+                    },
+                    {
+                        'type': 'image',
+                        'path': str(image_path),
+                        'name': 'lake-room',
+                        'artifact_ref': 'artifact:lake-room',
+                    },
+                ]
+            }
+
+            self.late_fill_owner.rebind_terminal_linked_artifacts(payload)
+
+            rebound = json.loads(data_path.read_text(encoding='utf-8'))
+            self.assertEqual(rebound['rooms'][0]['image'], 'generated_lake-room.png')
+            self.assertFalse(
+                self.late_fill_owner._terminal_json_content_has_unresolved_dependency_link(
+                    data_path.read_text(encoding='utf-8'),
+                    payload['artifacts'],
+                    target_path=str(data_path),
+                )
+            )
 
     def test_closure_review_displays_ollmo_relative_artifact_paths_for_link_rebind(self):
         prompt = (

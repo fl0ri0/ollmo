@@ -10662,3 +10662,21 @@ class ResponseFrameRecoveryCacheInspectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_manifest_hydration_sanitizes_tree_once_without_rewalking_restored_children(tmp_path):
+    from unittest.mock import patch
+    from ollmo_services import response_frames as owner
+
+    value = {'leaf': {'value': 'retained', 'response_frame': {'hidden': True}, 'empty': []}}
+    for _ in range(25):
+        value = {'child': value}
+    expected = owner._json_safe(value)
+    original = owner._json_safe
+    with patch.object(owner, '_json_safe', wraps=original) as sanitize:
+        actual = owner._hydrate_manifest_authorized_snapshot_children(
+            value, frames_dir=tmp_path, trusted_manifest={}, response_id='one', json_path='runtime')
+    assert actual == expected
+    # A linear walk: every container/leaf is normalized once, not once per ancestor.
+    assert sanitize.call_count < 35
+    assert value != actual  # The input is not mutated by normalization.

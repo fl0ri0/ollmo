@@ -2,7 +2,115 @@
 
 This document names the response-state fields that are part of Ollmo's runtime truth contract. It is intentionally narrower than general product docs: it describes what callers and UI code may rely on.
 
+## OpenAI-shaped compatibility boundary
+
+Ollmo exposes `/api/responses` and `/v1/responses` through its local response
+handler. This is a supported local contract with an OpenAI-shaped text
+compatibility surface, not complete OpenAI Responses protocol support or a direct
+call to OpenAI's hosted API. `ollmo_services/responses.py` owns the text adapter.
+
+- Text normalization accepts `prompt`, string `input`, and text message content.
+  Role-bearing message items currently preserve their role when explicitly typed
+  as `{"type": "message", "role": "developer", "content": "..."}`. The standard
+  role/content form without `type` is not faithfully normalized: it can become
+  user content. This is a known compatibility limitation, not a desired change
+  in instruction authority.
+- A complete function/custom-tool round trip, `function_call_output` handling,
+  OpenAI Conversations resources and `previous_response_id` semantics are not
+  implemented by this adapter. Unsupported input may be ignored rather than
+  rejected. Do not infer support from an endpoint name or backend feature flag.
+- Local `conversation_id`, response frames and Late Fill retain Ollmo semantics.
+  Canonical `outputs` and lifecycle/closure truth are distinct from compatibility
+  `output`, `output_text` and `status`. The text-output builder's zero token usage
+  values are placeholders, not measured zero consumption.
+
+Fixing role handling, rejecting unsupported items, changing completion/usage
+semantics or extending tool/provider compatibility requires a separate code and
+contract change. Client integrations must validate the subset they actually use.
+
+## Retrieval for clients
+
+`GET /api/responses/<id>` (also `/v1/responses/<id>`) returns a bounded UI view by
+default. Poll an existing response with `?view=status` for compact lifecycle and
+Late Fill observation; `compact=true` and the compact/observer view aliases also
+select that surface. Explicit `?view=full`, `?view=raw` or `?view=truth` retrieves
+full response truth when `compact` is not enabled. `?view=debug` remains bounded.
+Fetch exact details or artifact content when needed, not the entire response on
+every poll. Pending work is observed under the same response id, never restarted
+by posting its prompt again. The detailed projection rules below remain binding.
+
 ## Response Frame
+
+Explicit inline/embedded implementation formats (for example embedded CSS or
+inline JavaScript) do not request additional file artifacts. An explicitly named
+separate stylesheet or script remains a separate output request.
+
+A request to read a saved file and derive a named output from those read bytes
+is stronger than a dependency on preparation text. For a unique newly requested
+text producer and named text consumer, the bounded grammar builds
+`artifact_request.saved_file_dependency` (version 1), with exact producer and
+consumer branch/phase ids, output requests and a consumer-local instruction.
+The consumer depends on the producer phase. Both branches are excluded from
+text-artifact coalescing. Planner deferral retains their file contracts; graph
+rebuilding reuses the same exact file owners and branch/phase identities. Ambiguous or unsupported recognized dependencies keep
+`branch_contract_error=saved_file_dependency_unbound`; existing files and model
+claims cannot discharge that gate.
+
+The supported grammar is deliberately limited to separate clauses (sentence,
+semicolon or newline boundaries): an earlier `save/store/write/create` or
+`speichere/schreibe` clause with the producer filename; `read/reread/re-read` or
+`lies/lese` with a saved/stored/persisted or gespeichert/gesichert cue; then
+`create/generate/write/build` or `erstelle/erzeuge/generiere/schreibe`, a named
+consumer, and `from/using/based on` read/data/file cues or `daraus/aus den
+(gelesenen/eingelesenen)` cues. A named read or format cue must match the
+producer; an unnamed read must be unambiguous. Negated clauses do not grant
+execution authority. Trailing consumer constraints and standalone prior
+self-contained/embedded/external-resource constraint clauses are retained,
+without replaying the producer task or root prompt. Later independent action
+clauses, structured joins, retained inputs, binary inputs and external executor
+consumers are outside this positive path. This is not general natural-language
+file-execution support. `Create a new file named data.json ... and save it`
+is supported by the named `create` clause; this does not add general pronoun
+resolution or new file-executor verbs.
+
+Late Fill captures `saved_file_output_snapshot` after the producer's actual
+materializer returns a saved file, then binds it through the existing canonical
+artifact identity owner. The dependency owner uses the existing authorized
+saved-artifact path resolver, opens a stable regular file, and reads at most
+90,000 bytes (the existing complete revision-input bound). Inputs and observed
+outputs must be nonempty valid UTF-8; no truncation, replacement decoding or
+fallback data is allowed. The SHA-256 is computed from the same bytes as the
+input, which are stored losslessly as `utf8_base64` in
+`execution_contract.saved_file_read_evidence`. This avoids whitespace changes
+by generic contract normalization. Typed `input_refs` retain the exact artifact,
+response, producer, consumer, path and digest binding.
+
+Immediately before internal chat invocation, Late Fill revalidates the saved
+version and input binding. The prepared prompt must equal the bounded
+bytes-derived prompt; a changed/truncated prompt fails rather than bypassing
+normal preparation limits. Only the consumer's one output request is admitted.
+A successful invocation with a saved, correctly targeted output records
+`saved_file_consumption_evidence` with the contract, captured read, submitted
+input digest and output snapshot. This is runtime handoff evidence, not a
+model's assertion or a general guarantee of semantic output quality. The
+isolated positive test independently computes its output from that submitted
+input.
+
+Closure and terminal branch reconciliation use the same strict validator:
+exact producer and consumer records, artifact identities, captured-byte digest,
+input digest, saved output and current versions must agree. Missing, malformed,
+unauthorized, ambiguous, changed or misbound evidence remains unmet. Identical
+bytes at another artifact identity are not aliases. Evidence is preserved by
+ordinary response-frame storage and read-only hydration; no historical frame
+is migrated or retroactively credited with a read.
+
+When Closure repair projection changes the executable branch identity, its
+promoted contract retains the originating identities and records an
+`execution_binding` with the exact contract, branch and phase ids. Terminal
+settlement checks that binding and the target artifact identity, and retains
+the binding in resolved-contract evidence. Legacy contracts without this field
+keep the existing exact-identity comparison; observation does not retrofit
+bindings or rewrite historical frames.
 
 `response_frame` is the frozen response snapshot. It is immutable once written. Late fill and recovery do not edit an old frame; they produce successor lookup payloads and, outside tests, successor frame ledger entries.
 
@@ -24,10 +132,12 @@ Frame ledger rules:
 - Persisted ledger rows are compact audit facts. Large internal snapshots such as full `runtime`, `working_frame`, request-phase graphs, context candidates, planner diagnostics, bulky semantic-review state, work trees, large request inputs, and oversized planning contracts may be moved into sidecar JSON files under `state/response_frames/snapshots/`. Sidecars are content-addressed by SHA-256, so separate semantic refs such as `runtime` and `current_state.runtime`, `planning.request_phase_graph` and `planning.artifact_flow.request_phase_graph`, or repeated work-tree projections may point at the same physical file when their payloads are byte-identical. Large nested runtime/working-frame subtrees are split into their own `*_snapshot_ref` entries rather than summarized; the parent snapshot keeps the ref structure, and the child sidecar keeps the full raw subtree. The ledger keeps machine-readable `*_snapshot_ref` / `external_snapshots` entries with path, SHA-256 digest, byte size, and JSON path. This preserves truth without duplicating multi-megabyte internal state in every successor row.
 - Successor ledger rows delta-log external snapshots against their parent frame. `external_snapshots.items` on a persisted successor contains only new or changed refs for that row; unchanged parent refs are listed under `external_snapshots.inheritance` and omitted from the row-local `items`. Recovery/replay merges the parent manifest before returning the current response view. When a recovered frame exposes both effective and row-local truth, `external_snapshots.items` is the effective merged manifest and `external_snapshots.delta_items` is the successor row's own diff.
 - Sidecar snapshots may themselves be compact CAS manifests. Large worthwhile child fields such as request-phase graph nodes/edges, context candidates, decision/semantic contracts, graph-closure reviews, dependency evidence, branch/result collections, and work-tree structures can be replaced inside the sidecar by child `*_snapshot_ref` entries when they exceed the split threshold. This is ref-splitting, not summarization: child sidecars keep the full content, and snapshot readers expand those refs for replay/recovery.
+- Recursive child splitting reuses the parent's private media-normalized JSON subtree within that snapshot write. Independent snapshot writes normalize their inputs anew. Every child still receives its own path/lineage metadata, serialization, content hash, and current sidecar-byte verification; this preparation reuse does not cache file integrity or change publication ordering.
 - `working_frame` ledger sidecars are logic-only vessels. They keep small orchestration state such as `status`, pending ids, closure/loop state, and compact route/request summaries inline, while graph, contract, prompt, input, context-candidate, and artifact-flow bodies are represented by child `*_snapshot_ref` entries. The child sidecars remain full diagnostic truth.
 - `outputs[]` and `output_slots[]` are handle projections. They keep `artifact_ref`, slot/status/type/order, and compact recovery fields, but must not inline artifact dossiers, prompts, provenance, metadata, `image_state`, paths, or nested `artifacts[]` once an artifact ref exists. Full artifact identity, provenance, metadata, and enrichments live in the artifact dossier snapshot and registry.
 - Diagnostic snapshot hashes exclude volatile timestamp keys such as `created_at`, `updated_at`, `started_at`, and `completed_at` for graph/contract/context/work-tree sidecars. Those timestamps are bookkeeping metadata, not diagnostic content identity; frame/index metadata remains the operational time source, while the snapshot hash represents stable diagnostic content.
 - Persisted frames are indexed by `state/response_frames/current_index.json` for current-state recovery. The index is an optimization only; the compact JSONL ledger remains durable recovery truth. A current verified index binds the complete response map to physical ledger EOF with its byte size, entry count, and stable map digest. Entry-local ledger sizes are historical append-time facts: an older byte offset remains usable after unrelated append-only rows are added, provided global freshness holds and the decoded row still validates the requested response and frame identity. A verified complete map can also prove an absent response id without scanning the ledger. Legacy, incomplete, stale, malformed, or corrupt indexes cannot prove absence and fall back to the ledger; a failed direct read does the same. Recovery then returns the latest valid frame for the requested response id, or truthful not-found/corrupt-ledger state rather than unrelated or older state.
+- Complete epoch verification reuses its already verified map digest for the private rebound copy only when every entry's ledger path and name remain exactly unchanged. Any changed binding, including equivalent path spelling, gets a newly computed digest. The full ledger scan, final physical ledger/index checks, and subsequent selection, hydration and registry binding checks still execute; no verification result is cached across calls.
 - A complete legacy v1 map can cross that boundary only through the explicit operator command `.venv/bin/python scripts/attest_response_frame_index.py`. Use `--check-only` first when inspecting an existing ledger. Attestation streams the physical ledger one line at a time, requires the exact response-id set and exact latest frame id/sequence/byte offset/line length for every entry, preserves all response entries and effective snapshot manifests, and atomically adds only the v2 coverage fields. Malformed rows, mismatches, or moving ledger/index evidence reject without writing. This is an index attestation, not a ledger rewrite or read-path migration.
 
 Wire projection and canonical truth are deliberately separate:
@@ -64,6 +174,7 @@ Artifact fulfillment rules:
 - Model prose, Markdown code blocks, prompt lists, or chat text are evidence, not fulfilled file artifacts. They fulfill a requested file only when runtime materializes the file and records it in output slots, `outputs`, `artifacts`, response-frame truth, or artifact registry truth.
 - A prompt for an image is not the image artifact. A script for audio is not the audio artifact. HTML/CSS prose is not a saved page unless materialized as files.
 - Linked artifact sets close only when concrete saved files point to their concrete saved dependencies. Placeholder names, guessed paths, stale paths, wrong relative links, or missing CSS/image references are open artifact-binding problems.
+- A page background color does not imply a hero/background image placement requirement. Hero placement checks distinguish image-specific request language from color styling; existing hero regions and ordinary concrete image links retain their binding checks. A correctly linked HTML image does not require a duplicate CSS image reference merely because the stylesheet sets a background color.
 - Template-style asset variables such as `IMG_PATH_1`, `IMAGE_URL_2`, or `ASSET_REF_3` are linked-artifact placeholders. When concrete artifacts already exist, terminal rebind should replace those variables with correct relative artifact links before closure instead of regenerating duplicate assets.
 - When concrete artifacts exist but are not linked, recovery should prefer deterministic rebind or bounded repair against existing artifacts before declaring failure or creating duplicate page files.
 - If the user requested an exact artifact count, a smaller count remains incomplete unless Closure records an explicit waiver or supersession.
@@ -356,6 +467,20 @@ Text/file artifacts are materialized outputs. If a model returns a structured en
 then the persisted artifact payload is `output_obligations[].content`, not the surrounding route/control JSON. A wrapper without payload content is not proof that a file exists.
 
 Ambiguous deictic requests such as "make this HTML" need a selected source, current payload, or explicit reference before persistence.
+
+A bare pronoun in a later sentence may refer to one explicitly named text
+artifact requested earlier in the current turn, for example "Create styles.css.
+Use it for the page background." During preparation, this binding requires the
+matching required text-artifact successor in the resolved current phase graph;
+an absent, reserved, disconnected or differently named target does not supply
+the source. A declaration derived from missing external input does not ground
+that input. This is an input binding, not evidence that the file exists.
+
+Final materialization includes open canonical image/audio output obligations as
+well as text artifacts. Pending, blocked or failed media cannot be omitted merely
+because its closure check uses `final_output` without repeating `requires_artifact`.
+Fulfilled, waived and superseded obligations remain closed; references in HTML
+and successfully saved CSS cannot fulfill a missing media obligation.
 
 ## Artifact Dossiers And Evidence
 

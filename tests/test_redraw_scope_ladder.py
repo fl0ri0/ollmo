@@ -1,5 +1,9 @@
 import copy
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from ollmo_server.responses_request_runtime import ResponsesRequestRuntimeOwner
 from ollmo_services.redraw_scope import (
@@ -710,6 +714,83 @@ class RedrawScopeLadderTests(unittest.TestCase):
         self.assertEqual(len(canonical['artifacts']), 1)
         self.assertEqual(canonical['artifacts'][0]['type'], 'document')
         self.assertEqual(canonical['artifacts'][0]['artifact_ref'], 'artifact:result')
+
+    def test_absolute_relative_artifact_path_identity_preserves_provenance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            target = root / 'artifacts/documents/retained_input/rooms.json'
+            target.parent.mkdir(parents=True)
+            target.write_text('{"rooms": []}', encoding='utf-8')
+            records = [
+                {'type': 'text', 'artifact_ref': 'artifact:rooms',
+                 'path': str(target), 'branch_id': 'branch-text_artifact-5',
+                 'phase_id': 'phase-10', 'source_response_id': 'resp-owner',
+                 'provenance_id': 'retained-input'},
+                {'type': 'text', 'artifact_ref': 'artifact:rooms',
+                 'path': str(target.relative_to(root)),
+                 'branch_id': 'branch-text_artifact-5', 'phase_id': 'phase-10',
+                 'source_response_id': 'resp-owner', 'provenance_id': 'saved-result'},
+            ]
+            original = copy.deepcopy(records)
+            with patch('ollmo_services.redraw_scope._ARTIFACT_PATH_ROOT', root, create=True):
+                result = canonicalize_duplicate_artifact_refs(records)
+                repeated = canonicalize_duplicate_artifact_refs(result['artifacts'])
+            self.assertFalse(result['final_projection_blocked'])
+            self.assertEqual(len(result['artifacts']), 1)
+            artifact = result['artifacts'][0]
+            self.assertEqual(artifact['path'], str(target))
+            self.assertEqual(artifact['branch_id'], 'branch-text_artifact-5')
+            self.assertEqual(artifact['phase_id'], 'phase-10')
+            self.assertEqual(artifact['alias_metadata']['path_aliases'], records)
+            self.assertEqual(repeated['artifacts'], result['artifacts'])
+            self.assertEqual(records, original)
+
+    def test_artifact_path_identity_is_checkout_bound_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            target = root / 'artifacts/documents/retained_input/rooms.json'
+            target.parent.mkdir(parents=True)
+            target.write_text('{"rooms": []}', encoding='utf-8')
+            other = root / 'artifacts/documents/other/rooms.json'
+            other.parent.mkdir(parents=True)
+            other.write_bytes(target.read_bytes())
+            symlink = root / 'rooms-link.json'
+            symlink.symlink_to(target)
+            dangling = root / 'missing-link.json'
+            dangling.symlink_to(root / 'missing.json')
+            cases = [
+                (str(target.relative_to(root)), 'text', False, 'relative'),
+                (str(symlink), 'text', False, 'symlink'),
+                (str(target.relative_to(root)), 'document', False, 'document_label'),
+                (str(target.relative_to(root)), 'image', True, 'wrong_type'),
+                (str(other.relative_to(root)), 'text', True, 'same_basename_and_bytes'),
+                ('rooms.json', 'text', True, 'basename_only'),
+                (str(dangling), 'text', True, 'dangling'),
+                (str(target.parent), 'text', True, 'directory'),
+                (target.as_uri(), 'text', True, 'file_uri'),
+                ('https://example.test/rooms.json', 'text', True, 'remote'),
+            ]
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(other.parent)
+                with patch('ollmo_services.redraw_scope._ARTIFACT_PATH_ROOT', root, create=True):
+                    for path, kind, blocked, label in cases:
+                        with self.subTest(label=label):
+                            records = [
+                                {'type': 'text', 'path': str(target), 'artifact_ref': 'artifact:rooms', 'file_sha256': 'same'},
+                                {'type': kind, 'path': path, 'artifact_ref': 'artifact:rooms', 'file_sha256': 'same'},
+                            ]
+                            result = canonicalize_duplicate_artifact_refs(records)
+                            self.assertEqual(result['final_projection_blocked'], blocked)
+                            self.assertEqual(len(result['artifacts']), 2 if blocked else 1)
+                    target.unlink()
+                    result = canonicalize_duplicate_artifact_refs([
+                        {'type': 'text', 'path': str(target), 'artifact_ref': 'artifact:rooms'},
+                        {'type': 'text', 'path': str(target.relative_to(root)), 'artifact_ref': 'artifact:rooms'},
+                    ])
+                    self.assertTrue(result['final_projection_blocked'])
+            finally:
+                os.chdir(previous_cwd)
 
     def test_document_and_text_aliases_still_conflict_across_different_paths(self):
         canonical = canonicalize_duplicate_artifact_refs(

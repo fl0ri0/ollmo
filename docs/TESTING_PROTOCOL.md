@@ -1,6 +1,14 @@
 # TESTING PROTOCOL
 
-Use this when something feels off.
+Use this as the canonical test-routing and debugging guide for the affected
+behavior. Start with focused checks, broaden for shared contracts or unresolved
+risk, and run release validation when preparing a release. Once relevant checks
+pass, repeat or broaden only for new changes, failures or unresolved concerns.
+Prose-only edits ordinarily need static contract/link checks, not live inference.
+
+For an explicitly authorized live adversarial sweep of the five intent/truth boundaries, run
+`./ollmo self-attack`. See [SELF_ATTACK.md](SELF_ATTACK.md) for deterministic
+oracles, discovered profiles, full truth capture, reduction and regression replay.
 
 Do not overthink. Just map the issue.
 
@@ -54,6 +62,9 @@ Do not overthink. Just map the issue.
 - bad output → Provider
 - broken state → Runtime, response frame, artifact dossier
 - unresolved generated links → artifact registry, terminal rebind, graph closure review
+- counted image branch received a whole answer or selected data file → exact image-prompt cohort / branch-local handoff
+- explicit image retry repeats `NO_COMPATIBLE_INSTANCE` while excluded providers are currently ready → exhausted-pool retry policy / live candidate truth
+- a successful successor under the same response id has no new report → monitor frame identity / reference-export binding
 - graph repair proposal missing despite runtime evidence → backend runtime evidence bridge, `graph_repair_proposals`, `graph_repair_reviews`
 - graph repair patch staged/applied unexpectedly → `OLLMO_GRAPH_REPAIR_AUTONOMY`, `graph_patch_lifecycle`, `staged_graph_patches`, `applied_graph_patches`
 - `BLOCKED:` provider text materialized as output content → external-provider block projection, artifact acceptance, late fill
@@ -68,6 +79,9 @@ Do not overthink. Just map the issue.
 - an external branch-executor call lacks `[OLLMO_DOWNSTREAM_EXECUTION_V1]`, can recursively invoke Ollmo, widens `<ollmo_bounded_task>`, or applies the marker to Ghost planning → downstream execution-boundary regression
 - downstream output beginning with `BLOCKED:` becomes artifact/materialization content, fulfillment, or Late Fill work instead of blocked runtime truth → external-provider block-projection regression
 - later branch used the whole first answer → branch-local handoff
+- two or more requested images run without the exact number of distinct branch-local prompts, an explicitly malformed count is treated as an absent single-image count, or a full website/code response becomes every image prompt → counted image-prompt contract regression
+- an explicit image retry clears exclusion history, prefers an excluded provider over a ready non-excluded provider, reuses stale snapshot-only liveness, bypasses a missing prompt contract, or automatically retries again after failure → explicit image exhausted-pool policy regression
+- a failed frame prevents a later same-response success frame from receiving its own monitor report, or reference export accepts a report for the wrong frame → frame-scoped observer/export regression
 - image/audio follow-up text is hypothetical → missing evidence branch or artifact dossier
 - TTS produces a non-empty but wrong recording and any non-empty STT transcript still closes the graph → TTS source-fidelity evidence gate regression
 - TTS returns HTTP 200 plus a readable but silent, severely truncated, or mostly padded WAV and the audio slot still fulfills → output-side TTS integrity regression
@@ -78,6 +92,8 @@ Do not overthink. Just map the issue.
 - saved text syntax failure loses the target path/current bytes/issues or repeatedly regenerates the whole artifact → target-bound saved-text syntax recovery regression
 - Ghost route preview starts a model → start-source policy regression
 - duplicate, placeholder, or template-variable links such as `{{IMG_PATH_1}}` survive in final HTML/CSS/media → linked-artifact closure regression
+- a multi-page site closes after generated images were appended as an unstyled detached stack to the first HTML file, or room/item images remain unbound from their semantic records → composed-site image-role/layout closure regression
+- a composed-site target repair disappears because its existing file is mistaken for new write evidence, or a bundle leaves a retained-input path unresolved after selecting its newer authoritative file → target-bound handoff/bundle-authority regression
 - optional generated-image `image_state_enrichment` disappears without `pending_existing`, `skipped`, or a suppression reason → image-state enrichment transparency regression
 - `proposal_count=0` even though there is `materialization_contract_unmet`, terminal pending work, duplicate artifact refs, fake artifact refs, or actionable blocked/repair/semantic-review surface mismatch → graph-repair runtime evidence bridge regression
 - `reconcile_surface_state_or_reopen_contract` appears for advisory-only pending `controlled_attention_review`, `aspiration_review`, `commitment_review`, or reconsideration state → graph-repair surface-actionability classifier regression
@@ -123,6 +139,35 @@ For labelled/count TTS extraction, output-side WAV integrity, and TTS-to-STT sem
 
 The expected current shape is exact branch-local speakable payload selection, contiguous labelled candidate authority, exclusion of transcript/analysis/code/JSON siblings, durable exact final-prompt `tts_semantic_source`, deterministic source/file-bound PCM-WAV signal evidence, direct-producer-only `tts_stt_semantic_evidence`, harmless transcript normalization acceptance, and fail-closed silence/truncation/padding/malformed/missing/digest/binding handling. HTTP 200 or a non-empty WAV must not fulfill audio by itself. Expected text must never enter the STT request, downstream joins must stay unexecuted on mismatch, and a physically materialized wrong WAV remains diagnostic evidence rather than fulfillment.
 
+For counted image handoff, explicit exhausted-pool retry, and frame-scoped recovery evidence, run:
+
+    .venv/bin/python -m pytest tests/test_response_semantics_runtime.py -q -k "image_prompt or incomplete_image"
+    .venv/bin/python -m pytest tests/test_responses_api.py -q -k "image and (retry or batch or branch_contract)"
+
+For terminal link-rebind write evidence and branch settlement, run:
+
+    .venv/bin/python -m pytest tests/test_responses_api.py -q -k "terminal_link_rebind or terminal_linked_artifact or terminal_materialization_contract"
+
+Keep both the minimized single-branch case and the four-image inline-CSS Hive
+case. Applied link-rebind evidence carries exact branch/phase identity only
+when an already-owned saved artifact/result and that branch's bounded repair
+independently select the actual written transformation. Same-target pending
+branches, unrelated revisions, conflicting identities, and different dependency
+selections must not inherit the write. A coalesced physical write may produce
+separate exact-owner records only after each owner passes this check. Repeated
+rebinding must neither rewrite unchanged bytes nor append evidence. Legacy
+identity-free records remain readable diagnostics, never retroactively attributed
+write authority. Ledger and UI projections preserve optional branch identity.
+
+For composed multi-page image placement and bounded cohort repair, run:
+
+    .venv/bin/python -m pytest tests/test_response_semantics_runtime.py -q -k "composed_site_image_closure or composed_page"
+    .venv/bin/python -m pytest tests/test_responses_api.py -q -k "authoritative_composed_site_image_repair"
+    .venv/bin/python -m pytest tests/test_response_artifact_bundles.py -q
+    .venv/bin/python -m pytest tests/test_ollmo_run_monitor_projection.py tests/test_reference_run_export.py -q
+
+The expected shape is that `batch_prompt_expected_count >= 2` requires the exact number of non-empty branch-local prompts and a valid slot selection. Shared preparation prose, full HTML/CSS/JSON answers, selected room data, root prompts, and heuristically focused fragments must be removed and exposed as `incomplete_image_prompt_batch` before routing. A user-triggered retry after `NO_COMPATIBLE_INSTANCE` keeps all exclusions, prefers any ready non-excluded alternative, and may reuse one excluded provider only under `explicit_image_excluded_pool_retry_v1` after fresh live truth; the attempt cannot auto-follow up. Missing contracts and refresh failures fail closed. A failed frame and a later successful frame under one response id each receive one append-only report, while export accepts only evidence matching the authoritative latest frame and leaves the source ledger byte-identical.
+
 For accepted-learning and graph-repair changes, run:
 
     .venv/bin/python -m pytest tests/test_graph_repair_self_healing.py tests/test_self_learning.py -q
@@ -145,6 +190,20 @@ When touching intent-aligned repair/redraw scope selection, include:
 
 The expected current shape is that Runtime exposes `redraw_scope_ladder_review`, reserved/additive/binding/identity scopes are considered before partial or full rebase, graph repair proposals only consume the scope as orientation, rebase proposals preserve bounded scope fields, duplicate refs are canonicalized only when proven aliases, and conflicting duplicate refs stay repair-needed.
 
+For local artifact path identity, also run:
+
+    .venv/bin/python -m pytest tests/test_responses_api.py -q -k "artifact_path_identity"
+
+Different path spellings under one artifact ref may alias only when all resolve
+to the same existing local file. Relative paths use the Ollmo checkout root,
+never the caller's working directory or a basename search. Checksums alone do
+not establish identity. Preserve original paths and branch/phase/provenance in
+alias metadata. Distinct files with equal bytes or basenames, unresolved paths,
+and incompatible types remain conflicting. Final lifecycle must honor blocked
+artifact outputs, and slot hydration must preserve a frozen conflict; only a
+new validated frame can replace that adjudication. Active execution, hard
+terminal state, and unrelated open Closure checks retain their authority.
+
 For generic intent-obligation graph adequacy, run:
 
     .venv/bin/python -m pytest tests/test_request_phase_graph_runtime.py tests/test_response_semantics_runtime.py tests/test_graph_repair_self_healing.py -q
@@ -165,20 +224,67 @@ For response runtime lifecycle wiring, also run:
 
     .venv/bin/python -m pytest tests/test_response_semantics_runtime.py -q
 
+For availability waiting, include `availability_wait` and `unavailable_preparation` tests in `tests/test_responses_api.py`, `tests/test_response_semantics_runtime.py`, and `tests/test_runtime_contract_knobs.py`. Fake-clock tests must show pending status, visible wait metadata, unchanged repair counters/targets, ready-sibling progress, one automatic execution after availability returns, and responsive cancellation. Hard-unavailable and excluded-only candidates must not create wait evidence. Run `tests/test_runtime_liveness.py` to preserve cooldown selectability semantics and `tests/test_response_wire.py` for compact wait projection.
+
 `shadow` and `stage` must not mutate executable graph work and must carry non-executable `runtime_effect` values from lifecycle construction. `apply_safe` may apply only validated safe additive patches. On terminal/frozen parents, allowed safe additive repair must keep the parent blocked and byte-stable, persist an exact same-response successor relation, revalidate current autonomy/policy and patch/graph bindings, schedule only the applied owed branches through Late Fill, and keep repeated preparation idempotent. Request preparation and materialization-spec construction must both reject inherited root/assistant prompt recovery when the exact successor branch has no local payload. Same-key execution truth must progress from queued to running to one immutable terminal result across the complete Late Fill envelope, graph, request, and diagnostic projections; delayed queued/running or conflicting terminal callbacks must not restore pending/active branches, regress the canonical response lifecycle, or replace terminal truth. A fake-backend E2E must prove one branch-local backend execution and no root-prompt replay. Invalid graph repair autonomy values must stay safe `off` while surfacing diagnostics.
 
 ## Response-Ledger Lookup And Test Isolation
+
+For causal convergence observations, also run:
+
+    .venv/bin/python -m pytest tests/test_causal_telemetry.py tests/test_self_attack_convergence.py tests/test_self_attack_production.py tests/test_ollmo_run_monitor_projection.py -q
+
+See `docs/CAUSAL_TELEMETRY.md` for event bounds, exact-identity proof gates and
+inclusive persistence timings. Projected lenses are not model invocations;
+historical or incomplete causality stays unknown. New observations must not
+change owner outputs, retry/lock behavior, authority or durability boundaries.
 
 When touching response lookup, index persistence, or `/api/responses/<id>` recovery, run:
 
     .venv/bin/python -m pytest tests/test_response_frames.py -q
     .venv/bin/python -m pytest tests/test_responses_api.py -q --durations=20
 
+For recursive snapshot preparation, include
+`tests/test_response_snapshot_preparation.py`. It checks eliminated duplicate
+preparation, byte/provenance equivalence, distinct media-file identities, changed
+inputs/files, missing/corrupt repeated sidecars, and post-write verification
+failure. Snapshot preparation reuse must never suppress fresh integrity checks.
+
+For epoch/map preparation changes, include
+`tests/test_response_frame_epoch_verification.py`. It checks exact versus changed
+entry bindings, relocated epochs, physical evidence changes during verification,
+downstream map tampering, and rejection of old readiness after a successor or
+same-byte file replacement. Private digest reuse must not extend file freshness.
+
 `ResponsesApiTests` must redirect `ollmo_webserver.RESPONSE_FRAMES_DIR` to a per-test temporary root. Tests must never scan or write the checkout's production `state/response_frames/responses.jsonl`. A globally fresh, coverage-verified response map may serve validated historical byte-offset hits and prove a missing response id without a ledger scan. Legacy, stale, incomplete, malformed, or corrupt coverage remains uncertain and must retain the safe full-ledger fallback. Do not weaken product timeout or state-transition limits merely to shorten this suite; first inspect duration output for missing mocks, unintended real subprocess/network work, or protected-state coupling.
 
 For the explicit legacy-index boundary, include the `attest_response_frame_index` regressions in `tests/test_response_frames.py`. Attestation must stream rather than call `Path.read_text()` or `_iter_ledger_frames`, preserve the existing `responses` mapping exactly, reject missing ids/latest-coordinate drift/malformed rows/moving evidence without writing, and use an atomic replace only after exact verification. `scripts/attest_response_frame_index.py --check-only` is the operator preflight; tests use temporary roots or a copied temp index with a symlinked source ledger and must never attest the checkout's production index implicitly.
 
 ## Fake-Backend E2E Truth Harness
+
+For PNG/SVG request typing and negative-format scope, run:
+
+    .venv/bin/python -m pytest tests/test_inference_service.py tests/test_visual_materialization_intent.py tests/test_generated_image_artifact_routing.py -q
+
+The generated-image routing regressions trace the exact HTML-IMAGE-SMOKE-01
+prompt through candidates, promotion, obligations, phases, branches and Late
+Fill eligibility. Their bounded fake-provider integration executes the real
+branch preparation/execution and final materialization owners, verifies one
+PNG producer followed by separate HTML/CSS files, and rejects filename/prose
+as production evidence. It does not test the asynchronous scheduler or frame
+persistence. All provider outputs and ledgers are temporary; no live image
+generation is part of this suite. Broaden intent/extraction changes with the
+Ghost routing, request-phase-graph and affected response-semantics tests.
+
+The older `ResponsesApiTests` slice has an isolation limitation: direct calls to
+late-fill completion outside a Flask application context can outlive per-test
+patches and reach later tests as closure-repair workers. Its fixture also restores
+checkout configuration files, and preview paths retain unmocked port/subprocess
+probes. Do not describe this slice as fully offline or isolated merely because it
+uses the Flask test client. Revalidate it in a disposable physical checkout with
+production state absent and external I/O blocked; report blocked probes or leaked
+worker calls separately from the request-typing regression result. Do not weaken
+the runtime gates or test assertions to hide these isolation failures.
 
 Run:
 
@@ -206,3 +312,23 @@ For prompt or injected policy wording changes that reach Ghost routing, the reso
     .venv/bin/python -m pytest tests/test_responses_api.py -q -k "ghost_route or ghost_auto or ghost_route_preview or execution_planner or planner_deferred or late_fill"
 
 When a local chat-capable runtime is available, also compare a small live set: plain chat, write-then-speak, describe-then-image, selected-reference follow-up, latest-artifact edit, and each compatibility `ghost_mode` variant that is still accepted at the API edge.
+
+For bounded handoff/transition observations, additionally run:
+
+    .venv/bin/python -m pytest tests/test_transition_telemetry.py tests/test_runtime_contract_knobs.py -q
+    .venv/bin/python -m pytest tests/test_responses_api.py -q -k late_fill_branch_progress_updates_response_lookup_before_wave_terminal
+
+These isolated tests cover exhausted observation budgets, paired reservation,
+multiple branches/attempts, gate/result provenance, exceptions/aborts, callback
+ordering and retained publication/drain waits. Persistence and hydration use
+only temporary frame roots; no live-model or self-attack execution is needed.
+
+For opt-in state-flow observation, first run:
+
+    .venv/bin/python -m pytest tests/test_state_flow.py tests/test_transition_telemetry.py tests/test_causal_telemetry.py tests/test_response_snapshot_preparation.py tests/test_readiness_observation_reuse.py -q
+
+Then include affected frame, lookup, readiness/registry, artifact, response
+semantics and disposable-checkout API/E2E coverage. Instrumentation must preserve
+canonical bytes, owner outputs/exceptions, existing checks and scheduling.
+See [STATE_FLOW_DIAGNOSTICS](STATE_FLOW_DIAGNOSTICS.md) for scope bounds and
+partial byte/timing coverage. No live submission is implicit in these tests.

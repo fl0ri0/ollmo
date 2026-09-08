@@ -75,7 +75,7 @@ _TEXT_ARTIFACT_ACTION_CUE_RE = re.compile(
     r'\b('
     r'create|generate|make|write|produce|return|provide|build|emit|design|draft|'
     r'change|modify|update|edit|revise|alter|save|materialize|materialise|'
-    r'erzeuge|erstelle|generiere|schreibe|gib|liefere|baue|'
+    r'erzeuge|erstelle|generiere|schreibe|gib|liefere|bau(?:e|en)?|'
     r'entwirf|entwerfe|entwerfen|gestalte|gestalten|'
     r'aendere|ändere|veraendere|verändere|anpassen|passe|speichere|'
     r'materialisiere|materialisieren'
@@ -411,8 +411,48 @@ _TEXT_ARTIFACT_PART_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _TEXT_ARTIFACT_FORMAT_NEGATION_RE = re.compile(
-    r'\b(?:do\s+not|don[\'’]?t|dont|no|not|without|kein(?:e|en|er|es)?|nicht|ohne)\b'
-    r'[^.;!?\n]{0,48}$',
+    r'\b(?:do\s+not|don[\'’]?t|dont|no|not|without|kein(?:e|en|er|es)?|nicht|ohne)\b',
+    re.IGNORECASE,
+)
+_TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE = re.compile(
+    r'[;!?]|(?<!\d)\.(?=\s|$)|\b(?:but|however|aber|sondern|stattdessen)\b|'
+    r'(?:,|\n|\b(?:and|und)\b)\s*(?=(?:(?:then|please|dann|bitte)\s+)?'
+    r'(?:create|generate|write|produce|build|make|draw|render|save|'
+    r'erzeuge|erstelle|generiere|schreibe|baue|zeichne|speichere)\b)',
+    re.IGNORECASE,
+)
+_TEXT_ARTIFACT_COMMAND_PROHIBITION_RE = re.compile(
+    r'(?:^|[,\n]|\b(?:and|und)\b)\s*(?:(?:please|bitte)\s+)?'
+    r'(?:do\s+not|don[\'’]?t|dont)\b',
+    re.IGNORECASE,
+)
+_SVG_ARTIFACT_ACTION_RE = re.compile(
+    r'\b(?:create|generate|draw|render|make|produce|build|write|'
+    r'erzeuge|erstelle|generiere|zeichne|baue|schreibe)\b\s+'
+    r'(?:(?:me|us|mir|uns)\s+)?',
+    re.IGNORECASE,
+)
+_SVG_ARTIFACT_TYPED_NOUN_PATTERN = (
+    r'(?:illustration|image|picture|drawing|icon|graphic|logo|'
+    r'file|artifact|artefact|bild|zeichnung|grafik|datei|artefakt)'
+)
+_SVG_ARTIFACT_TYPED_TARGET_RE = re.compile(
+    r'(?:(?:a|an|one|the|ein(?:e|en|em|er|es)?|die|das|'
+    r'simple|small|new|separate|detailed|kleine?|neue?|einfache?|detaillierte?)\s+)*'
+    r'(?:'
+    r'(?P<prefix_format>svg|png|jpe?g)\b'
+    r'(?:[\s-]+' + _SVG_ARTIFACT_TYPED_NOUN_PATTERN + r'\b)?|'
+    + _SVG_ARTIFACT_TYPED_NOUN_PATTERN + r'\b\s+(?:as|als)\s+'
+    r'(?P<suffix_format>svg|png|jpe?g)\b'
+    r')',
+    re.IGNORECASE,
+)
+_SVG_ARTIFACT_TARGET_JOIN_RE = re.compile(
+    r'\s*(?:,\s*(?:(?:and|und)\s+)?|\b(?:and|und)\s+)',
+    re.IGNORECASE,
+)
+_TEXT_ARTIFACT_RESERVED_SUFFIX_RE = re.compile(
+    r'^\s*(?:(?:ideas?|concepts?)\s+)?(?:as\s+)?(?:reserved|optional|for\s+later)\b',
     re.IGNORECASE,
 )
 _TEXT_ARTIFACT_VALIDATION_ONLY_RE = re.compile(
@@ -815,8 +855,86 @@ def prompt_has_inline_text_artifact_source(prompt: str) -> bool:
 
 
 def _text_artifact_format_match_is_negated(text: str, match: re.Match[str]) -> bool:
-    prefix = str(text or '')[max(0, match.start() - 64):match.start()]
+    prefix = str(text or '')[:match.start()]
+    # Wrapped exclusion lists remain one command. Only an actual sentence,
+    # contrast or new action starts a fresh polarity scope, not a character cap.
+    scope_start = 0
+    for boundary in _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE.finditer(prefix):
+        if (
+            boundary.group().strip().lower() in {'and', 'und'}
+            and _TEXT_ARTIFACT_COMMAND_PROHIBITION_RE.search(
+                prefix[scope_start:boundary.start()],
+            )
+        ):
+            # "Do not generate X and create Y" prohibits both coordinated
+            # commands. "Create X with no external assets, and create Y" has
+            # an object constraint, so its independent action resets scope.
+            continue
+        scope_start = boundary.end()
+    prefix = prefix[scope_start:]
+    prefix = re.sub(
+        r"\b(?:(?:do\s+not|don[\'’]?t|dont|not)\s+just|not\s+only|nicht\s+nur)\b",
+        '',
+        prefix,
+        flags=re.IGNORECASE,
+    )
     return bool(_TEXT_ARTIFACT_FORMAT_NEGATION_RE.search(prefix))
+
+
+def explicit_svg_artifact_request_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return affirmative SVG target spans governed by a local creation action.
+
+    These bounded input spans distinguish requested SVG text artifacts from
+    binary image generation. The action stays outside the spans because it can
+    govern a coordinated PNG/JPEG target too. A target's subject description is
+    included; an independent action or typed sibling target ends its scope.
+    These are input intent spans, never production or fulfillment evidence.
+    """
+    prompt = str(text or '')
+    spans: list[tuple[int, int]] = []
+    for action in _SVG_ARTIFACT_ACTION_RE.finditer(prompt):
+        prefix = prompt[:action.start()]
+        if _JSON_TEXT_ARTIFACT_META_ACTION_PREFIX_RE.search(prefix):
+            continue
+        target = _SVG_ARTIFACT_TYPED_TARGET_RE.match(prompt, action.end())
+        while target:
+            boundary = _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE.search(prompt, target.end())
+            scope_end = boundary.start() if boundary else len(prompt)
+            next_target = None
+            for join in _SVG_ARTIFACT_TARGET_JOIN_RE.finditer(prompt, target.end(), scope_end):
+                next_target = _SVG_ARTIFACT_TYPED_TARGET_RE.match(prompt, join.end(), scope_end)
+                if next_target:
+                    break
+            requested_format = target.group('prefix_format') or target.group('suffix_format')
+            if requested_format.lower() == 'svg':
+                svg_format_match = next(
+                    match for match in _TEXT_ARTIFACT_FORMAT_RE.finditer(
+                        prompt, target.start(), target.end(),
+                    )
+                    if match.group('format').lower() == 'svg'
+                )
+                if (
+                    not _text_artifact_format_match_is_negated(prompt, svg_format_match)
+                    and not _json_text_artifact_span_is_inside_quoted_instruction(
+                        prompt, action.start(), target.end(),
+                    )
+                ):
+                    # Remove the outgoing list connector with its SVG target,
+                    # leaving the shared action adjacent to a surviving raster
+                    # target even when that target has no explicit image noun.
+                    end = next_target.start() if next_target else scope_end
+                    spans.append((target.start(), end))
+            target = next_target
+    return tuple(spans)
+
+
+def _text_artifact_format_is_embedded(text: str, match: re.Match[str]) -> bool:
+    """An inline implementation format is not a request for a sibling file."""
+    return bool(re.search(
+        r'\b(?:inline|embedded|eingebettet\w*)[\s-]+$',
+        text[:match.start()],
+        flags=re.IGNORECASE,
+    ))
 
 
 def _text_artifact_match_scope(text: str, start: int, end: int) -> tuple[str, int, int]:
@@ -827,6 +945,7 @@ def _text_artifact_match_scope(text: str, start: int, end: int) -> tuple[str, in
         prompt.rfind('.', 0, start_index),
         prompt.rfind('!', 0, start_index),
         prompt.rfind('?', 0, start_index),
+        prompt.rfind(';', 0, start_index),
         prompt.rfind('\n', 0, start_index),
     )
     end_candidates = [
@@ -835,6 +954,7 @@ def _text_artifact_match_scope(text: str, start: int, end: int) -> tuple[str, in
             prompt.find('.', end_index),
             prompt.find('!', end_index),
             prompt.find('?', end_index),
+            prompt.find(';', end_index),
             prompt.find('\n', end_index),
         )
         if index >= 0
@@ -1452,12 +1572,26 @@ def detect_text_artifact_requests(
     has_file_cue = bool(_TEXT_ARTIFACT_FILE_CUE_RE.search(text))
     has_action_cue = bool(_TEXT_ARTIFACT_ACTION_CUE_RE.search(text))
     has_web_page_need_cue = bool(_TEXT_ARTIFACT_WEB_PAGE_NEED_CUE_RE.search(text))
-    has_implicit_web_page_cue = bool(_TEXT_ARTIFACT_IMPLICIT_WEB_PAGE_RE.search(text))
+    # A web possibility cannot borrow an action from an unrelated sentence
+    # (for example, "create an image ... keep website ideas reserved").
+    has_implicit_web_page_cue = any(
+        not _text_artifact_format_match_is_negated(text, match)
+        and not _TEXT_ARTIFACT_RESERVED_SUFFIX_RE.search(text[match.end():])
+        and bool(
+            _TEXT_ARTIFACT_ACTION_CUE_RE.search(scope)
+            or _TEXT_ARTIFACT_WEB_PAGE_NEED_CUE_RE.search(scope)
+        )
+        for match in _TEXT_ARTIFACT_IMPLICIT_WEB_PAGE_RE.finditer(text)
+        for scope, _, _ in [_text_artifact_match_scope(text, match.start(), match.end())]
+    )
     has_bare_german_page_with_generated_visuals = bool(
         _TEXT_ARTIFACT_BARE_GERMAN_PAGE_RE.search(text)
         and _TEXT_ARTIFACT_GENERATED_VISUAL_CONTEXT_RE.search(text)
     )
-    format_matches = list(_TEXT_ARTIFACT_FORMAT_RE.finditer(text))
+    format_matches = [
+        match for match in _TEXT_ARTIFACT_FORMAT_RE.finditer(text)
+        if not _text_artifact_format_is_embedded(text, match)
+    ]
     distinct_format_match_spans = {
         (format_match.start(), format_match.end())
         for format_match in format_matches
@@ -1468,6 +1602,7 @@ def detect_text_artifact_requests(
         )
     }
     has_explicit_format_file_cue = has_file_cue and has_action_cue
+    explicit_svg_request_spans = explicit_svg_artifact_request_spans(text)
     explicit_format_file_match_spans = {
         (format_match.start(), format_match.end())
         for format_match in format_matches
@@ -1482,6 +1617,13 @@ def detect_text_artifact_requests(
                 and (
                     (_normalize_text_artifact_extension(format_match.group('format') or '') or 'txt')
                     not in _TEXT_ARTIFACT_RESPONSE_FORMAT_ONLY_EXTENSIONS
+                )
+            )
+            or (
+                _normalize_text_artifact_extension(format_match.group('format') or '') == 'svg'
+                and any(
+                    start <= format_match.start() and format_match.end() <= end
+                    for start, end in explicit_svg_request_spans
                 )
             )
         )
@@ -2353,6 +2495,7 @@ class InferContext:
     text_artifact_requests: list[dict[str, str]] = field(default_factory=list)
     prompt_is_semantic_materializer_payload: bool = False
     reasoning_effort: Optional[str] = None
+    phase_system_prompt: Optional[str] = None
 
 
 @dataclass
@@ -4475,6 +4618,7 @@ def _run_chat_fallback(
     ops: Dict[str, Callable[..., Any]],
 ) -> Tuple[dict, int]:
     prompt = ctx.prompt
+    phase_system_prompt = str(ctx.phase_system_prompt or '').strip()
     warnings = list(artifacts.pdf_warnings or [])
     if artifacts.text_from_file:
         file_content_prefix = '[Attached file content]'
@@ -4516,10 +4660,21 @@ def _run_chat_fallback(
         return {'error': error_message, 'warnings': warnings}, 400
     if artifacts.image_b64:
         if ctx.backend in {'mlx', 'llama_cpp'}:
+            messages = [
+                _build_mlx_multimodal_user_message(
+                    prompt or 'Describe the attached image.',
+                    artifacts.image_b64,
+                )
+            ]
+            if phase_system_prompt:
+                messages.insert(
+                    0,
+                    {'role': 'system', 'content': phase_system_prompt},
+                )
             mlx_out = _run_backend_chat_completion(
                 ctx,
                 ops,
-                [_build_mlx_multimodal_user_message(prompt or 'Describe the attached image.', artifacts.image_b64)],
+                messages,
                 timeout_sec=ctx.infer_timeout_sec,
             )
             return (
@@ -4533,10 +4688,15 @@ def _run_chat_fallback(
                 },
                 200,
             )
+        ollama_image_prompt = prompt or 'Describe the attached image.'
+        if phase_system_prompt:
+            ollama_image_prompt = (
+                f'{phase_system_prompt}\n\n{ollama_image_prompt}'
+            )
         data_out = ops['ollama_generate'](
             ctx.port,
             ctx.model_name,
-            prompt or 'Describe the attached image.',
+            ollama_image_prompt,
             images=[artifacts.image_b64],
             timeout_sec=ctx.infer_timeout_sec,
         )
@@ -4554,16 +4714,27 @@ def _run_chat_fallback(
 
     if not prompt:
         return {'error': 'No prompt was provided.'}, 400
+    chat_messages = [{'role': 'user', 'content': prompt}]
+    if phase_system_prompt:
+        chat_messages.insert(
+            0,
+            {'role': 'system', 'content': phase_system_prompt},
+        )
     if ctx.backend in {'mlx', 'llama_cpp'}:
         chat_result = _run_backend_chat_completion(
             ctx,
             ops,
-            [{'role': 'user', 'content': prompt}],
+            chat_messages,
             timeout_sec=ctx.infer_timeout_sec,
         )
         content = chat_result.get('content', '')
     else:
-        chat_result = ops['ollama_chat'](ctx.port, ctx.model_name, [{'role': 'user', 'content': prompt}])
+        chat_result = ops['ollama_chat'](
+            ctx.port,
+            ctx.model_name,
+            chat_messages,
+            timeout_sec=ctx.infer_timeout_sec,
+        )
         content = chat_result.get('content', '')
     payload = {
         'instance_id': ctx.instance_id,

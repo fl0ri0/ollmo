@@ -25,6 +25,10 @@ def _write_jsonl(path: Path, payload: dict) -> bytes:
     return encoded
 
 
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.open('ab').write((json.dumps(payload, sort_keys=True) + '\n').encode('utf-8'))
+
+
 def _fixture_truth(tmp_path: Path) -> dict:
     source_root = tmp_path / 'source'
     artifact_root = source_root / 'artifacts'
@@ -317,6 +321,232 @@ def test_export_fails_closed_on_truth_mismatch(
             artifact_root=fixture['artifact_root'],
         )
     assert not destination.exists()
+
+
+def test_export_selects_clean_monitor_report_for_latest_successor_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    current_report = json.loads(fixture['monitor'].read_text(encoding='utf-8'))
+    failed_parent_report = dict(current_report)
+    failed_parent_report.update(
+        {
+            'frame_id': f'{RESPONSE_ID}:frame-1',
+            'frame_sequence': 1,
+            'verdict': 'needs_attention',
+            'lifecycle_state': 'repair_needed',
+            'late_fill_status': 'partial_failed',
+            'final_materialization_contract_status': 'unmet',
+            'materialization_contract_unmet': True,
+            'failed_branch_count': 1,
+        }
+    )
+    fixture['monitor'].write_bytes(b'')
+    _append_jsonl(fixture['monitor'], failed_parent_report)
+    _append_jsonl(fixture['monitor'], current_report)
+    _patch_truth(monkeypatch, fixture)
+    destination = tmp_path / 'published' / 'fixture'
+    ledger_path = fixture['frames_dir'] / 'responses.jsonl'
+    ledger_before = ledger_path.read_bytes()
+
+    exporter.export_reference_run(
+        response_id=RESPONSE_ID,
+        source_readme=fixture['readme'],
+        output_dir=destination,
+        frames_dir=fixture['frames_dir'],
+        monitor_reports=fixture['monitor'],
+        artifact_root=fixture['artifact_root'],
+    )
+
+    published_monitor = json.loads(
+        (destination / 'monitor-report.json').read_text(encoding='utf-8')
+    )
+    assert published_monitor['frame_id'] == FRAME_ID
+    assert published_monitor['verdict'] == 'clean'
+    assert (destination / 'manifest.json').is_file()
+    assert ledger_path.read_bytes() == ledger_before
+
+
+def test_export_rejects_when_only_stale_monitor_report_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    stale = json.loads(fixture['monitor'].read_text(encoding='utf-8'))
+    stale.update(
+        {
+            'frame_id': f'{RESPONSE_ID}:frame-1',
+            'frame_sequence': 1,
+            'verdict': 'needs_attention',
+            'lifecycle_state': 'repair_needed',
+            'late_fill_status': 'partial_failed',
+            'final_materialization_contract_status': 'unmet',
+            'materialization_contract_unmet': True,
+            'failed_branch_count': 1,
+        }
+    )
+    _write_jsonl(fixture['monitor'], stale)
+    _patch_truth(monkeypatch, fixture)
+    destination = tmp_path / 'published' / 'fixture'
+
+    with pytest.raises(
+        exporter.ReferenceExportError,
+        match='indexed latest frame',
+    ):
+        exporter.export_reference_run(
+            response_id=RESPONSE_ID,
+            source_readme=fixture['readme'],
+            output_dir=destination,
+            frames_dir=fixture['frames_dir'],
+            monitor_reports=fixture['monitor'],
+            artifact_root=fixture['artifact_root'],
+        )
+    assert not destination.exists()
+
+
+def test_export_rejects_malformed_indexed_frame_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    fixture['index']['responses'][RESPONSE_ID]['latest_frame_sequence'] = 'not-an-int'
+    _patch_truth(monkeypatch, fixture)
+
+    with pytest.raises(
+        exporter.ReferenceExportError,
+        match='frame sequence.*malformed',
+    ):
+        exporter.export_reference_run(
+            response_id=RESPONSE_ID,
+            source_readme=fixture['readme'],
+            output_dir=tmp_path / 'published' / 'fixture',
+            frames_dir=fixture['frames_dir'],
+            monitor_reports=fixture['monitor'],
+            artifact_root=fixture['artifact_root'],
+        )
+
+
+@pytest.mark.parametrize('projection', ['wire', 'observation'])
+def test_export_rejects_malformed_projection_frame_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    projection: str,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    fixture[projection]['response_payload']['response_frame']['frame_sequence'] = (
+        'not-an-int'
+    )
+    _patch_truth(monkeypatch, fixture)
+
+    with pytest.raises(
+        exporter.ReferenceExportError,
+        match='response projection frame sequence.*malformed',
+    ):
+        exporter.export_reference_run(
+            response_id=RESPONSE_ID,
+            source_readme=fixture['readme'],
+            output_dir=tmp_path / 'published' / 'fixture',
+            frames_dir=fixture['frames_dir'],
+            monitor_reports=fixture['monitor'],
+            artifact_root=fixture['artifact_root'],
+        )
+
+
+def test_export_rejects_malformed_matching_monitor_frame_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    monitor_report = json.loads(fixture['monitor'].read_text(encoding='utf-8'))
+    monitor_report['frame_sequence'] = 'not-an-int'
+    _write_jsonl(fixture['monitor'], monitor_report)
+    _patch_truth(monkeypatch, fixture)
+
+    with pytest.raises(
+        exporter.ReferenceExportError,
+        match='monitor frame sequence.*malformed',
+    ):
+        exporter.export_reference_run(
+            response_id=RESPONSE_ID,
+            source_readme=fixture['readme'],
+            output_dir=tmp_path / 'published' / 'fixture',
+            frames_dir=fixture['frames_dir'],
+            monitor_reports=fixture['monitor'],
+            artifact_root=fixture['artifact_root'],
+        )
+
+
+def test_export_rejects_fully_legacy_frameless_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    ledger = fixture['frames_dir'] / 'responses.jsonl'
+    legacy_row = _write_jsonl(
+        ledger,
+        {
+            'response_id': RESPONSE_ID,
+            'frame_sequence': 2,
+            'status': 'completed',
+        },
+    )
+    indexed = fixture['index']['responses'][RESPONSE_ID]
+    indexed.update(
+        {
+            'line_length': len(legacy_row),
+            'latest_frame_id': '',
+        }
+    )
+    monitor_report = json.loads(fixture['monitor'].read_text(encoding='utf-8'))
+    monitor_report.pop('frame_id', None)
+    monitor_report.pop('frame_sequence', None)
+    _write_jsonl(fixture['monitor'], monitor_report)
+    fixture['wire']['response_payload']['response_frame'].pop('frame_id', None)
+    fixture['observation']['response_payload']['response_frame'].pop('frame_id', None)
+    _patch_truth(monkeypatch, fixture)
+
+    with pytest.raises(
+        exporter.ReferenceExportError,
+        match='immutable frame identity',
+    ):
+        exporter.export_reference_run(
+            response_id=RESPONSE_ID,
+            source_readme=fixture['readme'],
+            output_dir=tmp_path / 'published' / 'fixture',
+            frames_dir=fixture['frames_dir'],
+            monitor_reports=fixture['monitor'],
+            artifact_root=fixture['artifact_root'],
+        )
+
+
+def test_export_last_conflicting_observer_record_wins_for_same_frame(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture_truth(tmp_path)
+    first = json.loads(fixture['monitor'].read_text(encoding='utf-8'))
+    second = dict(first)
+    second.update(
+        {
+            'verdict': 'needs_attention',
+            'lifecycle_state': 'repair_needed',
+        }
+    )
+    fixture['monitor'].write_bytes(b'')
+    _append_jsonl(fixture['monitor'], first)
+    _append_jsonl(fixture['monitor'], second)
+
+    selected, identity = exporter._load_monitor_report(
+        RESPONSE_ID,
+        reports_path=fixture['monitor'],
+        expected_frame_id=FRAME_ID,
+        expected_frame_sequence=2,
+    )
+
+    assert selected['verdict'] == 'needs_attention'
+    assert identity['record_sha256'] == exporter._sha256_bytes(
+        (json.dumps(second, sort_keys=True) + '\n').encode('utf-8')
+    )
 
 
 def test_export_rejects_artifact_outside_approved_root(

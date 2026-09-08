@@ -1524,6 +1524,10 @@ def summarize_debug_payload(payload: Mapping[str, Any], *, byte_count: int = 0) 
         else {}
     )
     return {
+        'causal_telemetry': {
+            key: value for key, value in (diagnostics.get('causal_telemetry') or {}).items()
+            if key != 'events'
+        } if isinstance(diagnostics.get('causal_telemetry'), Mapping) else {},
         'response_bytes': int(byte_count or 0),
         'id': payload.get('id') or payload.get('response_id'),
         'status': payload.get('status'),
@@ -2443,6 +2447,7 @@ class ShadowCorpusRunner:
         post_timeout: float = 7200.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         emit: Callable[[str], None] = print,
+        request_transform: Optional[Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any]]] = None,
     ):
         if max_in_flight < 1:
             raise CorpusError('--max-in-flight must be at least 1.')
@@ -2458,6 +2463,7 @@ class ShadowCorpusRunner:
         self.post_timeout = max(0.1, float(post_timeout))
         self.sleep_fn = sleep_fn
         self.emit = emit
+        self.request_transform = request_transform
         self._dispatch_results: queue.Queue[tuple[str, HttpResult]] = queue.Queue()
         self._dispatch_threads: dict[str, threading.Thread] = {}
         self._ghost_preferences: dict[str, Any] = {}
@@ -2797,6 +2803,11 @@ class ShadowCorpusRunner:
 
     def _start_dispatch(self, case: dict[str, Any]) -> None:
         payload = build_request_payload(self.manifest, case, self._ghost_preferences)
+        if self.request_transform is not None:
+            original = {key: payload.get(key) for key in ('response_id', 'conversation_id', 'ghost_route', 'prompt', 'ghost_preferences')}
+            payload = self.request_transform(payload, case)
+            if any(payload.get(key) != value for key, value in original.items()):
+                raise CorpusError('Request transform cannot change shadow dispatch identity, intent or persisted preferences.')
         case['state'] = 'submitting'
         case['submitting_at'] = utc_now()
         case['dispatch_request'] = payload

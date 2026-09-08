@@ -1500,6 +1500,12 @@ def build_output_obligations(
             value = raw_phase.get(key)
             if value not in (None, '', [], {}):
                 obligation[key] = value
+        # Execution failures are owed-work truth, not optional planner hints.
+        # Closure must retain them even when matching output files exist.
+        for key in ('branch_contract_error', 'materialization_blocked',
+                    'blocked_by_branch_contract', 'dependency_contract', 'repair_action'):
+            if raw_phase.get(key) not in (None, '', [], {}):
+                obligation[key] = raw_phase[key]
         if isinstance(raw_phase.get('artifact_request'), Mapping):
             obligation['artifact_request'] = dict(raw_phase.get('artifact_request') or {})
         for key in (

@@ -1,0 +1,31 @@
+{
+  "entrypoint": "index.html",
+  "files": [
+    {
+      "artifact_ref": "artifact:text_0c14ec7b99ca1fd285efe3f1",
+      "relative_path": "assets/files/file-01.json",
+      "sha256": "b1ba85eba8552c657bda618fd13c7e72557a0f3c55e7a1d56fc90d7d7cf23839",
+      "size_bytes": 36,
+      "source_sha256": "b1ba85eba8552c657bda618fd13c7e72557a0f3c55e7a1d56fc90d7d7cf23839",
+      "type": "text"
+    },
+    {
+      "artifact_ref": "artifact:text_3878e28ba06960b710009e34",
+      "relative_path": "index.html",
+      "sha256": "9851fbc10d9a4ed572ac35728fa1ef3c31c87db7d538d8be34596482b912e9bb",
+      "size_bytes": 1071,
+      "source_sha256": "9851fbc10d9a4ed572ac35728fa1ef3c31c87db7d538d8be34596482b912e9bb",
+      "type": "text"
+    }
+  ],
+  "link_check": {
+    "status": "passed"
+  },
+  "raw_runtime_manifest_published": false,
+  "resolved_links": [],
+  "schema": "ollmo.public_bundle_manifest.v1",
+  "source_bundle_id": "bundle:4582068f93943e780ffa3638",
+  "source_response_id": "resp_1788803596168_832ad3bf8fc31",
+  "status": "bundled",
+  "version": 1
+}

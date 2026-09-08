@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -190,6 +191,112 @@ class ResponseArtifactBundleTests(unittest.TestCase):
                 [('js_fetch', 'pricing.json')],
             )
 
+    def test_web_bundle_rewrites_retained_input_reference_to_current_authoritative_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            retained_dir = document_dir / 'retained_input_da4693202d605684'
+            document_dir.mkdir(parents=True)
+            retained_dir.mkdir()
+            index_path = document_dir / 'index.html'
+            script_path = document_dir / 'app.js'
+            retained_path = retained_dir / 'rooms.json'
+            current_path = document_dir / '20260905T082249Z_text_artifact_mon-repos-rooms.json'
+            index_path.write_text(
+                '<!doctype html><script src="app.js"></script>',
+                encoding='utf-8',
+            )
+            script_path.write_text(
+                "fetch('retained_input_da4693202d605684/rooms.json');\n",
+                encoding='utf-8',
+            )
+            retained_path.write_text('{"rooms": []}', encoding='utf-8')
+            current_path.write_text('{"rooms": []}\n', encoding='utf-8')
+            response_id = 'resp_retained_input_authoritative_replacement'
+            current_record = {
+                'type': 'text',
+                'path': str(current_path),
+                'name': '20260905T082249Z_text_artifact_mon-repos-rooms',
+                'artifact_ref': 'artifact:current-rooms',
+                'source_response_id': response_id,
+                'text_artifact_source': 'saved_text_artifact',
+            }
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': response_id,
+                    'outputs': [
+                        {
+                            'type': 'text',
+                            'status': 'fulfilled',
+                            'artifact_ref': 'artifact:index',
+                            'path': str(index_path),
+                        },
+                        {
+                            'type': 'text',
+                            'status': 'fulfilled',
+                            'artifact_ref': 'artifact:app',
+                            'path': str(script_path),
+                        },
+                        {
+                            **current_record,
+                            'status': 'fulfilled',
+                        },
+                    ],
+                    'artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(index_path),
+                            'name': 'index',
+                            'artifact_ref': 'artifact:index',
+                        },
+                        {
+                            'type': 'text',
+                            'path': str(script_path),
+                            'name': 'app',
+                            'artifact_ref': 'artifact:app',
+                        },
+                        current_record,
+                    ],
+                    'input_artifacts': [
+                        {
+                            'type': 'text',
+                            'path': str(retained_path),
+                            'name': 'rooms',
+                            'artifact_ref': 'artifact:retained-rooms',
+                            'source': 'retained_input',
+                        }
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-09-05T10:30:00Z',
+            )
+
+            bundle_dir = Path(payload['bundle_path'])
+            bundled_script = (bundle_dir / 'assets/js/app.js').read_text(encoding='utf-8')
+            bundled_json = (
+                bundle_dir
+                / 'assets/files/20260905T082249Z_text_artifact_mon-repos-rooms.json'
+            )
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertEqual(payload['link_check']['status'], 'passed')
+            self.assertTrue(bundled_json.is_file())
+            self.assertFalse((bundle_dir / 'assets/files/rooms.json').exists())
+            self.assertIn(
+                "fetch('../files/20260905T082249Z_text_artifact_mon-repos-rooms.json')",
+                bundled_script,
+            )
+            self.assertIn(
+                (
+                    'js_fetch',
+                    'retained_input_da4693202d605684/rooms.json',
+                ),
+                {
+                    (item.get('kind'), item.get('original'))
+                    for item in payload['rewritten_links']
+                },
+            )
+
     def test_bundle_rewrites_structural_json_asset_paths_and_includes_the_dependency(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -259,6 +366,175 @@ class ResponseArtifactBundleTests(unittest.TestCase):
                 {item.get('json_key_path') for item in json_rewrites},
                 {'items[0].image_path', 'imagePaths[0]'},
             )
+
+    def test_bundle_rewrites_singular_json_media_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            image_dir = root / 'artifacts' / 'images'
+            audio_dir = root / 'artifacts' / 'audio'
+            document_dir.mkdir(parents=True)
+            image_dir.mkdir(parents=True)
+            audio_dir.mkdir(parents=True)
+            rooms_path = document_dir / 'rooms.json'
+            image_path = image_dir / 'lake-room.png'
+            audio_path = audio_dir / 'welcome.wav'
+            image_path.write_bytes(b'png')
+            audio_path.write_bytes(b'wav')
+            rooms_path.write_text(
+                json.dumps(
+                    {
+                        'rooms': [
+                            {
+                                'name': 'Lake Room',
+                                'image': '../images/lake-room.png',
+                                'audio': '../audio/welcome.wav',
+                                'description': '../images/not-a-link.png',
+                            }
+                        ]
+                    },
+                    indent=2,
+                ),
+                encoding='utf-8',
+            )
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_singular_json_media',
+                    'artifacts': [
+                        {'type': 'text', 'path': str(rooms_path), 'name': 'rooms'},
+                        {'type': 'image', 'path': str(image_path), 'name': 'lake-room'},
+                        {'type': 'audio', 'path': str(audio_path), 'name': 'welcome'},
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-09-03T10:00:00Z',
+            )
+
+            bundled_rooms = json.loads(
+                (Path(payload['bundle_path']) / 'rooms.json').read_text(encoding='utf-8')
+            )
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertEqual(bundled_rooms['rooms'][0]['image'], 'assets/images/lake-room.png')
+            self.assertEqual(bundled_rooms['rooms'][0]['audio'], 'assets/audio/welcome.wav')
+            self.assertEqual(
+                bundled_rooms['rooms'][0]['description'],
+                '../images/not-a-link.png',
+            )
+            self.assertEqual(
+                {
+                    item.get('json_key_path')
+                    for item in payload['rewritten_links']
+                    if item.get('kind') == 'json_path'
+                },
+                {'rooms[0].image', 'rooms[0].audio'},
+            )
+
+    def test_bundle_prefers_exact_canonical_filename_over_semantic_alias_collision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            document_dir = root / 'artifacts' / 'documents'
+            retained_dir = root / 'artifacts' / 'retained'
+            document_dir.mkdir(parents=True)
+            retained_dir.mkdir(parents=True)
+            index_path = document_dir / 'index.html'
+            script_path = document_dir / 'app.js'
+            generated_path = document_dir / '20260903T100000Z_text_rooms.json'
+            retained_path = retained_dir / 'rooms.json'
+            index_path.write_text(
+                '<!doctype html><script src="app.js"></script>',
+                encoding='utf-8',
+            )
+            script_path.write_text("fetch('rooms.json');\n", encoding='utf-8')
+            generated_path.write_text('{"source":"generated"}\n', encoding='utf-8')
+            retained_path.write_text('{"source":"retained"}\n', encoding='utf-8')
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_canonical_alias_collision',
+                    'artifacts': [
+                        {'type': 'text', 'path': str(index_path), 'name': 'index'},
+                        {'type': 'text', 'path': str(script_path), 'name': 'app'},
+                        {'type': 'text', 'path': str(generated_path), 'name': 'rooms'},
+                        {'type': 'text', 'path': str(retained_path), 'name': 'rooms'},
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-09-03T11:00:00Z',
+            )
+
+            copied_by_source = {
+                item['source_path']: Path(item['path'])
+                for item in payload['copied_artifacts']
+            }
+            bundled_script = copied_by_source[str(script_path.resolve())]
+            bundled_retained = copied_by_source[str(retained_path.resolve())]
+            expected_reference = os.path.relpath(
+                bundled_retained,
+                bundled_script.parent,
+            ).replace('\\', '/')
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertIn(
+                f"fetch('{expected_reference}')",
+                bundled_script.read_text(encoding='utf-8'),
+            )
+            self.assertEqual(
+                json.loads(bundled_retained.read_text(encoding='utf-8'))['source'],
+                'retained',
+            )
+
+    def test_bundle_closes_multipage_script_data_and_image_graph(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            documents = root / 'artifacts' / 'documents'
+            images = root / 'artifacts' / 'images'
+            documents.mkdir(parents=True)
+            images.mkdir(parents=True)
+            index_path = documents / 'index.html'
+            rooms_page_path = documents / 'rooms.html'
+            styles_path = documents / 'styles.css'
+            script_path = documents / 'app.js'
+            rooms_data_path = documents / 'rooms.json'
+            room_image_path = images / 'lake-room.png'
+            index_path.write_text(
+                '<!doctype html><link rel="stylesheet" href="styles.css">'
+                '<a href="rooms.html">Rooms</a>',
+                encoding='utf-8',
+            )
+            rooms_page_path.write_text(
+                '<!doctype html><link rel="stylesheet" href="styles.css">'
+                '<a href="index.html">Home</a><script src="app.js"></script>',
+                encoding='utf-8',
+            )
+            styles_path.write_text('body { color: #222; }\n', encoding='utf-8')
+            script_path.write_text("fetch('rooms.json');\n", encoding='utf-8')
+            rooms_data_path.write_text(
+                json.dumps({'rooms': [{'name': 'Lake Room', 'image': 'lake-room.png'}]}),
+                encoding='utf-8',
+            )
+            room_image_path.write_bytes(b'png')
+
+            payload = bundle_response_artifacts(
+                {
+                    'id': 'resp_multipage_transitive_closure',
+                    'artifacts': [
+                        {'type': 'text', 'path': str(index_path), 'name': 'index'},
+                        {'type': 'text', 'path': str(rooms_page_path), 'name': 'rooms'},
+                        {'type': 'text', 'path': str(styles_path), 'name': 'styles'},
+                        {'type': 'text', 'path': str(script_path), 'name': 'app'},
+                        {'type': 'text', 'path': str(rooms_data_path), 'name': 'rooms'},
+                        {'type': 'image', 'path': str(room_image_path), 'name': 'lake-room'},
+                    ],
+                },
+                bundle_root=root / 'bundles',
+                created_at='2026-09-03T11:30:00Z',
+            )
+
+            self.assertEqual(payload['status'], 'bundled')
+            self.assertEqual(payload['link_check']['status'], 'passed')
+            self.assertFalse(payload['link_check'].get('missing'))
+            for item in payload['copied_artifacts']:
+                self.assertTrue(Path(item['path']).is_file())
 
     def test_bundle_fails_closed_for_unresolved_structural_json_asset_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:

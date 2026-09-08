@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
 import hashlib
 import json
 from collections.abc import Mapping
@@ -1144,6 +1146,7 @@ def _closure(
     }
 
 
+@observe_state('working_frame.build', 'live_response_record', 'working_response_frame', labels=('NEW_REPRESENTATION',))
 def build_working_frame(
     *,
     request_payload: Optional[Mapping[str, Any]] = None,

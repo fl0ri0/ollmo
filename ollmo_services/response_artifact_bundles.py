@@ -12,7 +12,14 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Optional
 
-from ollmo_services.artifact_contracts import sanitize_artifact_record
+from ollmo_services.artifact_contracts import (
+    artifact_authority_rank,
+    artifact_is_current_authoritative,
+    artifact_logical_identity,
+    artifact_logical_identities_match,
+    select_authoritative_artifact_records,
+    sanitize_artifact_record,
+)
 
 
 DEFAULT_BUNDLE_ROOT = Path('artifacts/bundles')
@@ -302,9 +309,12 @@ def _filter_public_bundle_artifacts(
         return []
     filtered: list[dict[str, Any]] = []
     for artifact in artifacts:
-        if _artifact_public_keys(artifact) & public_keys:
+        if _artifact_public_keys(artifact) & public_keys and _is_public_output_artifact(artifact):
             filtered.append(artifact)
-    return filtered
+    return select_authoritative_artifact_records(
+        filtered,
+        response_id=_clean_text(response_payload.get('id')),
+    )
 
 
 def _authorized_carried_predecessor_artifacts(
@@ -519,32 +529,146 @@ def _normalize_ref_key(value: Any) -> str:
     return path_part.strip().lstrip('./').lower()
 
 
-def _add_alias(alias_map: dict[str, Path], alias: Any, destination: Path) -> None:
+def _add_alias_claim(
+    alias_claims: dict[str, list[tuple[int, Path]]],
+    alias: Any,
+    destination: Path,
+    *,
+    priority: int,
+) -> None:
     key = _normalize_ref_key(alias)
-    if key and key not in alias_map:
-        alias_map[key] = destination
+    if key:
+        alias_claims.setdefault(key, []).append((priority, destination))
 
 
-def _build_alias_map(copied_artifacts: list[dict[str, Any]]) -> dict[str, Path]:
-    alias_map: dict[str, Path] = {}
+def _build_alias_map(
+    copied_artifacts: list[dict[str, Any]],
+    *,
+    source_artifacts: list[dict[str, Any]] | None = None,
+    inventory_artifacts: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Path], list[dict[str, Any]]]:
+    alias_claims: dict[str, list[tuple[int, Path]]] = {}
     for item in copied_artifacts:
         destination = Path(item['path'])
         source = Path(item['source_path'])
         destination_relative = _clean_text(item.get('relative_path'))
-        aliases = {
-            source.name,
-            str(source),
-            destination.name,
-            destination_relative,
-            Path(destination_relative).name if destination_relative else '',
-            item.get('name'),
-        }
+        # Original source identity is authoritative.  Destination aliases are
+        # next because they describe the actual bundle layout.  Semantic names
+        # are only fallback hints and must never shadow a canonical source such
+        # as an explicitly retained rooms.json input.
+        _add_alias_claim(alias_claims, str(source), destination, priority=100)
+        _add_alias_claim(alias_claims, source.name, destination, priority=90)
+        _add_alias_claim(alias_claims, destination_relative, destination, priority=80)
+        _add_alias_claim(alias_claims, destination.name, destination, priority=70)
+        if destination_relative:
+            _add_alias_claim(
+                alias_claims,
+                Path(destination_relative).name,
+                destination,
+                priority=70,
+            )
+        _add_alias_claim(alias_claims, item.get('name'), destination, priority=20)
         extension = source.suffix or destination.suffix
         if item.get('name') and extension:
-            aliases.add(f'{item.get("name")}{extension}')
-        for alias in aliases:
-            _add_alias(alias_map, alias, destination)
-    return alias_map
+            _add_alias_claim(
+                alias_claims,
+                f'{item.get("name")}{extension}',
+                destination,
+                priority=20,
+            )
+
+    if (
+        source_artifacts
+        and len(source_artifacts) == len(copied_artifacts)
+    ):
+        for source_artifact, copied_artifact in zip(
+            source_artifacts,
+            copied_artifacts,
+            strict=True,
+        ):
+            destination = Path(copied_artifact['path'])
+            for alias in source_artifact.get('bundle_source_aliases') or []:
+                _add_alias_claim(
+                    alias_claims,
+                    alias,
+                    destination,
+                    priority=96,
+                )
+
+    # A selected current-generation artifact may replace an older file whose
+    # timestamped basename is still embedded in another generated document.
+    # Preserve that old basename as a rewrite-only alias for the selected
+    # logical file. The older file is not copied and never regains authority.
+    if (
+        source_artifacts
+        and inventory_artifacts
+        and len(source_artifacts) == len(copied_artifacts)
+    ):
+        logical_destinations: list[tuple[tuple[str, str], Path]] = []
+        for source_artifact, copied_artifact in zip(
+            source_artifacts,
+            copied_artifacts,
+            strict=True,
+        ):
+            identity = artifact_logical_identity(source_artifact)
+            if identity is not None:
+                logical_destinations.append(
+                    (identity, Path(copied_artifact['path']))
+                )
+        for inventory_artifact in inventory_artifacts:
+            identity = artifact_logical_identity(inventory_artifact)
+            if identity is None:
+                continue
+            matching_destinations = {
+                destination
+                for selected_identity, destination in logical_destinations
+                if artifact_logical_identities_match(identity, selected_identity)
+            }
+            if len(matching_destinations) != 1:
+                continue
+            destination = next(iter(matching_destinations))
+            source_path = _clean_text(
+                inventory_artifact.get('source_path')
+                or inventory_artifact.get('path')
+            )
+            if source_path:
+                _add_alias_claim(
+                    alias_claims,
+                    source_path,
+                    destination,
+                    priority=95,
+                )
+                _add_alias_claim(
+                    alias_claims,
+                    Path(source_path).name,
+                    destination,
+                    priority=85,
+                )
+
+    alias_map: dict[str, Path] = {}
+    conflicts: list[dict[str, Any]] = []
+    for alias, claims in alias_claims.items():
+        highest_priority = max(priority for priority, _destination in claims)
+        destinations = sorted(
+            {
+                str(destination)
+                for priority, destination in claims
+                if priority == highest_priority
+            }
+        )
+        if len(destinations) == 1:
+            alias_map[alias] = Path(destinations[0])
+            continue
+        conflicts.append(
+            {
+                'file': '',
+                'kind': 'ambiguous_alias',
+                'target': alias,
+                'reason': 'ambiguous',
+                'candidates': destinations,
+            }
+        )
+    return alias_map, conflicts
 
 
 def _relative_path_between(from_file: Path, to_file: Path, suffix: str = '') -> str:
@@ -652,7 +776,12 @@ def _is_static_local_fetch_reference(value: Any) -> bool:
 def _json_key_is_path_like(value: Any) -> bool:
     raw_token = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', _clean_text(value))
     token = re.sub(r'[^a-z0-9]+', '_', raw_token.lower()).strip('_')
-    return token in {'href', 'hrefs', 'poster', 'posters', 'src', 'srcs'} or bool(
+    return token in {
+        'href', 'hrefs', 'poster', 'posters', 'src', 'srcs',
+        'image', 'picture', 'photo', 'audio', 'sound', 'voice',
+        'video', 'movie', 'media', 'asset', 'artifact', 'font',
+        'style', 'stylesheet', 'script',
+    } or bool(
         JSON_PATH_KEY_RE.search(token)
     )
 
@@ -961,6 +1090,7 @@ def _include_linked_bundle_dependencies(
     all_artifacts: list[dict[str, Any]],
     *,
     allow_unregistered: bool = True,
+    response_id: str = '',
 ) -> list[dict[str, Any]]:
     if not selected_artifacts:
         return selected_artifacts
@@ -969,8 +1099,14 @@ def _include_linked_bundle_dependencies(
         source_path = _resolve_existing_file(artifact.get('source_path') or artifact.get('path'))
         if source_path is not None:
             artifacts_by_path[str(source_path.resolve(strict=False))] = artifact
+    authoritative_by_identity: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for artifact in all_artifacts:
+        identity = artifact_logical_identity(artifact)
+        if identity and artifact_is_current_authoritative(artifact, response_id=response_id):
+            authoritative_by_identity.setdefault(identity, []).append(artifact)
 
     result: list[dict[str, Any]] = []
+    result_by_source_path: dict[str, dict[str, Any]] = {}
     seen_paths: set[str] = set()
     queue: list[Path] = []
     for artifact in selected_artifacts:
@@ -982,7 +1118,10 @@ def _include_linked_bundle_dependencies(
             seen_paths.add(key)
             if source_path.suffix.lower().lstrip('.') in LINK_REFERENCE_EXTENSIONS:
                 queue.append(source_path)
-        result.append(artifact)
+        selected_artifact = dict(artifact)
+        result.append(selected_artifact)
+        if source_path is not None:
+            result_by_source_path[key] = selected_artifact
 
     scanned: set[str] = set()
     while queue:
@@ -1013,8 +1152,65 @@ def _include_linked_bundle_dependencies(
             )
             if not artifact:
                 continue
+            identity = artifact_logical_identity(artifact)
+            authoritative = authoritative_by_identity.get(identity, []) if identity else []
+            if identity and not authoritative:
+                matching_identities = [
+                    candidate_identity
+                    for candidate_identity in authoritative_by_identity
+                    if artifact_logical_identities_match(identity, candidate_identity)
+                ]
+                if len(matching_identities) == 1:
+                    authoritative = authoritative_by_identity[matching_identities[0]]
+            if authoritative:
+                referenced_dependency = dependency
+                top_rank = max(
+                    artifact_authority_rank(item, response_id=response_id)
+                    for item in authoritative
+                )
+                top = [
+                    item
+                    for item in authoritative
+                    if artifact_authority_rank(item, response_id=response_id) == top_rank
+                ]
+                top_paths = {
+                    str(_resolve_existing_file(item.get('source_path') or item.get('path')) or '')
+                    for item in top
+                }
+                top_paths.discard('')
+                if len(top_paths) != 1:
+                    # Conflicting current truth must not silently fall back to
+                    # an older same-directory file.
+                    continue
+                artifact = dict(top[0])
+                replacement_path = _resolve_existing_file(
+                    artifact.get('source_path') or artifact.get('path')
+                )
+                if replacement_path is None:
+                    continue
+                dependency = replacement_path
+                dependency_key = str(replacement_path.resolve(strict=False))
+                if dependency != referenced_dependency:
+                    aliases = [path_part, str(referenced_dependency)]
+                    if dependency_key in seen_paths:
+                        selected = result_by_source_path.get(dependency_key)
+                        if selected is not None:
+                            selected['bundle_source_aliases'] = list(
+                                dict.fromkeys(
+                                    [
+                                        *(selected.get('bundle_source_aliases') or []),
+                                        *aliases,
+                                    ]
+                                )
+                            )
+                        continue
+                    artifact['bundle_source_aliases'] = aliases
+                if dependency_key in seen_paths:
+                    continue
             seen_paths.add(dependency_key)
-            result.append(artifact)
+            selected_artifact = dict(artifact)
+            result.append(selected_artifact)
+            result_by_source_path[dependency_key] = selected_artifact
             if dependency.suffix.lower().lstrip('.') in LINK_REFERENCE_EXTENSIONS:
                 queue.append(dependency)
     return result
@@ -1161,6 +1357,7 @@ def bundle_response_artifacts(
             selected_artifacts,
             all_artifacts,
             allow_unregistered=allow_unregistered_linked_dependencies,
+            response_id=_clean_text(response_payload.get('id')),
         )
         if _is_bundleable_artifact(item)
     ]
@@ -1210,7 +1407,22 @@ def bundle_response_artifacts(
         copied_artifacts.append({key: value for key, value in record.items() if value not in (None, '', [], {})})
         copied_files.append(destination)
 
-    alias_map = _build_alias_map(copied_artifacts)
+    alias_map, alias_conflicts = _build_alias_map(
+        copied_artifacts,
+        source_artifacts=artifacts,
+        inventory_artifacts=all_artifacts,
+    )
+    referenced_aliases = {
+        _normalize_ref_key(value)
+        for path in copied_files
+        for _kind, value in _iter_local_refs(path)
+        if not _is_ignored_reference(value) and _normalize_ref_key(value)
+    }
+    referenced_alias_conflicts = [
+        conflict
+        for conflict in alias_conflicts
+        if _normalize_ref_key(conflict.get('target')) in referenced_aliases
+    ]
     rewritten_links: list[dict[str, Any]] = []
     for path in copied_files:
         rewritten_links.extend(_rewrite_text_file(path, alias_map))
@@ -1220,6 +1432,11 @@ def bundle_response_artifacts(
         item['size_bytes'] = final_path.stat().st_size
 
     link_check = _link_check(bundle_dir, copied_files)
+    if referenced_alias_conflicts:
+        for conflict in referenced_alias_conflicts:
+            conflict['file'] = str(bundle_dir)
+        link_check['missing'].extend(referenced_alias_conflicts)
+        link_check['status'] = 'failed'
     entrypoint_path = ''
     if entrypoint_artifact:
         for item in copied_artifacts:

@@ -65,11 +65,11 @@ class RuntimeLivenessTests(unittest.TestCase):
             )
         )
 
-    def test_fresh_failure_cooldown_makes_instance_temporarily_unselectable(self):
+    def test_live_instance_remains_selectable_during_failure_cooldown(self):
         now = dt.datetime(2026, 5, 23, 0, 0, tzinfo=dt.timezone.utc)
         cooldown_until = format_runtime_timestamp(now + dt.timedelta(seconds=120))
 
-        self.assertFalse(
+        self.assertTrue(
             runtime_instance_is_selectable(
                 {
                     'instance_id': 'helper-cooling-down',
@@ -84,6 +84,19 @@ class RuntimeLivenessTests(unittest.TestCase):
                 now=now,
             )
         )
+
+    def test_cooldown_without_positive_liveness_remains_unselectable(self):
+        self.assertFalse(runtime_instance_is_selectable({
+            'readiness': 'degraded', 'cooldown_until': '2099-01-01T00:00:00Z',
+        }, capability='chat'))
+
+    def test_live_truth_overrides_unavailable_state_labels(self):
+        for label in ('failed', 'stopped', 'degraded', 'loading'):
+            with self.subTest(label=label):
+                self.assertTrue(runtime_instance_is_selectable({
+                    'readiness': label, 'process_alive': True, 'port_listening': True,
+                    'cooldown_until': '2099-01-01T00:00:00Z',
+                }, capability='chat'))
 
     def test_ghost_payload_does_not_turn_live_degraded_into_runtime_issue(self):
         payload = build_ghost_payload(

@@ -87,6 +87,7 @@ from ollmo_services.responses import (
     extract_responses_prompt,
 )
 from ollmo_services.chat_history import read_chat_history, write_chat_history
+from ollmo_services.response_artifact_bundles import bundle_response_artifacts
 from ollmo_services.response_frames import (
     build_response_frame,
     load_latest_response_state,
@@ -125,6 +126,257 @@ def _passed_tts_audio_integrity_evidence(source_text, path):
 
 
 class ResponsesApiTests(unittest.TestCase):
+    def test_failed_composition_repair_is_superseded_only_by_fresh_applicable_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / 'app.js'
+            target.write_text('const roomImages = {};')
+            branch = {'branch_id': 'repair-app', 'status': 'failed', 'capability': 'chat', 'output_type': 'text',
+                'content_payload_source': 'closure_composed_site_image_composition',
+                'text_artifact_target_path': str(target), 'text_artifact_extension': 'js',
+                'error': {'code': 'TEXT_ARTIFACT_REPAIR_OUTPUT_MISSING'},
+                'recovery_state': {'status': 'candidate'}}
+            late_fill = {'failed_branches': [branch], 'completed_branches': []}
+            for review in (None, [{'evidence': 'image_missing'}]):
+                with patch.object(_LATE_FILL_RUNTIME, '_terminal_composed_site_image_composition_open_checks', return_value=review):
+                    self.assertEqual(_LATE_FILL_RUNTIME._supersede_resolved_composition_repairs({}, late_fill), late_fill)
+            with patch.object(_LATE_FILL_RUNTIME, '_terminal_composed_site_image_composition_open_checks', return_value=[]):
+                result = _LATE_FILL_RUNTIME._supersede_resolved_composition_repairs({}, late_fill)
+                self.assertEqual(result['failed_branches'], [])
+                done = result['completed_branches'][0]
+                self.assertEqual(done['status'], 'superseded')
+                self.assertEqual(done['superseded_failure']['error'], branch['error'])
+                self.assertNotIn('recovery_state', done)
+                self.assertTrue(done['supersession_evidence']['target_sha256'])
+                self.assertEqual(_LATE_FILL_RUNTIME._supersede_resolved_composition_repairs({}, result), result)
+                target.unlink()
+                self.assertEqual(_LATE_FILL_RUNTIME._supersede_resolved_composition_repairs({}, late_fill), late_fill)
+
+    def test_terminal_missing_pages_without_original_branches_queue_bounded_repairs(self):
+        prompt = 'Create a local hotel website with room detail pages.'
+        request = {'ghost_route': True, 'prompt': prompt}
+        route = {'capability': 'chat', 'route_source': 'ghost_carried'}
+        graph = build_request_phase_graph(prompt, request_payload=request, route_payload=route)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = str(Path(tmpdir).resolve())
+            index = Path(tmpdir) / 'index.html'
+            names = ['room_lake.html', 'room_garden.html', 'room_house.html']
+            html = '<!doctype html><html><body>' + ''.join(
+                f'<a href="{name}">Room details</a>' for name in names
+            ) + '</body></html>'
+            index.write_text(html)
+            payload = {
+                'id': 'resp_missing_room_pages', 'status': 'completed',
+                'runtime': {'request_phase_graph': graph},
+                'artifacts': [{'type': 'text', 'path': str(index), 'name': 'index',
+                    'mime_type': 'text/html', 'content': html, 'artifact_ref': 'artifact:index',
+                    'text_artifact_extension': 'html', 'text_artifact_source_name': 'index'}],
+                'late_fill': {'status': 'completed', 'completed_branches': [],
+                    'pending_branches': [], 'failed_branches': []},
+            }
+            checks = _LATE_FILL_RUNTIME._terminal_unresolved_local_dependency_link_open_checks(payload)
+            self.assertEqual(len(checks), 3)
+            updated, status = _LATE_FILL_RUNTIME.finalize_terminal_materialization_contract(
+                payload, terminal_status='completed', request_payload=request,
+                route_payload=route, artifact_gap={},
+            )
+            self.assertEqual(status, 'pending')
+            pending = updated['late_fill']['pending_branches']
+            self.assertEqual(len(pending), 3)
+            self.assertEqual({b['text_artifact_target_path'] for b in pending},
+                             {str(Path(tmpdir) / name) for name in names})
+            for branch in pending:
+                self.assertEqual(branch['promotion_source'], 'terminal_materialization_contract')
+                self.assertIn(str(index), branch['content_payload'])
+                self.assertTrue(branch['branch_id'].startswith('branch-repair-'))
+            # Historical/existing targets cannot acquire fresh retry identities.
+            for collection in ('pending_branches', 'failed_branches', 'cancelled_branches', 'completed_branches'):
+                with self.subTest(collection=collection):
+                    prior = {collection: [dict(b, status='failed') for b in pending]}
+                    result = _LATE_FILL_RUNTIME._demote_terminal_materialization_branches_with_open_checks(prior, checks)
+                    self.assertFalse(result.get('materialization_contract_current_demoted_branches'))
+            for name in names:
+                (Path(tmpdir) / name).write_text('<!doctype html><html><body>Room</body></html>')
+            self.assertEqual(_LATE_FILL_RUNTIME._terminal_unresolved_local_dependency_link_open_checks(payload), [])
+
+    def test_target_repair_identity_survives_retry_labels_and_rejects_old_writes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / 'app.js'
+            target.write_text('const image = "same.png";')
+            branch = {
+                'branch_id': 'repair-app', 'capability': 'chat',
+                'requires_artifact': True, 'output_type': 'text',
+                'text_artifact_extension': 'js', 'text_artifact_source_name': 'app',
+                'text_artifact_target_path': str(target),
+                'artifact_request': {'extension': 'js', 'source_name': 'app',
+                    'target_path': str(target), 'source': 'closure_composed_site_image_composition'},
+            }
+            payload = {'artifacts': [{'type': 'text', 'path': str(target),
+                'text_artifact_extension': 'js', 'text_artifact_source_name': 'app'}]}
+            for action in ('', 'retry_excluding_instance', 'retry_same_branch'):
+                with self.subTest(action=action):
+                    branch['suggested_action'] = action
+                    self.assertTrue(_LATE_FILL_RUNTIME._artifact_gap_is_authoritative_bounded_text_artifact_repair(branch))
+                    self.assertEqual(_LATE_FILL_RUNTIME._canonical_text_artifact_branch_fulfillment(branch, payload), {})
+                    self.assertFalse(_LATE_FILL_RUNTIME._text_artifact_branch_has_canonical_evidence(branch, payload))
+            record = {'branch_id': 'older-repair', 'saved_text_path': str(target),
+                      'text_artifact_source': 'target_path_authoritative_repair_output'}
+            payload['late_fill'] = {'fill_results': [record]}
+            self.assertFalse(_LATE_FILL_RUNTIME._text_artifact_branch_has_canonical_evidence(branch, payload))
+            record['branch_id'] = 'repair-app'
+            self.assertTrue(_LATE_FILL_RUNTIME._text_artifact_branch_has_canonical_evidence(branch, payload))
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_live_cooldown_routes_without_wait_but_dead_or_excluded_do_not(self, load, merge):
+        for dead, excluded in [(False, False), (True, False), (False, True)]:
+            with self.subTest(dead=dead, excluded=excluded):
+                instance = self._image_recovery_instance('cooling-image')
+                instance['runtime_status'].update({
+                    'process_alive': not dead, 'port_listening': not dead,
+                    'cooldown_until': '2099-01-01T00:00:00Z',
+                })
+                load.return_value = [instance]
+                merge.return_value = [instance]
+                payload, route, error = _resolve_late_fill_route(
+                    {'capability': 'image_generation', 'prompt': 'Generate the requested image.'},
+                    expected_capability='image_generation', failed_instance_id=None,
+                    excluded_instance_ids=['cooling-image'] if excluded else [],
+                    artifact_gap={}, source_route_payload=None,
+                )
+                diagnostics = payload.get('_late_fill_route_diagnostics', {})
+                self.assertNotIn('availability_wait', diagnostics)
+                if not dead and not excluded:
+                    self.assertIsNotNone(route)
+                    self.assertFalse(error)
+                else:
+                    self.assertIsNone(route)
+                    self.assertTrue(error)
+
+    def test_availability_wait_automatically_resumes_or_cancels_same_artifact_branch(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as tmpdir:
+                response_id = f'resp_availability_wait_{cancel}'
+                target = Path(tmpdir) / 'index.html'
+                branch = {
+                    'branch_id': 'repair-chat', 'phase_id': 'repair-chat',
+                    'capability': 'chat', 'output_type': 'text', 'status': 'pending',
+                    'stage_direction': 'materialize_requested_text_artifact',
+                    'requires_artifact': True,
+                    'text_artifact_extension': 'html', 'text_artifact_source_name': 'index',
+                    'text_artifact_target_path': str(target),
+                    'artifact_request': {'extension': 'html', 'source_name': 'index',
+                                         'target_path': str(target)},
+                    'auto_executable_repair_retry_count': 2,
+                }
+                graph = {'current_phase_id': 'phase-1', 'current_phase_resolution': 'graph_resolved',
+                         'phases': [{'phase_id': 'phase-1', 'capability': 'chat', 'status': 'completed'}, branch]}
+                payload = {'id': response_id, 'mode': 'chat', 'status': 'completed',
+                           'output_text': 'Repair pending.', 'runtime': {'request_phase_graph': graph},
+                           'late_fill': {'status': 'pending', 'expected_capability': 'chat',
+                                         'pending_branches': [dict(branch)]}}
+                clock = [time.time()]
+                calls = []
+                sleeps = []
+                snapshots = []
+
+                def execute(specs, **kwargs):
+                    calls.append(copy.deepcopy(specs))
+                    self.assertLessEqual(len(calls), 2)
+                    if len(calls) == 1:
+                        return {'branch_results': {}, 'prepared_branch_plans': [], 'branch_errors': {
+                            'repair-chat': {'code': 'INSTANCE_UNAVAILABLE', 'retryable': True,
+                                            'stage': 'prepare_branch_plan',
+                                            'message': 'No ready late-fill instance for capability chat.',
+                                            'route_diagnostics': {'availability_wait': {
+                                                'reason': 'live_candidates_in_cooldown',
+                                                'candidate_instance_ids': ['chat-live'],
+                                            }}}}}
+                    self.assertGreaterEqual(sum(sleeps), 5)
+                    self.assertEqual(specs[0]['branch_id'], 'repair-chat')
+                    target.write_text('<!doctype html><html><body><h1>Done</h1></body></html>')
+                    return {'branch_errors': {}, 'prepared_branch_plans': [], 'branch_results': {
+                        'repair-chat': {'route_info': {'instance_id': 'chat-live'},
+                                        'instance': {'instance_id': 'chat-live'}, 'effective_data': {},
+                                        'infer_result': {'mode': 'chat', 'saved_text_path': str(target),
+                                                         'text_artifact_extension': 'html',
+                                                         'text_artifact_source_name': 'index'}}}}
+
+                def sleep(seconds):
+                    self.assertGreater(seconds, 0)
+                    self.assertLessEqual(seconds, 1)
+                    sleeps.append(seconds)
+                    self.assertLessEqual(len(sleeps), 6)
+                    current = _RESPONSE_LOOKUP[response_id]['response_payload']['late_fill']
+                    snapshots.append(copy.deepcopy(current))
+                    self.assertEqual(current['status'], 'running')
+                    self.assertFalse(current.get('failed_branches'))
+                    waiting = current['pending_branches'][0]
+                    self.assertEqual(waiting['auto_executable_repair_retry_count'], 2)
+                    self.assertEqual(waiting['text_artifact_target_path'], str(target))
+                    self.assertEqual(waiting['availability_wait']['status'], 'waiting')
+                    status_payload = _build_response_status_lookup_payload(
+                        _RESPONSE_LOOKUP[response_id]
+                    )
+                    self.assertEqual(status_payload['late_fill']['pending_branches'][0]['progress_stage'],
+                                     'availability_wait')
+                    clock[0] += seconds
+
+                def gate(*args):
+                    return ({'action': 'skip', 'status': 'cancelled', 'reason': 'User cancelled.'}
+                            if cancel and sleeps else {'action': 'execute'})
+
+                with patch.object(_LATE_FILL_RUNTIME, 'execute_materialization_branches', side_effect=execute), \
+                     patch.object(_LATE_FILL_RUNTIME, 'semantic_execution_gate_decision', side_effect=gate), \
+                     patch('ollmo_server.late_fill_runtime.time.time', side_effect=lambda: clock[0]), \
+                     patch('ollmo_server.late_fill_runtime.time.sleep', side_effect=sleep), \
+                     patch.dict(os.environ, {'OLLMO_LATE_FILL_AVAILABILITY_POLL_SEC': '5'}):
+                    _complete_response_late_fill(
+                        response_payload=payload, request_payload={'prompt': 'Repair index.html.'},
+                        assistant_message=payload['output_text'],
+                        artifact_gap={'expected_capability': 'chat', 'pending_branches': [dict(branch)]},
+                        source_route_payload={'route_runtime': payload['runtime']},
+                    )
+                final = _RESPONSE_LOOKUP[response_id]['response_payload']['late_fill']
+                self.assertTrue(snapshots)
+                self.assertEqual(len(calls), 1 if cancel else 2)
+                self.assertFalse(final.get('failed_branches'))
+                self.assertFalse(final.get('pending_branches'))
+                records = final['cancelled_branches'] if cancel else final['completed_branches']
+                self.assertEqual(records[0]['branch_id'], 'repair-chat')
+                self.assertNotIn('availability_wait', records[0])
+                self.assertEqual(records[0]['auto_executable_repair_retry_count'], 2)
+                if not cancel:
+                    self.assertEqual(final['status'], 'completed')
+                    self.assertTrue(target.is_file())
+
+    def test_unavailable_preparation_recovery_survives_branch_normalization(self):
+        branch = {
+            'branch_id': 'repair-css', 'phase_id': 'repair-css', 'capability': 'chat',
+            'output_type': 'text', 'status': 'failed',
+            'text_artifact_target_path': '/synthetic/styles.css',
+            'error': {'code': 'INSTANCE_UNAVAILABLE', 'retryable': True,
+                      'stage': 'prepare_branch_plan'},
+            'recovery_context': {'can_retry': True, 'retry_scope': 'same_branch',
+                                 'suggested_action': 'retry_same_branch',
+                                 'availability_recheck_required': True},
+            'recovery_state': {'auto_execute': False, 'retry_scope': 'same_branch',
+                               'suggested_action': 'retry_same_branch',
+                               'availability_recheck_required': True},
+        }
+        normalized = _normalize_late_fill_branches([branch])[0]
+        self.assertTrue(normalized['recovery_context']['can_retry'])
+        self.assertTrue(normalized['recovery_context']['availability_recheck_required'])
+        self.assertTrue(normalized['recovery_state']['availability_recheck_required'])
+        self.assertFalse(_LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+            normalized, recovery_context=normalized['recovery_context'],
+        ))
+        retry, _, _, excluded = _build_late_fill_retry_wave_branch(
+            normalized, payload_body={}, anchor_branch_id='repair-css',
+        )
+        self.assertEqual(retry['branch_id'], 'repair-css')
+        self.assertEqual(retry['text_artifact_target_path'], '/synthetic/styles.css')
+        self.assertEqual(excluded, [])
+
     def setUp(self):
         app.config["TESTING"] = True
         self._live_runtime_snapshots = {}
@@ -1625,6 +1877,103 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(len(gap['pending_branches']), 3)
         self.assertEqual(gap['pending_capabilities'], ['image_generation'])
         self.assertEqual(gap['batch_prompts'], ['Prompt one', 'Prompt two', 'Prompt three'])
+
+    def test_build_pre_freeze_closure_review_gap_rejects_invalid_image_count_without_prompt_carrier(self):
+        phase_graph = {
+            'current_phase_id': 'phase-1',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'downstream_branches': [
+                {
+                    'branch_id': 'branch-image-1',
+                    'phase_id': 'phase-image-1',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'depends_on': ['phase-1'],
+                },
+                {
+                    'branch_id': 'branch-image-2',
+                    'phase_id': 'phase-image-2',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'depends_on': ['phase-1'],
+                },
+            ],
+            'phases': [
+                {'phase_id': 'phase-1', 'capability': 'chat', 'status': 'completed'},
+                {'phase_id': 'phase-image-1', 'capability': 'image_generation', 'depends_on': ['phase-1']},
+                {'phase_id': 'phase-image-2', 'capability': 'image_generation', 'depends_on': ['phase-1']},
+            ],
+            'prompt_intent': {'requested_visual_output_count': 'two images'},
+        }
+        preparation = 'Full preparation response with HTML, CSS, and room data.'
+
+        gap = _build_pre_freeze_closure_review_gap(
+            preparation,
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            request_payload={'ghost_route': True, 'prompt': 'Create images and a website.'},
+            artifact_payload={
+                'output_text': preparation,
+                'phase_payload': {
+                    'artifact_prompt': preparation,
+                    'artifact_prompt_source': 'full_display_text',
+                },
+                'runtime': {'request_phase_graph': phase_graph},
+            },
+        )
+
+        self.assertEqual(gap['branch_contract_error'], 'incomplete_image_prompt_batch')
+        self.assertEqual(
+            gap['candidate_extraction_issue'],
+            'invalid_image_prompt_batch_count',
+        )
+        self.assertTrue(gap['batch_prompt_expected_count_invalid'])
+        self.assertTrue(gap['materialization_blocked'])
+        self.assertTrue(gap['counted_batch_prompt_carriers_blocked'])
+        self.assertNotIn('artifact_prompt', gap)
+        self.assertNotIn('artifact_prompt_source', gap)
+        self.assertNotIn('batch_prompts', gap)
+
+    def test_planner_gap_rejects_invalid_image_count_without_value_error_or_fallback(self):
+        phase_graph = {
+            'current_phase_id': 'phase-chat',
+            'current_phase_capability': 'chat',
+            'current_phase_resolution': 'graph_resolved',
+            'phases': [
+                {'phase_id': 'phase-chat', 'capability': 'chat', 'status': 'completed'},
+                {
+                    'phase_id': 'phase-image-1',
+                    'branch_id': 'phase-image-1',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'depends_on': ['phase-chat'],
+                },
+                {
+                    'phase_id': 'phase-image-2',
+                    'branch_id': 'phase-image-2',
+                    'capability': 'image_generation',
+                    'output_type': 'image',
+                    'depends_on': ['phase-chat'],
+                },
+            ],
+            'prompt_intent': {'requested_visual_output_count': 'two images'},
+        }
+
+        gap = _build_planner_deferred_follow_up_gap_spec(
+            'Image prompt 1: a mountain.\nImage prompt 2: a lake.',
+            route_payload={'route_runtime': {'request_phase_graph': phase_graph}},
+            artifact_payload={},
+        )
+
+        self.assertIsInstance(gap, dict)
+        self.assertEqual(gap['branch_contract_error'], 'incomplete_image_prompt_batch')
+        self.assertEqual(gap['candidate_extraction_issue'], 'invalid_image_prompt_batch_count')
+        self.assertTrue(gap['batch_prompt_expected_count_invalid'])
+        self.assertTrue(gap['materialization_blocked'])
+        self.assertTrue(gap['counted_batch_prompt_carriers_blocked'])
+        self.assertNotIn('artifact_prompt', gap)
+        self.assertNotIn('content_payload', gap)
+        self.assertNotIn('batch_prompts', gap)
 
     def test_build_graph_closure_review_reports_pending_graph_state(self):
         phase_graph = {
@@ -7836,6 +8185,258 @@ class ResponsesApiTests(unittest.TestCase):
                 'passed',
             )
 
+    def test_retained_input_alias_materializes_byte_identically_without_model_call(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_path = root / '20260902T184249Z_text_mon-repos-rooms.json'
+            source_bytes = b'{\n  "property": "Mon Repos",\n  "minimum_nights": 2\n}\n'
+            source_path.write_bytes(source_bytes)
+            plan = {
+                'capability': 'chat',
+                'branch_id': 'branch-text-artifact-5',
+                'phase_id': 'phase-10',
+                'execution_contract': {
+                    'branch_id': 'branch-text-artifact-5',
+                    'phase_id': 'phase-10',
+                    'capability': 'chat',
+                    'output_type': 'text',
+                },
+                'route_info': {},
+                'instance': {},
+                'infer_payload': {},
+                'effective_data': {
+                    'stage_direction': 'materialize_retained_input_alias',
+                    'requires_artifact': True,
+                    'text_artifact_extension': 'json',
+                    'text_artifact_source_name': 'rooms',
+                    'text_artifact_source': 'retained_input_alias',
+                    'retained_input_alias_required': True,
+                    'retained_input_binding_state': 'bound',
+                    'retained_input_source_path': str(source_path),
+                    'retained_input_source_name': 'mon-repos-rooms.json',
+                    'retained_input_target_name': 'rooms.json',
+                    'input_artifacts': [
+                        {
+                            'type': 'text',
+                            'name': 'mon-repos-rooms.json',
+                            'path': str(source_path),
+                        }
+                    ],
+                    'artifact_request': {
+                        'extension': 'json',
+                        'source_name': 'rooms',
+                        'source': 'retained_input_alias',
+                        'retained_input_alias_required': True,
+                        'retained_input_binding_state': 'bound',
+                        'retained_input_source_path': str(source_path),
+                        'retained_input_source_name': 'mon-repos-rooms.json',
+                        'retained_input_target_name': 'rooms.json',
+                    },
+                },
+            }
+
+            with (
+                patch(
+                    'ollmo_server.late_fill_runtime.ARTIFACT_OUTPUTS_DOCUMENTS_DIR',
+                    root / 'documents',
+                ),
+                patch.object(
+                    _LATE_FILL_RUNTIME,
+                    'invoke_internal_api_json_route',
+                    side_effect=AssertionError('retained aliases must not call a model'),
+                ),
+            ):
+                result = _LATE_FILL_RUNTIME.execute_prepared_late_fill_branch(plan)
+
+            infer_result = result['infer_result']
+            target_path = Path(infer_result['saved_text_path'])
+            self.assertEqual(target_path.name, 'rooms.json')
+            self.assertEqual(target_path.read_bytes(), source_bytes)
+            self.assertTrue(infer_result['retained_input_byte_identical'])
+            self.assertEqual(
+                infer_result['retained_input_source_sha256'],
+                hashlib.sha256(source_bytes).hexdigest(),
+            )
+            self.assertEqual(
+                infer_result['retained_input_target_sha256'],
+                hashlib.sha256(source_bytes).hexdigest(),
+            )
+            self.assertEqual(
+                infer_result['text_artifact_source'],
+                'retained_input_alias_byte_copy',
+            )
+
+    def test_retained_input_alias_plan_bypasses_model_route_resolution(self):
+        resolve_route = Mock()
+        artifact_gap = {
+            'branch_id': 'branch-text-artifact-5',
+            'phase_id': 'phase-10',
+            'capability': 'chat',
+            'output_type': 'text',
+            'stage_direction': 'materialize_retained_input_alias',
+            'requires_artifact': True,
+            'text_artifact_extension': 'json',
+            'text_artifact_source_name': 'rooms',
+            'text_artifact_source': 'retained_input_alias',
+            'retained_input_alias_required': True,
+            'retained_input_binding_state': 'bound',
+            'retained_input_source_path': '/tmp/uploaded-rooms.json',
+            'retained_input_source_name': 'uploaded-rooms.json',
+            'retained_input_target_name': 'rooms.json',
+            'execution_contract': {
+                'branch_id': 'branch-text-artifact-5',
+                'phase_id': 'phase-10',
+                'capability': 'chat',
+                'output_type': 'text',
+            },
+        }
+
+        plan = _LATE_FILL_RUNTIME.prepare_late_fill_branch_plan(
+            expected_capability='chat',
+            artifact_gap=artifact_gap,
+            current_payload={},
+            request_payload={
+                'prompt': 'Retain the supplied data sheet as rooms.json.',
+                'input_artifacts': [
+                    {
+                        'type': 'text',
+                        'name': 'uploaded-rooms.json',
+                        'path': '/tmp/uploaded-rooms.json',
+                    }
+                ],
+            },
+            assistant_message='Preparing local files.',
+            source_route_payload=None,
+            failed_instance_id=None,
+            build_deferred_follow_up_gap_for_capability=(
+                lambda gap, **_kwargs: dict(gap)
+            ),
+            prepare_late_fill_request_payload=(
+                lambda request, **kwargs: {
+                    **dict(request),
+                    **dict(kwargs['artifact_gap']),
+                }
+            ),
+            resolve_late_fill_route=resolve_route,
+        )
+
+        resolve_route.assert_not_called()
+        self.assertEqual(
+            plan['route_info']['route_source'],
+            'deterministic_retained_input_alias',
+        )
+        self.assertEqual(plan['infer_payload'], {})
+        self.assertEqual(
+            plan['effective_data']['retained_input_target_name'],
+            'rooms.json',
+        )
+
+    def test_retained_input_alias_rejects_source_not_admitted_as_current_input(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / 'private.json'
+            source_path.write_text('{"private": true}\n', encoding='utf-8')
+            contract = {
+                'stage_direction': 'materialize_retained_input_alias',
+                'text_artifact_extension': 'json',
+                'text_artifact_source_name': 'rooms',
+                'retained_input_alias_required': True,
+                'retained_input_binding_state': 'bound',
+                'retained_input_source_path': str(source_path),
+                'retained_input_source_name': 'private.json',
+                'retained_input_target_name': 'rooms.json',
+            }
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'RETAINED_INPUT_ALIAS_SOURCE_NOT_ADMITTED',
+            ):
+                _LATE_FILL_RUNTIME._materialize_retained_input_alias(
+                    {'effective_data': {}},
+                    contract,
+                )
+
+    def test_retained_input_alias_accepts_direct_current_input_path_carriers(self):
+        for carrier in ('file_path', 'route_artifact_path'):
+            with self.subTest(carrier=carrier), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                source_path = root / 'direct-source.json'
+                source_bytes = b'{"property":"Mon Repos","rooms":3}\n'
+                source_path.write_bytes(source_bytes)
+                contract = {
+                    'stage_direction': 'materialize_retained_input_alias',
+                    'text_artifact_extension': 'json',
+                    'text_artifact_source_name': 'rooms',
+                    'retained_input_alias_required': True,
+                    'retained_input_binding_state': 'bound',
+                    'retained_input_source_path': str(source_path),
+                    'retained_input_source_name': 'direct-source.json',
+                    'retained_input_target_name': 'rooms.json',
+                }
+                plan = {
+                    'effective_data': {
+                        **contract,
+                        carrier: str(source_path),
+                    }
+                }
+
+                with patch(
+                    'ollmo_server.late_fill_runtime.ARTIFACT_OUTPUTS_DOCUMENTS_DIR',
+                    root / 'documents',
+                ):
+                    result = _LATE_FILL_RUNTIME._materialize_retained_input_alias(
+                        plan,
+                        contract,
+                    )
+
+                target_path = Path(result['saved_text_path'])
+                self.assertEqual(target_path.name, 'rooms.json')
+                self.assertEqual(target_path.read_bytes(), source_bytes)
+                self.assertTrue(result['retained_input_byte_identical'])
+
+    def test_retained_input_alias_rejects_conflicting_plan_carriers(self):
+        plan = {
+            'effective_data': {
+                'stage_direction': 'materialize_retained_input_alias',
+                'retained_input_alias_required': True,
+                'retained_input_binding_state': 'bound',
+                'retained_input_source_path': '/uploads/east.json',
+                'retained_input_target_name': 'rooms.json',
+            },
+            'branch': {
+                'stage_direction': 'materialize_retained_input_alias',
+                'retained_input_alias_required': True,
+                'retained_input_binding_state': 'bound',
+                'retained_input_source_path': '/uploads/west.json',
+                'retained_input_target_name': 'rooms.json',
+            },
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'RETAINED_INPUT_ALIAS_CONTRACT_CONFLICT',
+        ):
+            _LATE_FILL_RUNTIME._retained_input_alias_contract_from_plan(plan)
+
+    def test_retained_input_alias_rejects_unsafe_target_names(self):
+        for target_name in ('../rooms.json', '/tmp/rooms.json'):
+            with self.subTest(target_name=target_name):
+                contract = {
+                    'stage_direction': 'materialize_retained_input_alias',
+                    'text_artifact_extension': 'json',
+                    'retained_input_alias_required': True,
+                    'retained_input_binding_state': 'bound',
+                    'retained_input_source_path': '/uploads/source.json',
+                    'retained_input_target_name': target_name,
+                }
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    'RETAINED_INPUT_ALIAS_TARGET_INVALID',
+                ):
+                    _LATE_FILL_RUNTIME._materialize_retained_input_alias(
+                        {'effective_data': {}},
+                        contract,
+                    )
+
     def test_text_revision_preservation_blocks_shared_css_truncation_before_write(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             target_path = Path(tmpdir) / 'styles.css'
@@ -8355,11 +8956,7 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(outputs[1]["status"], "pending")
         self.assertEqual(outputs[1]["slot_id"], "output-phase-2")
         self.assertEqual(outputs[1]["branch_id"], "branch-image_generation-1")
-        self.assertEqual(payload["response_frame"]["output"]["outputs"][1]["slot_id"], "output-phase-2")
-        self.assertEqual(
-            payload["response_frame"]["output"]["outputs"][1]["branch_id"],
-            "branch-image_generation-1",
-        )
+        self.assertNotIn("response_frame", payload)
 
     @patch("ollmo_webserver._schedule_response_late_fill", return_value=True)
     @patch("ollmo_webserver._execute_chat_backend_request")
@@ -11980,10 +12577,9 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(lookup_payload["late_fill"]["fill_instance_id"], "flux-1")
         self.assertEqual(lookup_payload["saved_image_path"], "/tmp/generated/late-fill-cove.png")
         self.assertEqual(lookup_payload["artifacts"][0]["path"], "/tmp/generated/late-fill-cove.png")
-        self.assertEqual(
-            lookup_payload["response_frame"]["planning"]["artifact_flow"]["output_slots"][0]["status"],
-            "fulfilled",
-        )
+        self.assertNotIn("response_frame", lookup_payload)
+        image_slot = next(slot for slot in lookup_payload["output_slots"] if slot["type"] == "image")
+        self.assertEqual(image_slot["status"], "fulfilled")
 
     @patch("ollmo_webserver._invoke_internal_api_json_route")
     @patch("ollmo_webserver._schedule_response_late_fill")
@@ -12149,7 +12745,8 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(audio_fill["lang_code_source"], "explicit")
         self.assertEqual(audio_fill["response_format"], "wav")
         self.assertEqual(audio_fill["output_format"], "wav")
-        output_slots = lookup_payload["response_frame"]["planning"]["artifact_flow"]["output_slots"]
+        self.assertNotIn("response_frame", lookup_payload)
+        output_slots = lookup_payload["output_slots"]
         audio_slot = next(slot for slot in output_slots if slot["type"] == "audio")
         self.assertEqual(audio_slot["status"], "fulfilled")
         infer_payload = mock_invoke.call_args.kwargs["payload"]
@@ -13772,6 +14369,8 @@ class ResponsesApiTests(unittest.TestCase):
                 "pending_branches": list(branches),
             },
         }
+        from ollmo_services import events as transition_events
+        transition_records = []
         live_snapshots = []
 
         def execute_materialization_branches(_branch_specs, **kwargs):
@@ -13824,7 +14423,10 @@ class ResponsesApiTests(unittest.TestCase):
             _LATE_FILL_RUNTIME,
             "execute_materialization_branches",
             side_effect=execute_materialization_branches,
-        ):
+        ), patch.object(transition_events, 'CAUSAL_RECORD_LIMIT', 0), \
+                transition_events.causal_scope(
+                    lambda **entry: transition_records.append(copy.deepcopy(entry['causal_event'])),
+                    response_id=response_id):
             _complete_response_late_fill(
                 response_payload=response_payload,
                 request_payload={"prompt": prompt},
@@ -13858,6 +14460,19 @@ class ResponsesApiTests(unittest.TestCase):
             {item["branch_id"] for item in terminal_late_fill.get("completed_branches") or []},
             {"branch-image-1", "branch-image-2"},
         )
+
+        measured = [item for item in transition_records
+                    if item.get('record_kind') == 'transition_boundary'
+                    and item.get('boundary') == 'exit']
+        for section in ('progress_record', 'lookup', 'state_build', 'publication'):
+            witnesses = [item for item in measured
+                         if item['owner'] == 'late_fill.callback.' + section]
+            self.assertEqual(len(witnesses), 1)
+            self.assertEqual(witnesses[0]['target'], {
+                'response_id': response_id, 'branch_id': 'branch-image-1',
+                'phase_id': 'phase-image-1'})
+            self.assertEqual(witnesses[0]['outcome'], 'returned')
+        self.assertTrue(any(item['owner'] == 'late_fill.initial_lookup' for item in measured))
 
     def test_coalesced_required_text_artifact_subset_leaves_repair_branch_separate(self):
         def branch_spec(branch_id, phase_id, extension, source_name):
@@ -15997,7 +16612,8 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(lookup_payload["status"], "failed")
         self.assertEqual(lookup_payload["late_fill"]["status"], "failed")
         self.assertIn("image backend unavailable", lookup_payload["late_fill"]["error"])
-        output_slots = lookup_payload["response_frame"]["planning"]["artifact_flow"]["output_slots"]
+        self.assertNotIn("response_frame", lookup_payload)
+        output_slots = lookup_payload["output_slots"]
         image_slot = next(slot for slot in output_slots if slot["type"] == "image")
         self.assertEqual(image_slot["status"], "blocked")
         self.assertIn("image backend unavailable", image_slot["blocked_reason"])
@@ -16154,8 +16770,9 @@ class ResponsesApiTests(unittest.TestCase):
             [item["path"] for item in lookup_payload.get("artifacts") or [] if item.get("type") == "image"],
             ["/tmp/generated/scene-1.png"],
         )
+        self.assertNotIn("response_frame", lookup_payload)
         image_slots = [
-            slot for slot in lookup_payload["response_frame"]["planning"]["artifact_flow"]["output_slots"]
+            slot for slot in lookup_payload["output_slots"]
             if slot["type"] == "image"
         ]
         self.assertEqual([slot["status"] for slot in image_slots], ["fulfilled", "blocked"])
@@ -22893,6 +23510,7 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 'capability': 'image_generation',
                 'output_type': 'image',
                 'queue_index': 4,
+                'depends_on': ['phase-prepare'],
                 'depends_on': ['phase-1'],
             },
             {
@@ -23221,6 +23839,178 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             rebinds = updated['late_fill']['linked_artifact_rebinds']
             self.assertEqual(rebinds[0]['status'], 'applied')
             self.assertGreaterEqual(rebinds[0]['change_count'], 2)
+
+    def test_terminal_linked_artifact_rebind_replaces_existing_stale_named_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            documents = Path(tmpdir) / 'documents'
+            documents.mkdir()
+            index_path = documents / '20260903_index.html'
+            stale_css_path = documents / 'styles.css'
+            stale_js_path = documents / 'app.js'
+            canonical_css_path = documents / '20260903_styles.css'
+            canonical_js_path = documents / '20260903_app.js'
+            image_path = Path(tmpdir) / 'hero.png'
+            index_path.write_text(
+                '<link rel="stylesheet" href="styles.css">'
+                '<script src="app.js"></script>',
+                encoding='utf-8',
+            )
+            stale_css_path.write_text('body { color: red; }', encoding='utf-8')
+            stale_js_path.write_text('window.version = "stale";', encoding='utf-8')
+            canonical_css_path.write_text('body { color: green; }', encoding='utf-8')
+            canonical_js_path.write_text('window.version = "canonical";', encoding='utf-8')
+            image_path.write_bytes(b'png')
+
+            payload = {
+                'id': 'resp_terminal_rebind_existing_stale_named_dependencies',
+                'runtime': {
+                    'request_phase_graph': {
+                        'phases': [
+                            {
+                                'phase_id': 'phase-image',
+                                'branch_id': 'branch-image',
+                                'capability': 'image_generation',
+                                'output_type': 'image',
+                                'requires_artifact': True,
+                            },
+                            {
+                                'phase_id': 'phase-index',
+                                'branch_id': 'branch-index',
+                                'capability': 'chat',
+                                'output_type': 'text',
+                                'depends_on': ['phase-image'],
+                                'dependency_contract': 'local_visual_asset_binding',
+                            },
+                        ],
+                    },
+                },
+                'artifacts': [
+                    {
+                        'type': 'text',
+                        'path': str(index_path),
+                        'name': 'index',
+                        'artifact_ref': 'artifact:index',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(stale_css_path),
+                        'name': 'styles',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(stale_js_path),
+                        'name': 'app',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(canonical_css_path),
+                        'name': 'styles',
+                        'artifact_ref': 'artifact:styles',
+                    },
+                    {
+                        'type': 'text',
+                        'path': str(canonical_js_path),
+                        'name': 'app',
+                        'artifact_ref': 'artifact:app',
+                    },
+                    {
+                        'type': 'image',
+                        'path': str(image_path),
+                        'artifact_ref': 'artifact:hero',
+                        'branch_id': 'branch-image',
+                        'phase_id': 'phase-image',
+                    },
+                ],
+                'output_slots': [
+                    {
+                        'slot_id': 'output-index',
+                        'branch_id': 'branch-index',
+                        'phase_id': 'phase-index',
+                        'artifact_ref': 'artifact:index',
+                        'status': 'fulfilled',
+                    },
+                    {
+                        'slot_id': 'output-styles',
+                        'branch_id': 'branch-styles',
+                        'phase_id': 'phase-styles',
+                        'artifact_ref': 'artifact:styles',
+                        'status': 'fulfilled',
+                    },
+                    {
+                        'slot_id': 'output-app',
+                        'branch_id': 'branch-app',
+                        'phase_id': 'phase-app',
+                        'artifact_ref': 'artifact:app',
+                        'status': 'fulfilled',
+                    },
+                    {
+                        'slot_id': 'output-hero',
+                        'branch_id': 'branch-image',
+                        'phase_id': 'phase-image',
+                        'artifact_ref': 'artifact:hero',
+                        'status': 'fulfilled',
+                    },
+                ],
+                'late_fill': {
+                    'status': 'completed',
+                    'fill_results': [
+                        {
+                            'branch_id': 'branch-styles',
+                            'phase_id': 'phase-styles',
+                            'saved_text_path': str(canonical_css_path),
+                            'text_artifact_extension': 'css',
+                            'text_artifact_source_name': 'styles',
+                        },
+                        {
+                            'branch_id': 'branch-app',
+                            'phase_id': 'phase-app',
+                            'saved_text_path': str(canonical_js_path),
+                            'text_artifact_extension': 'js',
+                            'text_artifact_source_name': 'app',
+                        },
+                    ],
+                },
+            }
+
+            updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+
+            html = index_path.read_text(encoding='utf-8')
+            self.assertIn(f'href="{canonical_css_path.name}"', html)
+            self.assertIn(f'src="{canonical_js_path.name}"', html)
+            self.assertNotIn('href="styles.css"', html)
+            self.assertNotIn('src="app.js"', html)
+            index_rebind = next(
+                item
+                for item in updated['late_fill']['linked_artifact_rebinds']
+                if item['target_path'] == str(index_path)
+            )
+            self.assertEqual(
+                [change['linked_path'] for change in index_rebind['changes']],
+                [str(canonical_css_path), str(canonical_js_path)],
+            )
+
+            bundle = bundle_response_artifacts(
+                updated,
+                bundle_root=Path(tmpdir) / 'bundles',
+                created_at='2026-09-03T20:00:00Z',
+            )
+            copied_by_source = {
+                item['source_path']: Path(item['path'])
+                for item in bundle['copied_artifacts']
+            }
+            bundled_index = Path(bundle['entrypoint'])
+            bundled_html = bundled_index.read_text(encoding='utf-8')
+            bundled_css = copied_by_source[str(canonical_css_path.resolve())]
+            bundled_js = copied_by_source[str(canonical_js_path.resolve())]
+            self.assertIn(
+                f'href="{os.path.relpath(bundled_css, bundled_index.parent)}"',
+                bundled_html,
+            )
+            self.assertIn(
+                f'src="{os.path.relpath(bundled_js, bundled_index.parent)}"',
+                bundled_html,
+            )
+            self.assertEqual(bundle['link_check']['status'], 'passed')
 
     def test_terminal_linked_artifact_rebind_uses_exact_named_static_fetch_outside_visual_dependencies(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -25045,17 +25835,26 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 terminal_status='completed',
             )
             late_fill = updated['late_fill']
-            self.assertEqual(effective_status, 'partial_failed')
+            self.assertEqual(effective_status, 'pending')
+            self.assertEqual(late_fill['status'], 'pending')
             self.assertEqual(late_fill['final_materialization_contract_status'], 'unmet')
             self.assertTrue(late_fill['materialization_contract_unmet'])
             self.assertEqual(html_path.read_text(encoding='utf-8'), duplicate_html)
             self.assertNotIn('composed_page_image_representation_repair_status', late_fill)
-            self.assertTrue(
-                any(
-                    item.get('check_kind') == 'linked_artifact_binding'
-                    and item.get('evidence') == 'unresolved_linked_artifact_binding'
-                    for item in late_fill['materialization_contract_open_checks']
-                )
+            pending_html = [
+                item
+                for item in late_fill['pending_branches']
+                if item.get('text_artifact_extension') == 'html'
+            ]
+            self.assertEqual(len(pending_html), 1)
+            self.assertEqual(
+                Path(pending_html[0]['artifact_request']['target_path']).resolve(strict=False),
+                html_path.resolve(strict=False),
+            )
+            self.assertEqual(pending_html[0]['repair_action'], 'rebind_dependency_evidence')
+            self.assertEqual(
+                pending_html[0]['content_payload_source'],
+                'closure_linked_artifact_binding_review',
             )
 
     def test_terminal_materialization_contract_blocks_missing_local_stylesheet_link(self):
@@ -25147,28 +25946,24 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
 
             late_fill = updated['late_fill']
             expected_styles_target = str(missing_styles_path.resolve(strict=False))
-            self.assertEqual(effective_status, 'partial_failed')
+            self.assertEqual(effective_status, 'pending')
+            self.assertEqual(late_fill['status'], 'pending')
             self.assertEqual(late_fill['final_materialization_contract_status'], 'unmet')
             self.assertTrue(late_fill['materialization_contract_unmet'])
             self.assertFalse(missing_styles_path.exists())
-            open_checks = late_fill['materialization_contract_open_checks']
-            self.assertTrue(
-                any(
-                    item.get('check_kind') == 'linked_artifact_binding'
-                    and item.get('evidence') == 'unresolved_local_dependency_link'
-                    and item.get('text_artifact_extension') == 'css'
-                    and item.get('text_artifact_target_path') == expected_styles_target
-                    for item in open_checks
-                )
-            )
             pending_css = [
                 item
                 for item in late_fill['pending_branches']
                 if item.get('text_artifact_extension') == 'css'
             ]
             self.assertEqual(len(pending_css), 1)
+            self.assertEqual(pending_css[0]['repair_action'], 'rebind_dependency_evidence')
             self.assertEqual(pending_css[0]['content_payload_source'], 'closure_local_dependency_link_review')
             self.assertEqual(pending_css[0]['artifact_request']['target_path'], expected_styles_target)
+            self.assertIn(
+                'Dependency consumer file content (diagnostic context only; not target bytes):',
+                pending_css[0]['content_payload'],
+            )
 
     def test_terminal_materialization_contract_repairs_generated_page_image_not_represented(self):
         prompt = (
@@ -25663,17 +26458,33 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
 
             late_fill = updated['late_fill']
             html = html_path.read_text(encoding='utf-8')
-            self.assertEqual(effective_status, 'partial_failed')
+            self.assertEqual(effective_status, 'pending')
+            self.assertEqual(late_fill['status'], 'pending')
             self.assertEqual(late_fill['final_materialization_contract_status'], 'unmet')
             self.assertTrue(late_fill['materialization_contract_unmet'])
             self.assertNotIn('data-ollmo-repair', html)
             self.assertNotIn(f'../images/{image_paths[2].name}', html)
-            self.assertTrue(
-                any(
-                    check.get('check_kind') == 'composed_page_image_representation'
-                    for check in late_fill['materialization_contract_open_checks']
-                )
+            pending_html = [
+                item
+                for item in late_fill['pending_branches']
+                if item.get('text_artifact_extension') == 'html'
+            ]
+            pending_css = [
+                item
+                for item in late_fill['pending_branches']
+                if item.get('text_artifact_extension') == 'css'
+            ]
+            self.assertEqual(len(pending_html), 1)
+            self.assertFalse(pending_css)
+            self.assertEqual(
+                Path(pending_html[0]['artifact_request']['target_path']).resolve(strict=False),
+                html_path.resolve(strict=False),
             )
+            self.assertEqual(
+                pending_html[0]['content_payload_source'],
+                'closure_linked_artifact_binding_review',
+            )
+            self.assertIn(image_paths[2].name, pending_html[0]['content_payload'])
 
     def test_terminal_materialization_contract_repairs_hero_without_generated_image(self):
         prompt = (
@@ -26130,7 +26941,7 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         }
         return prompt, graph, payload, index_path, styles_path, image_paths
 
-    def test_authoritative_web_binding_repair_cannot_reuse_existing_target(self):
+    def test_authoritative_composed_site_image_repair_cannot_reuse_existing_target(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / 'pricing.json'
             original = '{"materials":[{"name":"Linen","price":120}]}\n'
@@ -26147,15 +26958,15 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                 'stage_direction': 'materialize_requested_text_artifact',
                 'requires_artifact': True,
                 'repair_action': 'retry_same_branch',
-                'content_payload_source': 'terminal_web_runtime_binding_review',
-                'text_artifact_source': 'closure_web_binding_repair',
+                'content_payload_source': 'closure_composed_site_image_composition',
+                'text_artifact_source': 'closure_composed_site_image_composition',
                 'text_artifact_extension': 'json',
                 'text_artifact_source_name': 'pricing',
                 'text_artifact_target_path': str(target),
                 'artifact_request': {
                     'extension': 'json',
                     'source_name': 'pricing',
-                    'source': 'closure_web_binding_repair',
+                    'source': 'closure_composed_site_image_composition',
                     'target_path': str(target),
                 },
             }
@@ -27071,7 +27882,7 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
 
     def test_terminal_materialization_contract_keeps_real_syntax_sanity_defects_blocking(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            prompt, graph, payload, _index_path, _styles_path, _image_paths = (
+            prompt, graph, payload, _index_path, styles_path, _image_paths = (
                 self._terminal_materialization_contract_payload_with_stale_open_checks(
                     Path(tmpdir),
                     unrepaired_css=True,
@@ -27087,18 +27898,11 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             )
 
             late_fill = updated['late_fill']
-            self.assertEqual(effective_status, 'partial_failed')
-            self.assertEqual(late_fill['status'], 'partial_failed')
+            self.assertEqual(effective_status, 'pending')
+            self.assertEqual(late_fill['status'], 'pending')
             self.assertEqual(late_fill['final_materialization_contract_status'], 'unmet')
             self.assertTrue(late_fill['materialization_contract_unmet'])
             self.assertTrue(
-                any(
-                    item.get('check_kind') == 'text_artifact_syntax_sanity'
-                    and item.get('evidence') == 'text_artifact_syntax_issue'
-                    for item in late_fill['materialization_contract_open_checks']
-                )
-            )
-            self.assertFalse(
                 any(
                     branch.get('branch_id') == 'branch-repair-chat-1'
                     and branch.get('status') == 'fulfilled'
@@ -27106,17 +27910,22 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
                     if isinstance(branch, dict)
                 )
             )
-            self.assertTrue(
-                any(
-                    branch.get('branch_id') == 'branch-repair-chat-1'
-                    and branch.get('status') in {'repair_needed', 'pending', 'failed', 'blocked'}
-                    for branch in (
-                        list(late_fill.get('pending_branches') or [])
-                        + list(late_fill.get('failed_branches') or [])
-                        + list(late_fill.get('completed_branches') or [])
-                    )
-                    if isinstance(branch, dict)
-                )
+            pending_css = [
+                branch
+                for branch in late_fill.get('pending_branches') or []
+                if isinstance(branch, dict)
+                and branch.get('text_artifact_extension') == 'css'
+            ]
+            self.assertEqual(len(pending_css), 1)
+            self.assertTrue(pending_css[0]['branch_id'].startswith('branch-repair-'))
+            self.assertNotEqual(pending_css[0]['branch_id'], 'branch-repair-chat-1')
+            self.assertEqual(
+                Path(pending_css[0]['artifact_request']['target_path']).resolve(strict=False),
+                styles_path.resolve(strict=False),
+            )
+            self.assertEqual(
+                pending_css[0]['content_payload_source'],
+                'closure_text_artifact_syntax_sanity',
             )
 
     def test_terminal_materialization_contract_checks_final_saved_html_bytes(self):
@@ -28956,6 +29765,306 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertEqual(finalized['lifecycle_state'], 'completed')
         self.assertFalse(finalized['status_semantics']['has_actionable_repair'])
 
+    def test_terminal_artifact_path_identity_only_settles_proven_file_alias(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            target = root / 'retained_input/rooms.json'
+            other = root / 'other/rooms.json'
+            for path in (target, other):
+                path.parent.mkdir()
+                path.write_text('{"rooms": []}', encoding='utf-8')
+            for same_file in (True, False):
+                with self.subTest(same_file=same_file):
+                    relative = os.path.relpath(
+                        target if same_file else other,
+                        Path(__file__).resolve().parent.parent,
+                    )
+                    owner = {'branch_id': 'branch-text_artifact-5', 'phase_id': 'phase-10'}
+                    payload = {
+                        'id': 'resp-terminal-path-identity', 'status': 'completed',
+                        'lifecycle_state': 'repair_needed', 'output_text': 'Rooms data saved.',
+                        'artifacts': [
+                            {**owner, 'type': 'text', 'path': path,
+                             'artifact_ref': 'artifact:rooms',
+                             'source_response_id': 'resp-terminal-path-identity'}
+                            for path in (str(target), relative)
+                        ],
+                        'output_slots': [{**owner, 'slot_id': 'output-phase-10',
+                            'type': 'text', 'status': 'fulfilled',
+                            'lifecycle': 'materialized_output', 'artifact_ref': 'artifact:rooms'}],
+                        'late_fill': {
+                            'status': 'partial_failed', 'partial_failure': True,
+                            'final_materialization_contract_status': 'fulfilled',
+                            'completed_branches': [{**owner, 'capability': 'chat', 'status': 'fulfilled'}],
+                            'pending_branches': [], 'active_branches': [], 'failed_branches': [],
+                        },
+                    }
+                    # A saved parent's conflict remains historical evidence;
+                    # only this newly validated projection may settle it.
+                    payload['response_frame'] = {
+                        'response_id': payload['id'],
+                        'frame_id': f"{payload['id']}:frame-1", 'frame_sequence': 1,
+                        'current_state': {'lifecycle_state': 'repair_needed'},
+                        'output': {'artifact_identity': {
+                            'canonicalization_required': True, 'final_projection_blocked': True,
+                            'conflicts': [{'artifact_ref': 'artifact:rooms',
+                                'reason': 'conflicting_duplicate_artifact_ref',
+                                'paths': [str(target), relative], 'types': ['text']}],
+                        }},
+                    }
+                    original = copy.deepcopy(payload)
+                    updated, effective_status = _LATE_FILL_RUNTIME.finalize_terminal_materialization_contract(
+                        copy.deepcopy(payload), request_payload={'prompt': 'Return the saved rooms data.'},
+                        route_payload={}, artifact_gap={}, terminal_status='partial_failed',
+                    )
+                    finalized = _finalize_response_frame_payload(
+                        updated, request_payload={'prompt': 'Return the saved rooms data.'}, persist=True,
+                    )
+                    frame = finalized['response_frame']
+                    self.assertEqual(frame['frame_relation']['parent_frame_id'], original['response_frame']['frame_id'])
+                    self.assertGreater(frame['frame_sequence'], original['response_frame']['frame_sequence'])
+                    self.assertEqual(effective_status, 'completed')
+                    self.assertEqual(updated['late_fill']['status'], 'completed')
+                    self.assertEqual(frame['output']['artifact_identity']['final_projection_blocked'], not same_file)
+                    for outputs in (frame['output']['outputs'], finalized['outputs']):
+                        output = next(item for item in outputs if item.get('artifact_ref') == 'artifact:rooms')
+                        self.assertEqual(output['status'], 'fulfilled' if same_file else 'repair_needed')
+                        self.assertEqual(output['branch_id'], owner['branch_id'])
+                        self.assertEqual(output['phase_id'], owner['phase_id'])
+                    for state in (finalized, frame['current_state']):
+                        self.assertEqual(state['lifecycle_state'], 'completed' if same_file else 'repair_needed')
+                        self.assertEqual(state['status_semantics']['has_actionable_repair'], not same_file)
+                    frames_dir = self._response_frames_dir / str(same_file)
+                    persist_response_frame(frame, frames_dir=frames_dir)
+                    recovered = load_latest_response_state(payload['id'], frames_dir=frames_dir)
+                    recovered_output = next(
+                        item for item in recovered['response_payload']['outputs']
+                        if item.get('artifact_ref') == 'artifact:rooms'
+                    )
+                    self.assertEqual(recovered_output['status'], 'fulfilled' if same_file else 'repair_needed')
+                    self.assertEqual(payload, original)
+                    self.assertEqual(target.read_bytes(), other.read_bytes())
+
+    def test_artifact_path_identity_lifecycle_preserves_execution_and_terminal_boundaries(self):
+        conflict = {
+            'artifact_ref': 'artifact:rooms', 'status': 'repair_needed',
+            'blocked_reason': 'conflicting_duplicate_artifact_ref', 'final_projection_blocked': True,
+        }
+        for lifecycle, late_status, expected in (
+            ('completed', 'completed', 'repair_needed'),
+            ('repair_needed', 'running', 'late_fill_running'),
+            ('cancelled', 'completed', 'cancelled'),
+            ('failed', 'completed', 'failed'),
+            ('waived', 'completed', 'waived'),
+            ('superseded', 'completed', 'superseded'),
+        ):
+            with self.subTest(lifecycle=lifecycle, late_status=late_status):
+                self.assertEqual(derive_response_lifecycle_state({
+                    'status': 'completed', 'lifecycle_state': lifecycle,
+                    'outputs': [conflict], 'late_fill': {'status': late_status},
+                }), expected)
+        self.assertEqual(derive_response_lifecycle_state({
+            'status': 'completed', 'lifecycle_state': 'repair_needed',
+            'outputs': [{'artifact_ref': 'artifact:rooms', 'status': 'fulfilled'}],
+            'late_fill': {'status': 'completed'},
+            'runtime': {'graph_closure_review': {'status': 'pending', 'continuation_required': True}},
+        }), 'repair_needed')
+        for invalid_outputs in (None, 1, 'repair_needed', {'status': 'repair_needed'}):
+            with self.subTest(invalid_outputs=invalid_outputs):
+                self.assertEqual(derive_response_lifecycle_state({
+                    'status': 'completed', 'outputs': invalid_outputs,
+                }), 'completed')
+
+    def test_terminal_link_rebind_write_settles_single_pending_text_branch(self):
+        # Minimized from the four-image Hive fixture: a real deterministic
+        # write must carry enough branch evidence for reconciliation to settle.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            html_path = root / 'index.html'
+            image_path = root / 'image.png'
+            html_path.write_text(
+                '<html><body><img src="https://via.placeholder.com/100"></body></html>',
+                encoding='utf-8',
+            )
+            image_path.write_bytes(b'png')
+            branch = {
+                'branch_id': 'branch-text_artifact-1',
+                'capability': 'chat',
+                'output_type': 'text',
+                'status': 'repair_needed',
+                'repair_action': 'rebind_dependency_evidence',
+                'artifact_request': {
+                    'extension': 'html',
+                    'source_name': 'index',
+                    'source': 'closure_link_rebind',
+                    'target_path': str(html_path),
+                },
+            }
+            payload = {
+                'id': 'resp_minimal_link_rebind_settling',
+                'artifacts': [
+                    {
+                        'type': 'text', 'path': str(html_path), 'name': 'index',
+                        'artifact_ref': 'artifact:index',
+                        'branch_id': branch['branch_id'], 'mime_type': 'text/html',
+                    },
+                    {
+                        'type': 'image', 'path': str(image_path),
+                        'artifact_ref': 'artifact:image',
+                    },
+                ],
+                'late_fill': {
+                    'status': 'partial_failed', 'pending_branches': [branch],
+                },
+            }
+            updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+            self.assertIn('src="image.png"', html_path.read_text(encoding='utf-8'))
+            self.assertEqual(updated['late_fill']['linked_artifact_rebinds'][0]['status'], 'applied')
+            reconciled = _LATE_FILL_RUNTIME._reconcile_satisfied_failed_text_artifact_branches(
+                updated, updated['late_fill'],
+            )
+            self.assertFalse(reconciled.get('pending_branches'))
+            self.assertEqual(reconciled['completed_branches'][0]['branch_id'], branch['branch_id'])
+
+    def test_terminal_link_rebind_evidence_preserves_exact_owner_and_idempotency(self):
+        cases = (
+            'pending_path_only', 'saved_unrelated_revision', 'different_dependencies',
+            'conflicting_phase', 'unowned_artifact', 'shared_owned_rebind',
+            'legacy_unbound_evidence', 'failed_write', 'compact_saved_result',
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                target = root / 'index.html'
+                image = root / 'image.png'
+                other_image = root / 'other.png'
+                target.write_text('<img src="https://via.placeholder.com/100">', encoding='utf-8')
+                image.write_bytes(b'png')
+                other_image.write_bytes(b'png')
+                owner = {
+                    'branch_id': 'owner', 'phase_id': 'phase-owner',
+                    'capability': 'chat', 'output_type': 'text', 'status': 'repair_needed',
+                    'repair_action': 'rebind_dependency_evidence',
+                    'artifact_request': {
+                        'extension': 'html', 'source_name': 'index',
+                        'source': 'closure_link_rebind', 'target_path': str(target),
+                    },
+                }
+                sibling = {**copy.deepcopy(owner), 'branch_id': 'sibling', 'phase_id': 'phase-sibling'}
+                artifact = {
+                    'type': 'text', 'path': str(target), 'name': 'index',
+                    'branch_id': 'owner', 'phase_id': 'phase-owner', 'artifact_ref': 'artifact:index',
+                }
+                payload = {
+                    'id': 'resp_rebind_owner_isolation',
+                    'output_slots': [{
+                        'slot_id': 'output-index', 'artifact_ref': 'artifact:index',
+                        'branch_id': 'owner', 'phase_id': 'phase-owner', 'status': 'fulfilled',
+                    }],
+                    'artifacts': [artifact, {
+                        'type': 'image', 'path': str(image), 'branch_id': 'image-owner',
+                    }, {
+                        'type': 'image', 'path': str(other_image), 'branch_id': 'other-image-owner',
+                    }],
+                    'late_fill': {
+                        'pending_branches': [owner, sibling], 'status': 'partial_failed',
+                    },
+                }
+                expected_owners = {'owner'}
+                if case in {'saved_unrelated_revision', 'different_dependencies', 'shared_owned_rebind'}:
+                    payload['late_fill']['fill_results'] = [
+                        {**copy.deepcopy(owner), 'saved_text_path': str(target)},
+                        {**copy.deepcopy(sibling), 'saved_text_path': str(target)},
+                    ]
+                if case == 'saved_unrelated_revision':
+                    sibling['text_artifact_revision_required'] = True
+                    sibling['repair_action'] = 'retry_same_branch'
+                elif case == 'different_dependencies':
+                    # Both branches own saved records for the target, but only
+                    # the owner's scoped transformation matches the real write.
+                    owner['depends_on'] = ['image-owner']
+                    sibling['depends_on'] = ['other-image-owner']
+                    owner['dependency_contract'] = 'local_visual_asset_binding'
+                    sibling['dependency_contract'] = 'local_visual_asset_binding'
+                    artifact['depends_on'] = ['image-owner']
+                    artifact['dependency_contract'] = 'local_visual_asset_binding'
+                    payload['late_fill']['fill_results'][1].update({
+                        'depends_on': ['other-image-owner'],
+                        'dependency_contract': 'local_visual_asset_binding',
+                    })
+                elif case == 'conflicting_phase':
+                    artifact['phase_id'] = 'wrong-phase'
+                    expected_owners = set()
+                elif case == 'unowned_artifact':
+                    artifact.pop('branch_id')
+                    artifact.pop('phase_id')
+                    payload.pop('output_slots')
+                    expected_owners = set()
+                elif case == 'shared_owned_rebind':
+                    expected_owners.add('sibling')
+                elif case == 'legacy_unbound_evidence':
+                    target.write_text('<img src="image.png">', encoding='utf-8')
+                    payload['late_fill']['linked_artifact_rebinds'] = [{
+                        'kind': 'ollmo.linked_artifact_rebind', 'target_path': str(target),
+                        'status': 'applied', 'source': 'terminal_late_fill_link_rebind',
+                    }]
+                    expected_owners = set()
+                elif case == 'compact_saved_result':
+                    result = {**copy.deepcopy(owner), 'saved_text_path': str(target)}
+                    result.pop('phase_id')
+                    payload['late_fill']['fill_results'] = [result]
+                if case == 'failed_write':
+                    with patch.object(Path, 'write_text', side_effect=OSError('test write failure')):
+                        updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+                    expected_owners = set()
+                else:
+                    updated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(payload)
+                evidence = updated['late_fill'].get('linked_artifact_rebinds', [])
+                self.assertEqual({item['branch_id'] for item in evidence if item.get('branch_id')}, expected_owners)
+                for item in evidence:
+                    if item.get('branch_id') in expected_owners:
+                        self.assertEqual(item.get('phase_id'), f"phase-{item['branch_id']}")
+                reconciled = _LATE_FILL_RUNTIME._reconcile_satisfied_failed_text_artifact_branches(
+                    updated, updated['late_fill'],
+                )
+                self.assertEqual(
+                    {item['branch_id'] for item in reconciled.get('pending_branches', [])},
+                    {'owner', 'sibling'} - expected_owners,
+                )
+                if case != 'failed_write':
+                    before_bytes = target.read_bytes()
+                    before_mtime = target.stat().st_mtime_ns
+                    before_evidence = copy.deepcopy(evidence)
+                    repeated = _LATE_FILL_RUNTIME.rebind_terminal_linked_artifacts(updated)
+                    self.assertEqual(target.read_bytes(), before_bytes)
+                    self.assertEqual(target.stat().st_mtime_ns, before_mtime)
+                    self.assertEqual(repeated['late_fill'].get('linked_artifact_rebinds', []), before_evidence)
+                # Existing exact-identity evidence remains compatible; a
+                # wrong branch or an identity-free legacy record cannot match.
+                if case == 'legacy_unbound_evidence':
+                    legacy = copy.deepcopy(updated)
+                    legacy['late_fill']['linked_artifact_rebinds'][0]['branch_id'] = 'owner'
+                    self.assertTrue(_LATE_FILL_RUNTIME._authoritative_bounded_text_artifact_repair_has_write_evidence(owner, legacy))
+                    self.assertFalse(_LATE_FILL_RUNTIME._authoritative_bounded_text_artifact_repair_has_write_evidence(sibling, legacy))
+
+    def test_terminal_link_rebind_identity_survives_compact_evidence_projection(self):
+        from ollmo_services.response_frames import _compact_late_fill_for_ledger
+        from ollmo_webserver import _response_lookup_late_fill_for_ui
+
+        legacy = {
+            'kind': 'ollmo.linked_artifact_rebind', 'status': 'applied',
+            'target_path': '/tmp/index.html', 'target_extension': 'html', 'change_count': 1,
+        }
+        owned = {**legacy, 'branch_id': 'owner', 'phase_id': 'phase-owner'}
+        late_fill = {'status': 'completed', 'linked_artifact_rebinds': [legacy, owned]}
+        ledger = _compact_late_fill_for_ledger(late_fill, snapshot_ref={'path': 'test-snapshot.json'})
+        recovered = json.loads(json.dumps(ledger))
+        self.assertEqual(recovered['linked_artifact_rebinds'], [legacy, owned])
+        ui = _response_lookup_late_fill_for_ui({'late_fill': recovered})
+        self.assertNotIn('branch_id', ui['linked_artifact_rebinds'][0])
+        self.assertEqual(ui['linked_artifact_rebinds'][1]['branch_id'], 'owner')
+        self.assertEqual(ui['linked_artifact_rebinds'][1]['phase_id'], 'phase-owner')
+
     def test_terminal_materialization_contract_closes_inline_css_hero_placeholder_with_repair_chat(self):
         prompt = (
             'Erstelle eine Webseite für ein Coworking-Space namens The Hive. Mach vier Bilder dafür: '
@@ -29470,6 +30579,58 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         self.assertTrue(has_file_context)
         self.assertTrue(expose_input_artifacts)
         self.assertIn('context_strategy', route_info['route_runtime'])
+
+    def test_responses_infer_execution_payload_carries_counted_image_prepare_contract_with_file_context(self):
+        prompt = (
+            'Build a local two-page room website from the attached data. '
+            'Generate exactly four cohesive local images: one exterior and three '
+            'room interiors. Create index.html, rooms.html, styles.css, app.js, '
+            'and rooms.json, then bundle everything.'
+        )
+        request_payload = {
+            'ghost_route': True,
+            'prompt': prompt,
+            'file_path': '/tmp/mon-repos-rooms.json',
+        }
+        phase_graph = build_request_phase_graph(
+            prompt,
+            intent_prompt=prompt,
+            request_payload=request_payload,
+            route_payload={'capability': 'chat'},
+        )
+
+        with app.test_request_context('/api/responses', method='POST'):
+            infer_payload, _route_info, has_file_context, _expose_input_artifacts = (
+                _build_responses_infer_execution_payload(
+                    request_payload,
+                    route_info={
+                        'capability': 'chat',
+                        'route_source': 'ghost_carried',
+                        'route_runtime': {'request_phase_graph': phase_graph},
+                    },
+                    instance={
+                        'instance_id': 'chat-1',
+                        'model': 'gemma4:26b',
+                        'backend': 'ollama',
+                        'capability': 'chat',
+                    },
+                    instance_id='chat-1',
+                    backend='ollama',
+                    capability='chat',
+                    request_model_override='gemma4:26b',
+                    upload_present=False,
+                )
+            )
+
+        self.assertTrue(has_file_context)
+        self.assertEqual(infer_payload['prompt'], prompt)
+        phase_system_prompt = infer_payload['phase_system_prompt']
+        self.assertIn('Ollmo phase contract: prepare-only.', phase_system_prompt)
+        self.assertIn(
+            'exactly 4 numbered image prompts using labels 1. through 4.',
+            phase_system_prompt,
+        )
+        self.assertNotIn(prompt, phase_system_prompt)
 
     def test_responses_infer_execution_payload_preserves_camel_case_reasoning_effort(self):
         with app.test_request_context('/api/responses', method='POST'):
@@ -30666,6 +31827,317 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         )
         self.assertEqual(artifact_gap['artifact_prompt_source'], 'focused_image_prompt_slot')
 
+    def test_late_fill_applies_attachment_isolation_after_batch_prompt_selection(self):
+        prompts = [
+            'Wide daylight photograph of a country house beside Lake Geneva.',
+            'Natural interior photograph of a quiet lakeside salon.',
+        ]
+        branches = [
+            {
+                'branch_id': f'branch-image-{index}',
+                'phase_id': f'phase-image-{index}',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'depends_on': ['phase-prepare'],
+                'queue_index': index,
+            }
+            for index in range(1, 3)
+        ]
+
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=branches[1],
+            artifact_gap={
+                'trigger': 'phase_continuation',
+                'artifact_prompt': 'The complete preparation response, including all web files.',
+                'artifact_prompt_source': 'full_display_text',
+                'batch_prompts': prompts,
+                'batch_prompts_source': 'semantic_prepare_phase_output',
+                'batch_prompt_expected_count': 2,
+                'batch_prompt_source_phase_id': 'phase-prepare',
+            },
+            current_payload={
+                'runtime': {
+                    'request_phase_graph': {
+                        'current_phase_id': 'phase-prepare',
+                        'current_phase_capability': 'chat',
+                        'prompt_intent': {'requested_visual_output_count': 2},
+                        'phases': [
+                            {'phase_id': 'phase-prepare', 'capability': 'chat', 'status': 'completed'},
+                            *branches,
+                        ],
+                    },
+                },
+            },
+            request_payload={
+                'prompt': 'Create two photographs and use the attached rooms data in a website.',
+                'reference_artifacts': [
+                    {'type': 'text', 'kind': 'file', 'path': '/tmp/rooms.json'},
+                ],
+            },
+            assistant_message='The complete preparation response, including all web files.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        branch_gap = spec['prepare_args']['artifact_gap']
+        self.assertEqual(branch_gap['artifact_prompt'], prompts[1])
+        self.assertEqual(branch_gap['artifact_prompt_source'], 'semantic_prepare_phase_output')
+        self.assertTrue(branch_gap['suppress_reference_file_context'])
+        self.assertEqual(
+            branch_gap['selected_reference_prompt_policy'],
+            'suppressed_for_branch_local_image_prompt',
+        )
+
+    def test_late_fill_fails_closed_when_counted_image_batch_has_no_exact_slots(self):
+        branches = [
+            {
+                'branch_id': f'branch-image-{index}',
+                'phase_id': f'phase-image-{index}',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'depends_on': ['phase-prepare'],
+                'queue_index': index,
+            }
+            for index in range(1, 5)
+        ]
+        full_preparation = (
+            'Three photographic instructions were prepared, followed by index.html, styles.css, '
+            'app.js, and room data.'
+        )
+
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=branches[-1],
+            artifact_gap={
+                'trigger': 'phase_continuation',
+                'artifact_prompt': full_preparation,
+                'artifact_prompt_source': 'full_display_text',
+                'batch_prompt_expected_count': 4,
+                'batch_prompt_source_phase_id': 'phase-prepare',
+            },
+            current_payload={
+                'output_text': full_preparation,
+                'runtime': {
+                    'request_phase_graph': {
+                        'current_phase_id': 'phase-prepare',
+                        'current_phase_capability': 'chat',
+                        'prompt_intent': {'requested_visual_output_count': 4},
+                        'phases': [
+                            {'phase_id': 'phase-prepare', 'capability': 'chat', 'status': 'completed'},
+                            *branches,
+                        ],
+                    },
+                },
+            },
+            request_payload={'prompt': 'Create four photographs and a multi-page room website.'},
+            assistant_message=full_preparation,
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        branch_gap = spec['prepare_args']['artifact_gap']
+        self.assertEqual(branch_gap['branch_contract_error'], 'incomplete_image_prompt_batch')
+        self.assertEqual(branch_gap['batch_prompt_expected_count'], 4)
+        self.assertEqual(branch_gap['batch_prompt_actual_count'], 0)
+        self.assertTrue(branch_gap['materialization_blocked'])
+        self.assertEqual(branch_gap['repair_action'], 'repair_branch_contract')
+        self.assertNotIn('artifact_prompt', branch_gap)
+
+        prepared = _prepare_late_fill_request_payload(
+            {'prompt': 'Create four photographs and a multi-page room website.'},
+            expected_capability='image_generation',
+            assistant_message=full_preparation,
+            artifact_gap=branch_gap,
+        )
+        self.assertTrue(prepared['counted_batch_prompt_carriers_blocked'])
+        self.assertEqual(
+            prepared['candidate_extraction_issue'],
+            'missing_exact_branch_local_image_prompt_batch',
+        )
+        for key in (
+            'prompt',
+            '_prompt_hint',
+            'input',
+            'messages',
+            'ghost_messages',
+            'artifact_prompt',
+            'content_payload',
+            'phase_summary',
+            'stage_direction',
+            'instruct',
+            'batch_prompts',
+            'artifact_prompt_source',
+            'content_payload_source',
+            'batch_prompts_source',
+            'batch_prompt_source_phase_id',
+        ):
+            self.assertNotIn(key, prepared)
+
+        resolve_route = Mock()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'Counted image prompt batch is incomplete',
+        ):
+            _LATE_FILL_RUNTIME.prepare_late_fill_branch_plan(
+                expected_capability='image_generation',
+                artifact_gap=branch_gap,
+                current_payload={},
+                request_payload={
+                    'prompt': 'Create four photographs and a multi-page room website.'
+                },
+                assistant_message=full_preparation,
+                source_route_payload=None,
+                failed_instance_id=None,
+                resolve_late_fill_route=resolve_route,
+            )
+        resolve_route.assert_not_called()
+
+        historical_gap = {
+            'trigger': 'phase_continuation',
+            'branch_id': 'branch-image-4',
+            'expected_capability': 'image_generation',
+            'artifact_prompt': full_preparation,
+            'artifact_prompt_source': 'focused_content_payload',
+            'batch_prompt_expected_count': 4,
+            'batch_prompt_source_phase_id': 'phase-prepare',
+            'execution_contract': {
+                'branch_id': 'branch-image-4',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'output_contract': {'output_type': 'image', 'required': True},
+            },
+        }
+        historical_resolve_route = Mock()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'Counted image prompt batch is incomplete',
+        ):
+            _LATE_FILL_RUNTIME.prepare_late_fill_branch_plan(
+                expected_capability='image_generation',
+                artifact_gap=historical_gap,
+                current_payload={},
+                request_payload={
+                    'prompt': 'Create four photographs and a multi-page room website.'
+                },
+                assistant_message=full_preparation,
+                source_route_payload=None,
+                failed_instance_id=None,
+                resolve_late_fill_route=historical_resolve_route,
+            )
+        historical_resolve_route.assert_not_called()
+
+    def test_late_fill_fails_closed_when_counted_image_batch_has_invalid_count(self):
+        full_preparation = (
+            'Full preparation response with HTML, CSS, remote image URLs, and room data.'
+        )
+
+        prepared = _prepare_late_fill_request_payload(
+            {'prompt': 'Create images and a multi-page room website.'},
+            expected_capability='image_generation',
+            assistant_message=full_preparation,
+            artifact_gap={
+                'trigger': 'phase_continuation',
+                'artifact_prompt': full_preparation,
+                'artifact_prompt_source': 'full_display_text',
+                'batch_prompt_expected_count': 'four images',
+            },
+        )
+
+        self.assertEqual(
+            prepared['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertEqual(
+            prepared['candidate_extraction_issue'],
+            'invalid_image_prompt_batch_count',
+        )
+        self.assertTrue(prepared['batch_prompt_expected_count_invalid'])
+        self.assertTrue(prepared['materialization_blocked'])
+        self.assertTrue(prepared['counted_batch_prompt_carriers_blocked'])
+        self.assertEqual(prepared['repair_action'], 'repair_branch_contract')
+        for key in (
+            'prompt',
+            '_prompt_hint',
+            'input',
+            'messages',
+            'ghost_messages',
+            'artifact_prompt',
+            'content_payload',
+            'phase_summary',
+            'stage_direction',
+            'instruct',
+            'batch_prompts',
+            'artifact_prompt_source',
+            'content_payload_source',
+        ):
+            self.assertNotIn(key, prepared)
+
+    def test_late_fill_state_preserves_invalid_image_count_contract(self):
+        state = _build_late_fill_state(
+            {
+                'batch_prompt_expected_count': 'two images',
+                'batch_prompts': ['a mountain', 'a lake'],
+            },
+            status='pending',
+            prior_state={},
+        )
+
+        self.assertEqual(state['batch_prompt_expected_count'], 'two images')
+        self.assertTrue(state['batch_prompt_expected_count_invalid'])
+        self.assertEqual(state['batch_prompt_actual_count'], 2)
+        self.assertEqual(
+            state['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertEqual(
+            state['candidate_extraction_issue'],
+            'invalid_image_prompt_batch_count',
+        )
+        self.assertTrue(state['materialization_blocked'])
+        self.assertTrue(state['counted_batch_prompt_carriers_blocked'])
+        self.assertEqual(state['repair_action'], 'repair_branch_contract')
+
+    def test_counted_image_batch_rejects_heuristically_focused_prompt_carrier(self):
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch={
+                'branch_id': 'branch-image_generation-4',
+                'phase_id': 'phase-image-4',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'queue_index': 4,
+                'depends_on': ['phase-prepare'],
+                'artifact_prompt': 'The whole preparation response.',
+                'artifact_prompt_source': 'focused_content_payload',
+            },
+            artifact_gap={
+                'trigger': 'phase_continuation',
+                'artifact_prompt': 'The whole preparation response.',
+                'artifact_prompt_source': 'focused_content_payload',
+                'batch_prompt_expected_count': 4,
+                'batch_prompt_source_phase_id': 'phase-prepare',
+            },
+            current_payload={
+                'runtime': {
+                    'request_phase_graph': {
+                        'prompt_intent': {'requested_visual_output_count': 4},
+                    },
+                },
+            },
+            request_payload={
+                'prompt': 'Create four photographs and a multi-page room website.'
+            },
+            assistant_message='The whole preparation response.',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        branch_gap = spec['prepare_args']['artifact_gap']
+        self.assertEqual(
+            branch_gap['branch_contract_error'],
+            'incomplete_image_prompt_batch',
+        )
+        self.assertTrue(branch_gap['materialization_blocked'])
+        self.assertNotIn('artifact_prompt', branch_gap)
+
     def test_late_fill_partial_retry_preserves_original_plain_alpha_batch_cardinality(self):
         scene_prompts = [
             'A red lighthouse surrounded by snow in bright daylight.',
@@ -30871,6 +32343,54 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         )
 
         self.assertEqual(count, 5)
+
+    def test_image_prompt_batch_expected_count_collapses_alias_duplicate_only(self):
+        logical_branch = {
+            'branch_id': 'branch-image',
+            'phase_id': 'phase-image',
+            'obligation_id': 'obligation-image',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'depends_on': ['phase-1'],
+            'queue_index': 1,
+        }
+        obligation_alias = {
+            'branch_id': 'phase-image',
+            'phase_id': 'phase-image',
+            'obligation_id': 'obligation-image',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'depends_on': ['phase-1'],
+            'queue_index': 1,
+        }
+
+        alias_count = _LATE_FILL_RUNTIME._image_prompt_batch_expected_count(
+            branch=logical_branch,
+            branch_gap={'pending_branches': [logical_branch, obligation_alias]},
+            current_payload={},
+        )
+
+        self.assertEqual(alias_count, 0)
+
+        distinct_branches = [
+            {
+                'branch_id': f'branch-image-{index}',
+                'phase_id': f'phase-image-{index}',
+                'obligation_id': f'obligation-image-{index}',
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'depends_on': ['phase-1'],
+                'queue_index': index,
+            }
+            for index in (1, 2)
+        ]
+        distinct_count = _LATE_FILL_RUNTIME._image_prompt_batch_expected_count(
+            branch=distinct_branches[0],
+            branch_gap={'pending_branches': distinct_branches},
+            current_payload={},
+        )
+
+        self.assertEqual(distinct_count, 2)
 
     def test_late_fill_state_preserves_batch_authority_and_slot_positions(self):
         branch = {
@@ -36193,7 +37713,7 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         actual_by_branch = {
             item["branch_id"]: (
                 item.get("artifact_ref"),
-                item.get("path"),
+                item.get("artifact_path"),
             )
             for item in ui_payload["output_slots"]
             if item.get("type") == "image"
@@ -36811,14 +38331,19 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
         }
 
         projected = _build_response_ui_lookup_payload(record)
-        artifact_flow = projected["response_frame"]["planning"]["artifact_flow"]
+        self.assertNotIn("response_frame", projected)
+        self.assertEqual(projected["frame_id"], "frame-exact-multi-text")
+        self.assertEqual(projected["frame_sequence"], 3)
+        output_slots = projected["output_slots"]
         slots_by_phase = {
             slot["phase_id"]: slot
-            for slot in artifact_flow["output_slots"]
+            for slot in output_slots
         }
 
-        self.assertFalse(artifact_flow["authoritative"])
-        self.assertTrue(artifact_flow["compatibility_derived"])
+        self.assertEqual(
+            set(slots_by_phase),
+            {"phase-1", "phase-4", "phase-5", "phase-6", "phase-7"},
+        )
         self.assertNotIn("artifact_ref", slots_by_phase["phase-1"])
         self.assertNotIn("artifact_path", slots_by_phase["phase-1"])
         for phase, canonical_output in zip((4, 5, 6, 7), canonical_outputs):
@@ -36830,14 +38355,14 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             len(
                 {
                     slot["slot_id"]
-                    for slot in artifact_flow["output_slots"]
+                    for slot in output_slots
                     if slot.get("slot_id")
                 }
             ),
             len(
                 [
                     slot
-                    for slot in artifact_flow["output_slots"]
+                    for slot in output_slots
                     if slot.get("slot_id")
                 ]
             ),
@@ -38592,6 +40117,351 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             'capability': 'text_to_speech',
             'runtime_status': {'readiness': 'ready', 'activity': 'idle'},
         }
+
+    @staticmethod
+    def _image_recovery_instance(instance_id):
+        return {
+            'instance_id': instance_id,
+            'model': 'x/flux2-klein:latest',
+            'backend': 'ollama',
+            'capability': 'image_generation',
+            'runtime_status': {'readiness': 'ready', 'activity': 'idle'},
+        }
+
+    @staticmethod
+    def _explicit_image_pool_recovery_gap(excluded_instance_ids=None):
+        branch_id = 'branch-image_generation-1'
+        excluded = list(excluded_instance_ids or ['image-a', 'image-b'])
+        policy_id = 'explicit_image_excluded_pool_retry_v1'
+        return {
+            'trigger': 'execution_planner_deferred_follow_up',
+            'branch_id': branch_id,
+            'expected_capability': 'image_generation',
+            'active_capability': 'image_generation',
+            'output_type': 'image',
+            'artifact_prompt': 'A quiet alpine room in clear natural light.',
+            'artifact_prompt_source': 'current_turn_direct_image_clause',
+            'excluded_instance_ids': excluded,
+            'excluded_reuse_policy_id': policy_id,
+            'automatic_follow_up_allowed': False,
+            'execution_contract': {
+                'branch_id': branch_id,
+                'capability': 'image_generation',
+                'output_type': 'image',
+                'output_contract': {
+                    'output_type': 'image',
+                    'required': True,
+                },
+            },
+            'recovery_attempt': {
+                'kind': 'ollmo.late_fill_recovery_attempt',
+                'trigger': 'explicit_retry_endpoint',
+                'branch_id': branch_id,
+                'capability': 'image_generation',
+                'preserve_intent': True,
+                'auto_execute': False,
+                'prior_error_code': 'NO_COMPATIBLE_INSTANCE',
+                'excluded_instance_ids': excluded,
+                'excluded_reuse_policy_id': policy_id,
+                'automatic_follow_up_allowed': False,
+            },
+            'recovery_state': {
+                'kind': 'ollmo.late_fill_recovery_state',
+                'status': 'attempting',
+                'trigger': 'explicit_retry_endpoint',
+                'branch_id': branch_id,
+                'capability': 'image_generation',
+                'preserve_intent': True,
+                'auto_execute': False,
+                'retry_scope': 'same_branch',
+                'suggested_action': 'start_compatible_instance',
+                'prior_error_code': 'NO_COMPATIBLE_INSTANCE',
+                'exclude_instance_ids': excluded,
+                'excluded_reuse_policy_id': policy_id,
+                'automatic_follow_up_allowed': False,
+            },
+        }
+
+    def test_explicit_image_pool_retry_policy_is_stamped_and_nonautomatic(self):
+        failed_branch = {
+            'branch_id': 'branch-image_generation-1',
+            'phase_id': 'phase-image-1',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'output_contract': {'output_type': 'image', 'required': True},
+            'artifact_prompt': 'A quiet alpine room in clear natural light.',
+            'artifact_prompt_source': 'current_turn_direct_image_clause',
+            'status': 'failed',
+            'error': {
+                'code': 'NO_COMPATIBLE_INSTANCE',
+                'message': 'No non-excluded image instance remained.',
+                'retryable': True,
+            },
+            'attempt': {'instance_id': 'image-a'},
+            'recovery_context': {
+                'can_retry': True,
+                'retry_scope': 'same_branch',
+                'suggested_action': 'start_compatible_instance',
+                'preserve_intent': True,
+                'exclude_instance_ids': ['image-a', 'image-b'],
+            },
+        }
+
+        retry_branch, retry_state, retry_attempt, excluded = (
+            _build_late_fill_retry_wave_branch(failed_branch)
+        )
+
+        normalized_retry_branch = _normalize_late_fill_branches(
+            [retry_branch]
+        )[0]
+
+        self.assertEqual(excluded, ['image-a', 'image-b'])
+        for payload in (retry_branch, retry_state, retry_attempt):
+            self.assertEqual(
+                payload['excluded_reuse_policy_id'],
+                'explicit_image_excluded_pool_retry_v1',
+            )
+            self.assertFalse(payload['automatic_follow_up_allowed'])
+        self.assertFalse(retry_state['auto_execute'])
+        self.assertFalse(retry_attempt['auto_execute'])
+        self.assertEqual(
+            normalized_retry_branch['excluded_reuse_policy_id'],
+            'explicit_image_excluded_pool_retry_v1',
+        )
+        self.assertFalse(
+            normalized_retry_branch['automatic_follow_up_allowed']
+        )
+        for key in ('recovery_attempt', 'recovery_state'):
+            self.assertEqual(
+                normalized_retry_branch[key]['excluded_reuse_policy_id'],
+                'explicit_image_excluded_pool_retry_v1',
+            )
+            self.assertFalse(
+                normalized_retry_branch[key]['automatic_follow_up_allowed']
+            )
+        self.assertFalse(
+            _LATE_FILL_RUNTIME.auto_executable_repair_recovery_allowed(
+                retry_branch,
+                recovery_context={
+                    'can_retry': True,
+                    'retry_scope': 'same_branch',
+                    'suggested_action': 'retry_excluding_instance',
+                },
+            )
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_explicit_image_retry_reuses_only_exhausted_excluded_ready_pool(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        instances = [
+            self._image_recovery_instance('image-a'),
+            self._image_recovery_instance('image-b'),
+        ]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'image_generation', 'prompt': 'Generate the room.'},
+            expected_capability='image_generation',
+            failed_instance_id='image-a',
+            excluded_instance_ids=['image-a', 'image-b'],
+            artifact_gap=self._explicit_image_pool_recovery_gap(),
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertIn(route_info['instance_id'], {'image-a', 'image-b'})
+        route_runtime = route_info['route_runtime']
+        self.assertEqual(
+            route_runtime['selection_policy'],
+            'excluded_reuse_for_explicit_image_retry',
+        )
+        self.assertEqual(
+            route_runtime['excluded_reuse_policy_id'],
+            'explicit_image_excluded_pool_retry_v1',
+        )
+        self.assertEqual(
+            route_runtime['excluded_instance_reuse_reason'],
+            'user_triggered_retry_after_ready_image_pool_exhausted',
+        )
+        selected = next(
+            item
+            for item in route_runtime['candidate_diagnostics']
+            if item['selected']
+        )
+        self.assertTrue(selected['excluded'])
+        self.assertTrue(selected['excluded_reuse_applied'])
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_explicit_image_retry_prefers_nonexcluded_ready_candidate(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        instances = [
+            self._image_recovery_instance('image-a'),
+            self._image_recovery_instance('image-b'),
+            self._image_recovery_instance('image-c'),
+        ]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+
+        _payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'image_generation', 'prompt': 'Generate the room.'},
+            expected_capability='image_generation',
+            failed_instance_id='image-a',
+            excluded_instance_ids=['image-a', 'image-b'],
+            artifact_gap=self._explicit_image_pool_recovery_gap(),
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'image-c')
+        self.assertNotEqual(
+            route_info['route_runtime'].get('selection_policy'),
+            'excluded_reuse_for_explicit_image_retry',
+        )
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_explicit_image_retry_requires_exact_policy_and_prompt_contract(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        instances = [self._image_recovery_instance('image-a')]
+        mock_load_running_instances.return_value = instances
+        mock_merge_instances.return_value = instances
+        for mutation in ('missing_policy', 'missing_prompt'):
+            with self.subTest(mutation=mutation):
+                gap = self._explicit_image_pool_recovery_gap(['image-a'])
+                if mutation == 'missing_policy':
+                    gap.pop('excluded_reuse_policy_id')
+                else:
+                    gap.pop('artifact_prompt')
+                _payload, route_info, route_error = _resolve_late_fill_route(
+                    {'capability': 'image_generation', 'prompt': 'Generate the room.'},
+                    expected_capability='image_generation',
+                    failed_instance_id='image-a',
+                    excluded_instance_ids=['image-a'],
+                    artifact_gap=gap,
+                    source_route_payload=None,
+                )
+                self.assertIsNone(route_info)
+                self.assertIn('No non-excluded running instance', route_error)
+
+    @patch('ollmo_webserver.merge_instances_with_runtime_status')
+    @patch('ollmo_webserver.load_running_instances')
+    def test_explicit_image_retry_replaces_stale_snapshot_with_live_truth(
+        self,
+        mock_load_running_instances,
+        mock_merge_instances,
+    ):
+        stale_a = self._image_recovery_instance('image-a')
+        stale_a['runtime_status'] = {
+            'readiness': 'unreachable',
+            'activity': 'idle',
+            'process_alive': False,
+            'port_listening': False,
+        }
+        live_a = self._image_recovery_instance('image-a')
+        live_b = self._image_recovery_instance('image-b')
+        mock_load_running_instances.return_value = [live_a, live_b]
+        mock_merge_instances.return_value = [live_a, live_b]
+        gap = self._explicit_image_pool_recovery_gap(['image-a'])
+        gap['_runtime_candidate_snapshot'] = [stale_a]
+
+        payload, route_info, route_error = _resolve_late_fill_route(
+            {'capability': 'image_generation', 'prompt': 'Generate the room.'},
+            expected_capability='image_generation',
+            failed_instance_id='image-a',
+            excluded_instance_ids=['image-a'],
+            artifact_gap=gap,
+            source_route_payload=None,
+        )
+
+        self.assertIsNone(route_error)
+        self.assertEqual(route_info['instance_id'], 'image-b')
+        refresh = payload['_late_fill_route_candidate_refresh']
+        self.assertTrue(refresh['attempted'])
+        self.assertTrue(refresh['applied'])
+        self.assertEqual(
+            refresh['reason'],
+            'snapshot_explicit_image_retry_requires_live_pool_check',
+        )
+
+    def test_image_retry_wave_spec_keeps_branch_local_recovery_identity(self):
+        failed_branch = {
+            'branch_id': 'branch-image_generation-2',
+            'phase_id': 'phase-image-2',
+            'capability': 'image_generation',
+            'output_type': 'image',
+            'output_contract': {'output_type': 'image', 'required': True},
+            'artifact_prompt': 'A quiet alpine room in clear natural light.',
+            'artifact_prompt_source': 'current_turn_direct_image_clause',
+            'status': 'failed',
+            'error': {'code': 'NO_COMPATIBLE_INSTANCE', 'retryable': True},
+            'attempt': {'instance_id': 'image-a'},
+            'recovery_context': {
+                'can_retry': True,
+                'retry_scope': 'same_branch',
+                'suggested_action': 'start_compatible_instance',
+                'preserve_intent': True,
+                'exclude_instance_ids': ['image-a'],
+            },
+        }
+        retry_branch, _state, _attempt, _excluded = (
+            _build_late_fill_retry_wave_branch(
+                failed_branch,
+                anchor_branch_id='branch-image_generation-1',
+            )
+        )
+        retry_branch = _normalize_late_fill_branches([retry_branch])[0]
+        spec = _LATE_FILL_RUNTIME.build_late_fill_materialization_branch_spec(
+            branch=retry_branch,
+            artifact_gap={
+                'trigger': 'execution_planner_deferred_follow_up',
+                'expected_capability': 'image_generation',
+                'active_capability': 'image_generation',
+                'recovery_state': {
+                    'branch_id': 'branch-image_generation-1',
+                    'capability': 'image_generation',
+                },
+                'recovery_attempt': {
+                    'branch_id': 'branch-image_generation-1',
+                    'capability': 'image_generation',
+                },
+            },
+            current_payload={},
+            request_payload={'prompt': 'Generate two alpine rooms.'},
+            assistant_message='',
+            source_route_payload=None,
+            failed_instance_id=None,
+        )
+
+        branch_gap = spec['prepare_args']['artifact_gap']
+        self.assertEqual(
+            branch_gap['recovery_attempt']['branch_id'],
+            'branch-image_generation-2',
+        )
+        self.assertEqual(
+            branch_gap['recovery_state']['branch_id'],
+            'branch-image_generation-2',
+        )
+        self.assertEqual(
+            branch_gap['excluded_reuse_policy_id'],
+            'explicit_image_excluded_pool_retry_v1',
+        )
+        self.assertTrue(
+            _LATE_FILL_RUNTIME._artifact_gap_allows_excluded_candidate_reuse_for_explicit_image_retry(
+                branch_gap
+            )
+        )
 
     @staticmethod
     def _explicit_single_branch_tts_recovery_gap(failed_instance_id='tts-failed'):

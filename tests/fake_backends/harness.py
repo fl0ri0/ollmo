@@ -29,7 +29,8 @@ from .fixtures import (
 class FakeBackendHarness:
     """Patch Ollmo's response route to deterministic temp-root fake backends."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, root: Path | None = None) -> None:
+        self._persistent_root = root
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._stack: ExitStack | None = None
         self._prior_testing: Any = None
@@ -39,8 +40,11 @@ class FakeBackendHarness:
         self.call_records: list[dict[str, Any]] = []
 
     def __enter__(self) -> "FakeBackendHarness":
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmpdir.name)
+        if self._persistent_root is None:
+            self._tmpdir = tempfile.TemporaryDirectory()
+            self.root = Path(self._tmpdir.name)
+        else:
+            self.root = self._persistent_root
         self.artifacts_dir = self.root / "artifacts"
         self.documents_dir = self.artifacts_dir / "documents"
         self.web_dir = self.artifacts_dir / "web"

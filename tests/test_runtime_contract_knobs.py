@@ -9,6 +9,7 @@ from ollmo_server.multi_materialization_runtime import (
     DEFAULT_MAX_PARALLEL_WORKERS,
     MAX_MAX_PARALLEL_WORKERS,
     MultiMaterializationRuntimeOwner,
+    _exception_error_payload,
     normalize_max_parallel_workers,
 )
 from ollmo_server.recovery_contract import (
@@ -27,6 +28,81 @@ from ollmo_server.recovery_contract import (
 
 
 class RuntimeContractKnobTests(unittest.TestCase):
+    def test_unavailable_preparation_does_not_block_ready_sibling(self):
+        runtime = MultiMaterializationRuntimeOwner(max_parallel_workers=2)
+        executed = []
+        branches = [
+            {'branch_id': name, 'capability': 'chat', 'prepare_args': {'name': name}}
+            for name in ['cooling', 'ready']
+        ]
+
+        def prepare(name, **kwargs):
+            if name == 'cooling':
+                raise RuntimeError("No ready late-fill instance for capability 'chat'.")
+            return {'branch_id': name, 'instance': {'instance_id': name}}
+
+        def execute(plan):
+            executed.append(plan['branch_id'])
+            return {'saved_text_path': '/synthetic/ready.html'}
+
+        result = runtime.execute_materialization_branches(
+            branches, prepare_branch_plan=prepare, execute_prepared_branch=execute,
+        )
+        self.assertEqual(executed, ['ready'])
+        self.assertEqual(set(result['branch_results']), {'ready'})
+        self.assertEqual(result['branch_errors']['cooling']['code'], 'INSTANCE_UNAVAILABLE')
+
+    def test_unavailable_preparation_preserves_branch_for_later_attempt(self):
+        runtime = MultiMaterializationRuntimeOwner(max_parallel_workers=1)
+        branch = {'branch_id': 'repair-css', 'phase_id': 'repair-css',
+                  'capability': 'chat', 'prepare_args': {}}
+        available = False
+        executed = []
+
+        def prepare(**kwargs):
+            if not available:
+                raise RuntimeError(
+                    "No ready late-fill instance for capability 'chat'. "
+                    'Unusable instance ids: chat-1 (readiness=ready, activity=idle, '
+                    'process_alive=true, port_listening=true, cooldown_until=2099-01-01T00:00:00Z).'
+                )
+            return {'branch_id': 'repair-css', 'phase_id': 'repair-css',
+                    'capability': 'chat', 'instance': {'instance_id': 'chat-1'}}
+
+        def execute(plan):
+            executed.append(plan['branch_id'])
+            return {'saved_text_path': '/synthetic/styles.css'}
+
+        first = runtime.execute_materialization_branches(
+            [branch], prepare_branch_plan=prepare, execute_prepared_branch=execute,
+        )
+        self.assertEqual(executed, [])
+        self.assertEqual(first['branch_results'], {})
+        error = first['branch_errors']['repair-css']
+        self.assertEqual(error['code'], 'INSTANCE_UNAVAILABLE')
+        self.assertTrue(error['retryable'])
+        self.assertEqual(error['stage'], 'prepare_branch_plan')
+        available = True
+        second = runtime.execute_materialization_branches(
+            [branch], prepare_branch_plan=prepare, execute_prepared_branch=execute,
+        )
+        self.assertEqual(executed, ['repair-css'])
+        self.assertEqual(second['branch_errors'], {})
+        self.assertIn('repair-css', second['branch_results'])
+
+    def test_unavailable_preparation_does_not_reclassify_contract_errors(self):
+        for message, code, retryable in [
+            ('Missing required session controls', 'CONTROL_VALIDATION_FAILED', False),
+            ('unsupported capability', 'CAPABILITY_UNSUPPORTED', False),
+            ('Invalid branch contract', 'PREPARE_FAILED', False),
+            ('arbitrary preparation bug', 'PREPARE_FAILED', False),
+            ('No running instance for late fill capability chat', 'NO_COMPATIBLE_INSTANCE', True),
+        ]:
+            with self.subTest(message=message):
+                error = _exception_error_payload(RuntimeError(message), stage='prepare_branch_plan')
+                self.assertEqual(error['code'], code)
+                self.assertEqual(error['retryable'], retryable)
+
     def test_recovery_suggested_actions_are_stable_wire_values(self):
         self.assertEqual(
             RECOVERY_SUGGESTED_ACTIONS,

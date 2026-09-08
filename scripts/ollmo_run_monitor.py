@@ -203,10 +203,27 @@ def _load_response_helpers(root: Path):
     return load_latest_response_state, ResponseSemanticsRuntimeOwner, _read_snapshot_ref_payload
 
 
-def _scan_responses(root: Path) -> tuple[list[str], dict[str, dict[str, int]]]:
+def _frame_identity_key(
+    response_id: Any,
+    frame_id: Any = None,
+    frame_sequence: Any = None,
+) -> tuple[str, str]:
+    """Return a stable report key without requiring every legacy field."""
+
+    normalized_response_id = str(response_id or '').strip()
+    normalized_frame_id = str(frame_id or '').strip()
+    if normalized_frame_id:
+        return normalized_response_id, f'id:{normalized_frame_id}'
+    if frame_sequence not in (None, ''):
+        return normalized_response_id, f'seq:{frame_sequence}'
+    # Old monitor records without frame identity remain response-id scoped.
+    return normalized_response_id, 'legacy'
+
+
+def _scan_responses(root: Path) -> tuple[list[str], dict[str, dict[str, Any]]]:
     ledger = root / 'state/response_frames/responses.jsonl'
     order: list[str] = []
-    latest: dict[str, dict[str, int]] = {}
+    latest: dict[str, dict[str, Any]] = {}
     if not ledger.exists():
         return order, latest
     for line_no, line, record in _iter_jsonl(ledger):
@@ -222,7 +239,14 @@ def _scan_responses(root: Path) -> tuple[list[str], dict[str, dict[str, int]]]:
             continue
         if response_id not in latest:
             order.append(response_id)
-        latest[response_id] = {'line': line_no, 'bytes': len(line)}
+        latest[response_id] = {
+            'line': line_no,
+            'bytes': len(line),
+            'frame_id': record.get('frame_id') or payload.get('frame_id'),
+            'frame_sequence': record.get('frame_sequence')
+            if record.get('frame_sequence') not in (None, '')
+            else payload.get('frame_sequence'),
+        }
     return order, latest
 
 
@@ -821,6 +845,10 @@ def _summarize_response_frame_finalize_timing(timing: dict[str, Any]) -> dict[st
         'completed_branch_count': timing.get('completed_branch_count'),
         'failed_branch_count': timing.get('failed_branch_count'),
         'steps': steps,
+        'invocation_id': timing.get('invocation_id'),
+        'process_boot_id': timing.get('process_boot_id'),
+        'operations': timing.get('operations', {}),
+        'operation_timing_scope': 'inclusive_nested_do_not_sum',
     }
 
 
@@ -2034,6 +2062,15 @@ def _render_learning_healing_lines(info: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _late_fill_is_clean(late_fill: dict[str, Any]) -> bool:
+    return late_fill.get('status') == 'completed' or (
+        late_fill.get('status') == 'skipped'
+        and late_fill.get('skip_reason') == 'already_fulfilled'
+        and late_fill.get('skip_kind') == 'no_work_needed'
+        and late_fill.get('skip_source') == 'late_fill_prune'
+    )
+
+
 def _build_report(root: Path, response_id: str, next_response_id: str | None, latest_line: dict[str, int]) -> dict[str, Any]:
     load_latest_response_state, syntax_owner, snapshot_reader = _load_response_helpers(root)
     state = load_latest_response_state(response_id, frames_dir=root / 'state/response_frames')
@@ -2237,10 +2274,11 @@ def _build_report(root: Path, response_id: str, next_response_id: str | None, la
         'failed': len(late_fill.get('failed_branches') or []),
         'completed': len(late_fill.get('completed_branches') or []),
     }
+    late_fill_clean = _late_fill_is_clean(late_fill)
     clean = (
         payload.get('status') == 'completed'
         and payload.get('lifecycle_state') == 'completed'
-        and late_fill.get('status') == 'completed'
+        and late_fill_clean
         and late_fill.get('final_materialization_contract_status') == 'fulfilled'
         and branch_counts['pending'] == 0
         and branch_counts['active'] == 0
@@ -2386,7 +2424,22 @@ def _build_report(root: Path, response_id: str, next_response_id: str | None, la
         },
     )
 
+    from scripts.self_attack_convergence import analyze_causal_records, causal_records
+    causal = analyze_causal_records(causal_records(payload) + [
+        event['causal_event'] for _, event, _ in response_events
+        if isinstance(event.get('causal_event'), dict)
+    ])
     report = {
+        'causal_observation': {
+            'authority': 'observer_only',
+            'invocation_count': len(causal['invocations']),
+            'model_invocation_count': sum(item['model_execution'] for item in causal['invocations']),
+            'read_model_invocation_count': sum(item.get('record_kind') == 'read_model_invocation' for item in causal['invocations']),
+            'classification_counts': causal['classification_counts'],
+            'event_id_conflicts': causal['event_id_conflicts'],
+            'operations': causal['operations'],
+            'coverage': 'Only retained exact response-bound records; absence remains unknown.',
+        },
         'response_id': response_id,
         'reported_at': _utc_now(),
         'frame_id': frame.get('frame_id'),
@@ -2744,6 +2797,44 @@ def _load_reported_ids(path: Path) -> set[str]:
     return reported_ids
 
 
+def _load_reported_frame_keys(path: Path) -> set[tuple[str, str]]:
+    """Load append-only monitor identities with legacy report compatibility."""
+
+    reported: set[tuple[str, str]] = set()
+    for _, _, record in _iter_jsonl(path):
+        if not isinstance(record, dict):
+            continue
+        response_id = str(record.get('response_id') or '').strip()
+        if not response_id:
+            continue
+        reported.add(
+            _frame_identity_key(
+                response_id,
+                record.get('frame_id'),
+                record.get('frame_sequence'),
+            )
+        )
+    return reported
+
+
+def _frame_was_reported(
+    reported_frame_keys: set[tuple[str, str]],
+    response_id: str,
+    frame_key: tuple[str, str],
+) -> bool:
+    """Apply frame-aware dedupe with a response-scoped legacy fallback.
+
+    A report written by an older monitor has no frame identity.  It is still
+    authoritative for that response as a whole; otherwise a later monitor
+    heartbeat would emit a duplicate report when the same response is now
+    represented by a modern frame.
+    """
+
+    return frame_key in reported_frame_keys or (
+        (response_id, 'legacy') in reported_frame_keys
+    )
+
+
 def _drop_legacy_idle_state(last_seen: dict[str, Any]) -> None:
     for key in (
         'idle_no_running_auto_pause_recommended',
@@ -2776,13 +2867,39 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
 
     last_seen = _load_last_seen(state_dir)
     _drop_legacy_idle_state(last_seen)
-    reported_ids = _load_reported_ids(state_dir / 'reports.jsonl')
+    reported_frame_keys = _load_reported_frame_keys(state_dir / 'reports.jsonl')
+    reported_ids = {response_id for response_id, _ in reported_frame_keys}
+
+    def latest_frame_key(response_id: str) -> tuple[str, str]:
+        latest_record = latest.get(response_id) or {}
+        return _frame_identity_key(
+            response_id,
+            latest_record.get('frame_id'),
+            latest_record.get('frame_sequence'),
+        )
+
     tracked_running_ids = [
         response_id
         for response_id in last_seen.get('running_unreported_response_ids') or []
-        if isinstance(response_id, str) and response_id and response_id not in reported_ids
+        if (
+            isinstance(response_id, str)
+            and response_id
+            and not _frame_was_reported(
+                reported_frame_keys,
+                response_id,
+                latest_frame_key(response_id),
+            )
+        )
     ]
-    candidate_ids = [response_id for response_id in order if response_id not in reported_ids]
+    candidate_ids = [
+        response_id
+        for response_id in order
+        if not _frame_was_reported(
+            reported_frame_keys,
+            response_id,
+            latest_frame_key(response_id),
+        )
+    ]
     candidate_id_set = set(candidate_ids)
     for response_id in tracked_running_ids:
         if response_id not in candidate_id_set:
@@ -2792,7 +2909,11 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
     emitted = 0
     still_running_ids: list[str] = []
     for response_id in candidate_ids:
-        if response_id in reported_ids:
+        if _frame_was_reported(
+            reported_frame_keys,
+            response_id,
+            latest_frame_key(response_id),
+        ):
             continue
         if response_id in latest:
             next_index = order.index(response_id) + 1
@@ -2814,7 +2935,13 @@ def run_once(root: Path, state_dir: Path, quiet: bool) -> int:
             continue
 
         _append(state_dir / 'reports.jsonl', json.dumps(report, sort_keys=True) + '\n')
-        reported_ids.add(response_id)
+        report_key = _frame_identity_key(
+            report.get('response_id') or response_id,
+            report.get('frame_id'),
+            report.get('frame_sequence'),
+        )
+        reported_frame_keys.add(report_key)
+        reported_ids.add(report_key[0])
         _append(
             state_dir / 'reports.md',
             f"\n\n## {report['response_id']} ({report['reported_at']})\n\n{report['human_report']}\n",

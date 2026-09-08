@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
+from ollmo_services.events import observe_call, observe_request
+
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -1761,6 +1765,7 @@ class ResponsesRequestRuntimeOwner:
         updated['runtime'] = runtime
         return updated
 
+    @observe_state('responses.attach_phase_graph', 'ghost_and_response_state', 'request_phase_graph', labels=('NEW_REPRESENTATION',))
     def _attach_fluid_request_phase_graph(
         self,
         response_payload: dict[str, Any],
@@ -2009,6 +2014,18 @@ class ResponsesRequestRuntimeOwner:
                 while branch_id in seen_branch_ids:
                     branch_id = f'{branch_id}-{len(seen_branch_ids) + 1}'
                 seen_branch_ids.add(branch_id)
+                if repair_contract and missing_count == 1:
+                    # Preserve the originating contract identities and bind
+                    # their actual execution identity before scheduling.
+                    binding = {
+                        'branch_id': branch_id,
+                        'phase_id': branch_id,
+                        'contract_id': repair_contract.get('contract_id'),
+                    }
+                    repair_contract['execution_binding'] = binding
+                    for promoted_contract in promoted_contracts:
+                        if promoted_contract.get('contract_id') == repair_contract.get('contract_id'):
+                            promoted_contract['execution_binding'] = dict(binding)
                 depends_on = [
                     str(item or '').strip()
                     for item in (raw_item.get('depends_on') or [])
@@ -5877,6 +5894,7 @@ class ResponsesRequestRuntimeOwner:
             'branch_ids': sorted(seen_branch_ids),
         }
 
+    @observe_state('responses.pre_freeze_closure', 'graph_branch_artifact_state', 'closure_reviewed_response', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
     def attach_pre_freeze_closure_review(
         self,
         response_payload: dict[str, Any],
@@ -6787,6 +6805,8 @@ class ResponsesRequestRuntimeOwner:
             None,
         )
 
+    @observe_request
+    @observe_call('responses_request.handle_responses_request', record_kind='request_invocation')
     def handle_responses_request(
         self,
         *,

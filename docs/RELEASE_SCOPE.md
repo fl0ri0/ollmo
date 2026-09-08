@@ -31,7 +31,7 @@ and inspect, but still allowed to evolve within the `0.x` series.
   login. The dashboard exposes ChatGPT as an external cloud target and Ghost
   preference, never as a local running instance.
 - A reproducible, allowlist-based source archive with a SHA-256 manifest.
-- Four explicitly curated, self-contained reference-run packages with copied
+- Five explicitly curated, self-contained reference-run packages with copied
   public artifacts, sanitized final-response and monitor evidence, and package
   checksums. Production response ledgers, monitor ledgers, runtime state, and
   unrelated generated artifacts remain excluded from the source release.

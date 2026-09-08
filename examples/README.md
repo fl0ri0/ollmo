@@ -26,7 +26,12 @@ runtime truth.
   generates each image, inspects each artifact independently, and publishes one
   combined evidence-grounded report.
 
-Each directory is a self-contained publication package with the reviewed prompt,
+- [Saved JSON → actual read → derived HTML](reference-runs/2026-09-07-saved-json-read-html-verified/README.md)
+  — an explicit Save/Read/Create-consumer request with exactly two deliverables,
+  captured JSON bytes bound to the HTML consumer, fulfilled Closure, and a clean
+  independent monitor report. Includes a verified local bundle.
+
+Each listed directory is a self-contained publication package with the reviewed prompt,
 copied public artifacts, a sanitized final-response projection, an independent
 monitor snapshot, and a checksum manifest. Echoes of the Pass also includes its
 openable local website bundle. The canonical response frame and original saved

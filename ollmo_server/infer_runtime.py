@@ -312,6 +312,10 @@ class InferRuntimeOwner:
         normalize_capability = self._hook('normalize_capability')
         sanitize_artifact_records = self._hook('sanitize_artifact_records')
         parse_bool = self._hook('parse_bool')
+        resolve_prepare_phase_contract = self.hooks.get('resolve_prepare_phase_contract')
+        build_prepare_phase_system_message = self.hooks.get(
+            'build_prepare_phase_system_message'
+        )
 
         normalized_payload = data if isinstance(data, dict) else dict(data)
         explicit_file_path = str(normalized_payload.get('file_path') or '').strip()
@@ -422,6 +426,25 @@ class InferRuntimeOwner:
         route_capability = normalize_capability(capability)
         if route_capability:
             infer_payload['capability'] = route_capability
+        if (
+            route_capability == 'chat'
+            and callable(resolve_prepare_phase_contract)
+            and callable(build_prepare_phase_system_message)
+        ):
+            prepare_contract = resolve_prepare_phase_contract(
+                route_payload=route_info,
+                request_payload=normalized_payload,
+            )
+            prepare_system_message = build_prepare_phase_system_message(
+                prepare_contract
+            )
+            phase_system_prompt = str(
+                (prepare_system_message or {}).get('content')
+                if isinstance(prepare_system_message, Mapping)
+                else ''
+            ).strip()
+            if phase_system_prompt:
+                infer_payload['phase_system_prompt'] = phase_system_prompt
         route_model = str((instance or {}).get('model') or '').strip()
         if route_model:
             infer_payload['model'] = route_model
@@ -758,6 +781,9 @@ class InferRuntimeOwner:
             return jsonify({"error": f"Invalid target port '{port}'."}), 400
 
         prompt = str(data.get("prompt") or "").strip()
+        phase_system_prompt = str(
+            data.get('phase_system_prompt') or ''
+        ).strip() or None
         semantic_materializer_prompt = extract_semantic_materializer_prompt(
             data,
             capability=capability,
@@ -1145,6 +1171,7 @@ class InferRuntimeOwner:
                     semantic_materializer_prompt
                 ),
                 reasoning_effort=reasoning_effort,
+                phase_system_prompt=phase_system_prompt,
             )
             infer_artifacts = InferArtifacts(
                 temp_path=temp_path,
@@ -1331,7 +1358,11 @@ class InferRuntimeOwner:
                 {
                     "error": (
                         "Timed out while waiting for the model request. The model process may still be running locally. "
-                        "Use smaller PDF chunks or increase infer_timeout_sec/pdf_page_timeout_sec."
+                        + (
+                            "Use smaller PDF chunks or increase infer_timeout_sec/pdf_page_timeout_sec."
+                            if file_kind == "pdf"
+                            else "The request exceeded its configured inference timeout (infer_timeout_sec)."
+                        )
                     )
                 }
             ), 504

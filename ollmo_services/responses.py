@@ -10,7 +10,17 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from ollmo_services.artifact_contracts import sanitize_artifact_record
+from ollmo_services.artifact_contracts import (
+    artifact_is_current_authoritative,
+    artifact_logical_identity,
+    artifact_logical_identities_match,
+    select_authoritative_artifact_records,
+    sanitize_artifact_record,
+)
+from ollmo_services.redraw_scope import (
+    apply_artifact_identity_to_outputs,
+    canonicalize_duplicate_artifact_refs,
+)
 
 
 _SEMANTIC_PHASE_PAYLOAD_KEYS = (
@@ -1251,12 +1261,25 @@ def _resolved_artifact_path(record: Mapping[str, Any]) -> Optional[Path]:
     return path if path.exists() and path.is_file() else None
 
 
-def _include_linked_public_dependencies(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _include_linked_public_dependencies(
+    artifacts: list[dict[str, Any]],
+    *,
+    response_id: str = '',
+    artifact_inventory: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
     if not artifacts:
         return artifacts
     by_path: dict[str, dict[str, Any]] = {}
     ordered: list[dict[str, Any]] = []
     queue: list[Path] = []
+    authoritative_by_identity: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    inventory = artifact_inventory if isinstance(artifact_inventory, list) else artifacts
+    for candidate in inventory:
+        if not isinstance(candidate, Mapping):
+            continue
+        identity = artifact_logical_identity(candidate)
+        if identity and artifact_is_current_authoritative(candidate, response_id=response_id):
+            authoritative_by_identity.setdefault(identity, []).append(dict(candidate))
     for artifact in artifacts:
         path = _resolved_artifact_path(artifact)
         path_key = str(path) if path else ''
@@ -1294,6 +1317,33 @@ def _include_linked_public_dependencies(artifacts: list[dict[str, Any]]) -> list
             record = _dependency_artifact_record(dependency)
             if not record:
                 continue
+            identity = artifact_logical_identity(record)
+            authoritative = authoritative_by_identity.get(identity, []) if identity else []
+            if identity and not authoritative:
+                matching_identities = [
+                    candidate_identity
+                    for candidate_identity in authoritative_by_identity
+                    if artifact_logical_identities_match(identity, candidate_identity)
+                ]
+                if len(matching_identities) == 1:
+                    authoritative = authoritative_by_identity[matching_identities[0]]
+            if authoritative:
+                strongest = select_authoritative_artifact_records(
+                    authoritative,
+                    response_id=response_id,
+                )
+                if len(strongest) != 1:
+                    # Conflicting current response truth remains fail-closed.
+                    continue
+                replacement = dict(strongest[0])
+                replacement_path = _resolved_artifact_path(replacement)
+                if replacement_path is None:
+                    continue
+                dependency = replacement_path
+                dependency_key = str(replacement_path)
+                if dependency_key in by_path:
+                    continue
+                record = replacement
             by_path[dependency_key] = record
             ordered.append(record)
             if dependency.suffix.lower().lstrip('.') in {'html', 'htm', 'css', 'js', 'mjs', 'cjs'}:
@@ -1366,7 +1416,12 @@ def filter_public_response_artifacts(
         artifact
         for artifact in normalized_artifacts
         if _artifact_public_keys(artifact) & public_keys
+        and _is_public_output_artifact_record(artifact)
     ]
+    public_artifacts = select_authoritative_artifact_records(
+        public_artifacts,
+        response_id=str(response_payload.get('id') or '').strip(),
+    )
     if not public_artifacts and public_keys:
         matched_fallback_artifacts: list[dict[str, Any]] = []
         used_indexes: set[int] = set()
@@ -1389,8 +1444,16 @@ def filter_public_response_artifacts(
             used_indexes.add(index)
             matched_fallback_artifacts.append(_alias_artifact_to_output_ref(artifact, output))
         if matched_fallback_artifacts:
-            return _include_linked_public_dependencies(matched_fallback_artifacts)
-    return _include_linked_public_dependencies(public_artifacts)
+            return _include_linked_public_dependencies(
+                matched_fallback_artifacts,
+                response_id=str(response_payload.get('id') or '').strip(),
+                artifact_inventory=normalized_artifacts,
+            )
+    return _include_linked_public_dependencies(
+        public_artifacts,
+        response_id=str(response_payload.get('id') or '').strip(),
+        artifact_inventory=normalized_artifacts,
+    )
 
 
 def _group_artifacts_for_outputs(artifacts: Any) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, Optional[int]], list[dict[str, Any]]]]:
@@ -2116,6 +2179,24 @@ def hoist_response_output_surfaces(payload: Mapping[str, Any]) -> dict[str, Any]
     ]
     outputs = _suppress_provisional_artifact_bundle_text_outputs(outputs)
     outputs = _suppress_consumed_evidence_text_outputs(response_payload, outputs)
+    # Rebuilding from fulfilled slots must not erase artifact adjudication in
+    # the attached frame. Also check current records for additional conflicts.
+    identity = canonicalize_duplicate_artifact_refs(artifacts)
+    frame_output = (
+        response_frame.get('output')
+        if isinstance(response_frame.get('output'), Mapping)
+        else {}
+    )
+    outputs = apply_artifact_identity_to_outputs(
+        outputs,
+        artifact_identity=frame_output.get('artifact_identity') or {},
+        canonical_artifacts=artifacts,
+    )
+    outputs = apply_artifact_identity_to_outputs(
+        outputs,
+        artifact_identity=identity,
+        canonical_artifacts=identity['artifacts'],
+    )
     if outputs:
         response_payload['outputs'] = outputs
     else:

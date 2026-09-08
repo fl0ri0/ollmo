@@ -6,6 +6,14 @@ that turns them into owed work, active context, or another runtime contract.
 
 from __future__ import annotations
 
+from ollmo_services.events import (
+    observe_call,
+    exact_target,
+    select_fields,
+    judgment_summary,
+    causal_event,
+)
+
 import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
@@ -671,6 +679,21 @@ def build_candidate_graph(
     )
 
 
+@observe_call('candidate_contracts.review_candidate_promotions',
+              record_kind='promotion_review_invocation',
+              target=lambda a: {'candidate_ids': [c.get('candidate_id') for c in a['candidate_graph'].get('candidates', []) if isinstance(c, Mapping)]},
+              inputs=lambda a: {
+                  'candidates': [select_fields(c, (
+                      'candidate_id', 'candidate_type', 'status', 'contract_ref',
+                      'promotion_reason', 'reason', 'promotion_source', 'evidence_refs',
+                      'execution_policy', 'reconsideration_policy', 'supersession_policy',
+                      'superseded_by', 'superseded_by_candidate_id', 'superseded_by_obligation_id',
+                  )) for c in a['candidate_graph'].get('candidates', []) if isinstance(c, Mapping)],
+                  'promotion_authority': (a['controls'] or {}).get('promotion_authority'),
+                  'existing_contract_source': (a['existing_contracts'] or {}).get('source'),
+              },
+              authority=lambda a: {'promotion_authority': (a['controls'] or {}).get('promotion_authority')},
+              result=judgment_summary)
 def review_candidate_promotions(
     candidate_graph: Mapping[str, Any],
     *,
@@ -755,6 +778,14 @@ def review_candidate_promotions(
                     if value:
                         decision_payload[key] = value
         decisions.append(_json_safe(decision_payload))
+        causal_event('candidate_contracts.review_candidate_promotions', 'promotion_judgment',
+            target=exact_target(raw_candidate),
+            judgment={**judgment_summary(decision_payload),
+                      'contract_ref': decision_payload.get('contract_ref')},
+            promotion_cause=reason, promotion_outcome=decision,
+            authority_source=authority,
+            runtime_state_delta=None,
+            authority_boundary='records_existing_contract_review_not_lens_or_aspiration_authority')
 
     counts = {
         'promoted': sum(1 for item in decisions if item.get('decision') == 'promoted'),

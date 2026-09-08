@@ -56,6 +56,26 @@ def _make_release_source(tmp_path: Path) -> Path:
         '# Release scope\n',
     )
     _write(
+        source / 'docs' / 'CAUSAL_TELEMETRY.md',
+        '# Causal telemetry\n',
+    )
+    _write(
+        source / 'docs' / 'SELF_ATTACK.md',
+        '# Self-Attack\n',
+    )
+    _write(
+        source / 'docs' / 'SELF_ATTACK_STATUS_2026-09-06.md',
+        '# Self-Attack status\n',
+    )
+    _write(
+        source / 'docs' / 'STATE_FLOW_DIAGNOSTICS.md',
+        '# State-flow diagnostics\n',
+    )
+    _write(
+        source / 'docs' / 'ollmo-icon.svg',
+        '<svg xmlns="http://www.w3.org/2000/svg"></svg>\n',
+    )
+    _write(
         source / 'docs' / 'KNOWN_LIMITATIONS.md',
         '# Known limitations\n',
     )
@@ -96,6 +116,18 @@ def _make_release_source(tmp_path: Path) -> Path:
     _write(
         source / 'ollmo_core' / 'version.py',
         '"""Version."""\n\n__version__ = \'0.1.0\'\n',
+    )
+    _write(
+        source / 'config' / 'self_attack_corpus.json',
+        '{"cases": []}\n',
+    )
+    _write(
+        source / 'config' / 'graph_rebase_shadow_corpus.json',
+        '{"cases": []}\n',
+    )
+    _write(
+        source / 'config' / 'unreviewed_local_config.json',
+        '{"private": true}\n',
     )
 
     for directory in (
@@ -258,6 +290,14 @@ def test_build_stages_only_allowlisted_clean_release_files(tmp_path: Path) -> No
     assert not any(path.is_file() for path in (staged_root / 'artifacts').rglob('*'))
     assert not (staged_root / 'plans').exists()
     assert not (staged_root / '.env').exists()
+    assert (staged_root / 'docs' / 'SELF_ATTACK.md').is_file()
+    assert (staged_root / 'docs' / 'SELF_ATTACK_STATUS_2026-09-06.md').is_file()
+    assert (staged_root / 'docs' / 'CAUSAL_TELEMETRY.md').is_file()
+    assert (staged_root / 'docs' / 'STATE_FLOW_DIAGNOSTICS.md').is_file()
+    assert (staged_root / 'docs' / 'ollmo-icon.svg').is_file()
+    assert (staged_root / 'config' / 'self_attack_corpus.json').is_file()
+    assert (staged_root / 'config' / 'graph_rebase_shadow_corpus.json').is_file()
+    assert not (staged_root / 'config' / 'unreviewed_local_config.json').exists()
     assert not (staged_root / 'Readme_current_building_state.md').exists()
     assert not (staged_root / 'docs' / 'IDEAS.md').exists()
     assert not (staged_root / 'docs' / 'BENCHMARK_PLAN.md').exists()

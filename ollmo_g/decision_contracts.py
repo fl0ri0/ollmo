@@ -6,6 +6,13 @@ one coherent thinking surface without making Ghost the source of runtime truth.
 
 from __future__ import annotations
 
+from ollmo_services.events import (
+    observe_call,
+    exact_target,
+    select_fields,
+    judgment_summary,
+)
+
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
@@ -98,6 +105,25 @@ def _semantic_review_criteria_for_task(task: Mapping[str, Any]) -> list[str]:
     ]
 
 
+# Explicit lens-owner input projection. Registry contents may change independently,
+# so coverage remains partial; selected catalog identity is retained in the result.
+_LENS_INPUT_FIELDS = (
+    'capability', 'output_type', 'advisory_role', 'role', 'semantic_intent',
+    'objective', 'deliverable', 'review_type', 'check_kind', 'source_category',
+    'source_kind', 'content_payload_source', 'stage_direction',
+    'semantic_review_criteria', 'review_criteria', 'evidence_requirements',
+    'depends_on', 'status', 'repair_action', 'recovery_action',
+    'recommended_transition', 'decision_action', 'semantic_review_lens',
+    'requires_artifact', 'success_definition', 'failure_modes',
+)
+
+
+@observe_call('decision_contracts.semantic_review_lens_payload',
+              record_kind='read_model_invocation',
+              target=lambda a: exact_target(a['record']),
+              inputs=lambda a: {'source_kind': a['source_kind'],
+                                'source': select_fields(a['record'], _LENS_INPUT_FIELDS)},
+              result=judgment_summary)
 def _semantic_review_lens_payload(record: Mapping[str, Any], *, source_kind: str = 'task') -> dict[str, Any]:
     capability = _clean_text(record.get('capability')).lower()
     output_type = _clean_text(record.get('output_type')).lower()
@@ -876,6 +902,8 @@ def _active_reconsideration_review(block_resolution_reflex: Mapping[str, Any]) -
     )
 
 
+@observe_call('decision_contracts.semantic_quality_review',
+              record_kind='read_model_invocation', result=judgment_summary)
 def _semantic_quality_review(semantic_review_items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     contracts: list[dict[str, Any]] = []
     for index, item in enumerate(semantic_review_items, start=1):
@@ -1058,6 +1086,11 @@ def _orientation_source_ref(source: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+@observe_call('decision_contracts.aspiration_frame',
+              record_kind='read_model_invocation', target=lambda a: exact_target(a['source']),
+              inputs=lambda a: {'source': select_fields(a['source'], _LENS_INPUT_FIELDS),
+                                'evidence_refs': a.get('evidence_refs')},
+              evidence=lambda a: a.get('evidence_refs'), result=judgment_summary)
 def _aspiration_frame(
     *,
     source: Mapping[str, Any],
@@ -1107,6 +1140,8 @@ def _aspiration_frame(
     )
 
 
+@observe_call('decision_contracts.aspiration_review',
+              record_kind='read_model_invocation', result=judgment_summary)
 def _aspiration_review(
     *,
     candidate_graph: Mapping[str, Any],
@@ -1260,6 +1295,11 @@ def _aspiration_review(
     )
 
 
+@observe_call('decision_contracts.commitment_frame',
+              record_kind='read_model_invocation', target=lambda a: exact_target(a['source']),
+              inputs=lambda a: {'source': select_fields(a['source'], _LENS_INPUT_FIELDS),
+                                'evidence_refs': a.get('evidence_refs')},
+              evidence=lambda a: a.get('evidence_refs'), result=judgment_summary)
 def _commitment_frame(
     *,
     source: Mapping[str, Any],
@@ -1310,6 +1350,8 @@ def _commitment_frame(
     )
 
 
+@observe_call('decision_contracts.commitment_review',
+              record_kind='read_model_invocation', result=judgment_summary)
 def _commitment_review(
     *,
     active_reconsideration_review: Mapping[str, Any],
@@ -1669,6 +1711,8 @@ def _semantic_decision_proposal(
     )
 
 
+@observe_call('decision_contracts.semantic_decision_review',
+              record_kind='read_model_invocation', result=judgment_summary)
 def _semantic_decision_review(
     *,
     active_reconsideration_review: Mapping[str, Any],
@@ -2027,6 +2071,11 @@ def _controlled_attention_source_id(source: Mapping[str, Any]) -> str:
     return ''
 
 
+@observe_call('decision_contracts.controlled_attention_frame',
+              record_kind='read_model_invocation', target=lambda a: exact_target(a['source']),
+              inputs=lambda a: {'source': select_fields(a['source'], _LENS_INPUT_FIELDS),
+                                'evidence_refs': a.get('evidence_refs')},
+              evidence=lambda a: a.get('evidence_refs'), result=judgment_summary)
 def _controlled_attention_frame(
     *,
     source: Mapping[str, Any],
@@ -2091,6 +2140,8 @@ def _controlled_attention_frame(
     )
 
 
+@observe_call('decision_contracts.controlled_attention_review',
+              record_kind='read_model_invocation', result=judgment_summary)
 def _controlled_attention_review(
     *,
     active_reconsideration_review: Mapping[str, Any],
@@ -2833,6 +2884,8 @@ def _learning_hint_summary(accepted_learning_hints: Optional[Mapping[str, Any]])
     )
 
 
+@observe_call('decision_contracts.build_ghost_decision_contract',
+              record_kind='read_model_invocation', result=judgment_summary)
 def build_ghost_decision_contract(
     *,
     candidate_graph: Optional[Mapping[str, Any]] = None,

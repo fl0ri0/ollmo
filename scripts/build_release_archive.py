@@ -59,6 +59,7 @@ PUBLIC_DOCS = frozenset(
         'BACKEND_FABRIC.md',
         'CANONICAL_GLOSSARY.md',
         'CANONICAL_STACK.md',
+        'CAUSAL_TELEMETRY.md',
         'CONTROL_KNOBS.md',
         'CORE_CONTRACTS.md',
         'GHOST_ROUTER.md',
@@ -69,6 +70,9 @@ PUBLIC_DOCS = frozenset(
         'PRINCIPLES.md',
         'RELEASE_SCOPE.md',
         'RESPONSES_CONTRACT.md',
+        'SELF_ATTACK.md',
+        'SELF_ATTACK_STATUS_2026-09-06.md',
+        'STATE_FLOW_DIAGNOSTICS.md',
         'TESTING_PROTOCOL.md',
         'TRUTH_SOURCES.md',
         'VISION_ALIGNMENT.md',
@@ -82,8 +86,21 @@ CURRENT_DIAGRAMS = frozenset(
 CURRENT_DIAGRAM_PATHS = frozenset(
     Path('docs/diagrams') / name for name in CURRENT_DIAGRAMS
 )
+PUBLIC_DOC_ASSET_PATHS = frozenset(
+    {
+        Path('docs/ollmo-icon.svg'),
+    }
+)
 PUBLIC_DOC_PATHS = frozenset(
-    {Path('docs') / name for name in PUBLIC_DOCS} | set(CURRENT_DIAGRAM_PATHS)
+    {Path('docs') / name for name in PUBLIC_DOCS}
+    | set(CURRENT_DIAGRAM_PATHS)
+    | set(PUBLIC_DOC_ASSET_PATHS)
+)
+PUBLIC_CONFIG_PATHS = frozenset(
+    {
+        Path('config/graph_rebase_shadow_corpus.json'),
+        Path('config/self_attack_corpus.json'),
+    }
 )
 RELEASE_SKILL_FILES = frozenset(
     {
@@ -104,6 +121,16 @@ RELEASE_SKILL_DIRECTORIES = frozenset(
 RELEASE_REFERENCE_EXAMPLE_FILES = frozenset(
     {
         Path('examples/README.md'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/README.md'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/artifacts/documents/document-01.json'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/artifacts/documents/index.html'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/bundle/assets/files/file-01.json'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/bundle/index.html'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/bundle/manifest.json'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/manifest.json'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/monitor-report.json'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/prompt.txt'),
+        Path('examples/reference-runs/2026-09-07-saved-json-read-html-verified/response.json'),
         Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/README.md'),
         Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/audio/narration.wav'),
         Path('examples/reference-runs/2026-08-31-echoes-of-the-pass/artifacts/documents/index.html'),
@@ -227,11 +254,16 @@ REQUIRED_RELEASE_PATHS = frozenset(
         Path('THIRD_PARTY_NOTICES.md'),
         Path('docs/KNOWN_LIMITATIONS.md'),
         Path('docs/RELEASE_SCOPE.md'),
+        Path('docs/CAUSAL_TELEMETRY.md'),
+        Path('docs/SELF_ATTACK.md'),
+        Path('docs/SELF_ATTACK_STATUS_2026-09-06.md'),
+        Path('docs/STATE_FLOW_DIAGNOSTICS.md'),
         Path('docs/VISION_ALIGNMENT.md'),
         Path('ollmo'),
         Path('ollmo_core/version.py'),
         Path('ollmo_webUI.html'),
         Path('ollmo_webserver.py'),
+        Path('config/self_attack_corpus.json'),
         Path('requirements.txt'),
         Path('scripts/build_release_archive.py'),
         Path('site/index.html'),
@@ -243,7 +275,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         Path('start_multi_models.sh'),
         Path('stop_multi_models.sh'),
     }
-) | CURRENT_DIAGRAM_PATHS | RELEASE_SKILL_FILES | RELEASE_REFERENCE_EXAMPLE_FILES
+) | CURRENT_DIAGRAM_PATHS | PUBLIC_DOC_ASSET_PATHS | PUBLIC_CONFIG_PATHS | RELEASE_SKILL_FILES | RELEASE_REFERENCE_EXAMPLE_FILES
 
 FORBIDDEN_ROOT_COMPONENTS = frozenset(
     {
@@ -418,6 +450,16 @@ def discover_release_files(source_root: Path) -> dict[Path, Path]:
         if source_path.exists():
             _assert_regular_source_file(source_path, relative_path=relative_path)
             selected[relative_path] = source_path
+
+    for relative_path in sorted(PUBLIC_CONFIG_PATHS, key=lambda path: path.as_posix()):
+        source_path = source_root / relative_path
+        _assert_regular_source_file(source_path, relative_path=relative_path)
+        selected[relative_path] = source_path
+
+    for relative_path in sorted(PUBLIC_DOC_ASSET_PATHS, key=lambda path: path.as_posix()):
+        source_path = source_root / relative_path
+        _assert_regular_source_file(source_path, relative_path=relative_path)
+        selected[relative_path] = source_path
 
     for relative_path in sorted(
         CURRENT_DIAGRAM_PATHS,

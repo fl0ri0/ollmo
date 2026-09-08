@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
+from ollmo_services.state_flow import observe_state, observe_mapping_digest, note as state_flow_note
+
+from ollmo_services.events import measure_operation, timed_operation, observe_transition, exact_target
+
 import base64
 import binascii
 import json
@@ -18,7 +24,10 @@ from ollmo_orchestration.working_frame import build_working_frame, compact_worki
 from ollmo_services.artifact_dossiers import build_artifact_dossier_index
 from ollmo_services.control_snapshots import build_control_snapshot
 from ollmo_services.frame_planning import build_artifact_flow_plan
-from ollmo_services.redraw_scope import canonicalize_duplicate_artifact_refs
+from ollmo_services.redraw_scope import (
+    apply_artifact_identity_to_outputs,
+    canonicalize_duplicate_artifact_refs,
+)
 from ollmo_services import response_wire as _response_wire_policy
 from ollmo_services.responses import (
     build_canonical_response_artifacts,
@@ -956,6 +965,7 @@ def _build_error_frame(response_payload: Mapping[str, Any]) -> Optional[dict[str
     return None
 
 
+@observe_state('response_frame.runtime_copy', 'response_payload', 'frame_runtime_subtree', labels=('NEW_REPRESENTATION',), full_normalization=True)
 def _build_runtime_frame(response_payload: Mapping[str, Any]) -> dict[str, Any]:
     runtime = dict(response_payload.get('runtime') or {}) if isinstance(response_payload.get('runtime'), Mapping) else {}
     runtime.pop('working_frame', None)
@@ -1589,6 +1599,7 @@ def _reconcile_output_branches_with_slots(
     return _json_safe(reconciled)
 
 
+@observe_state('response_frame.current_state_copy', 'response_payload', 'frame_current_state_subtree', labels=('NEW_REPRESENTATION',))
 def _build_current_state_frame(
     response_payload: Mapping[str, Any],
     *,
@@ -1656,8 +1667,11 @@ def _build_current_state_frame(
 
 
 def _frame_digest(response_frame: Mapping[str, Any]) -> str:
-    encoded = json.dumps(_json_safe(response_frame), ensure_ascii=False, sort_keys=True).encode('utf-8')
-    return hashlib.sha256(encoded).hexdigest()[:16]
+    with measure_operation('frame_identity_serialization', role='canonical_identity'):
+        encoded = json.dumps(_json_safe(response_frame), ensure_ascii=False, sort_keys=True).encode('utf-8')
+    state_flow_note(frame_serializations=1, frame_serialized_bytes=len(encoded), frame_hashed_bytes=len(encoded))
+    with measure_operation('frame_identity_hash', role='canonical_identity'):
+        return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def _ledger_path(
@@ -2245,6 +2259,7 @@ def _split_sidecar_payload_for_cas(
                     _sidecar_child_key=key,
                     _sidecar_parent_json_path=json_path,
                     _sidecar_split_counter=split_counter,
+                    _media_normalized=True,
                 )
                 payload[f'{key}_snapshot_ref'] = _json_safe(ref)
                 child_refs.append(
@@ -2308,6 +2323,7 @@ def _coerce_frame_sequence(value: Any, fallback: int | None = None) -> int | Non
         return fallback
 
 
+@observe_mapping_digest
 def _response_map_digest(responses: Mapping[str, Any]) -> str:
     """Return a stable digest binding the complete response-index mapping."""
 
@@ -2317,6 +2333,7 @@ def _response_map_digest(responses: Mapping[str, Any]) -> str:
         sort_keys=True,
         separators=(',', ':'),
     ).encode('utf-8')
+    state_flow_note(index_full_map_digest_passes=1, index_map_serialized_bytes=len(canonical), index_map_hashed_bytes=len(canonical))
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -2377,6 +2394,7 @@ def _response_frame_index_has_verified_response_map(
     return verified_digest == _response_map_digest(responses)
 
 
+@timed_operation('index_parent_frame_stub', role='canonical_parent_lookup')
 def _index_parent_frame_stub(
     response_id: str,
     *,
@@ -2455,6 +2473,8 @@ def _index_next_line_offset(index_state: Mapping[str, Any], target: Path) -> Opt
     return None
 
 
+@timed_operation('iter_ledger_frames', role='canonical_ledger_fallback')
+@observe_state('response_frame.ledger_scan', 'ledger_representation', 'ledger_frame_records', labels=('RECONSTRUCTION',))
 def _iter_ledger_frames(target: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     frames: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -2489,6 +2509,7 @@ def _iter_ledger_frames(target: Path) -> tuple[list[dict[str, Any]], list[dict[s
     return frames, errors
 
 
+@timed_operation('enrich_response_frame_metadata', role='canonical_identity')
 def enrich_response_frame_metadata(
     response_frame: Mapping[str, Any],
     *,
@@ -2629,29 +2650,45 @@ def _write_snapshot_ref(
     _sidecar_child_key: str | None = None,
     _sidecar_parent_json_path: str | None = None,
     _sidecar_split_counter: Optional[list[int]] = None,
+    _media_normalized: bool = False,
 ) -> dict[str, Any]:
+    state_flow_note(snapshot_root_calls=int(not _sidecar_child_ref), snapshot_child_calls=int(_sidecar_child_ref), recursive_split_operations=int(_sidecar_child_ref), snapshot_preparations=int(not _media_normalized))
     response_id = _safe_path_token(_frame_response_id(frame) or 'unknown_response')
     frame_id = _safe_path_token(frame.get('frame_id') or f'frame-{_frame_digest(frame)}')
-    snapshot_value = _normalize_snapshot_media_payloads(
-        _json_safe(value),
-        frames_dir=frames_dir,
-    )
+    # Only recursive splitting passes this flag: its child is a subtree of
+    # the parent's private, fully media-normalized JSON copy. Splitting reads
+    # that copy without mutating it. Raw media has already become digest-bound
+    # evidence (or an explicit orphan descriptor); another traversal would not
+    # recheck the artifact file. Independent snapshot calls still prepare anew.
+    if _media_normalized:
+        snapshot_value = value
+    else:
+        with measure_operation('snapshot_media_normalization', role='canonical_truth'):
+            snapshot_value = _normalize_snapshot_media_payloads(
+                _json_safe(value),
+                frames_dir=frames_dir,
+            )
     split_counter = (
         _sidecar_split_counter
         if isinstance(_sidecar_split_counter, list)
         else [0]
     )
-    safe_value, child_refs = _split_sidecar_payload_for_cas(
-        snapshot_value,
-        frame=frame,
-        frames_dir=frames_dir,
-        json_path=json_path,
-        depth=_sidecar_depth,
-        split_counter=split_counter,
-    )
-    safe_value, normalization = _normalize_snapshot_content(safe_value, json_path=json_path)
-    encoded = json.dumps(safe_value, ensure_ascii=False, sort_keys=True, indent=2).encode('utf-8')
-    digest = hashlib.sha256(encoded).hexdigest()
+    with measure_operation('snapshot_recursive_split', role='canonical_truth'):
+        safe_value, child_refs = _split_sidecar_payload_for_cas(
+            snapshot_value,
+            frame=frame,
+            frames_dir=frames_dir,
+            json_path=json_path,
+            depth=_sidecar_depth,
+            split_counter=split_counter,
+        )
+    with measure_operation('snapshot_timestamp_normalization', role='canonical_truth'):
+        safe_value, normalization = _normalize_snapshot_content(safe_value, json_path=json_path)
+    with measure_operation('snapshot_serialization', role='canonical_truth'):
+        encoded = json.dumps(safe_value, ensure_ascii=False, sort_keys=True, indent=2).encode('utf-8')
+    with measure_operation('snapshot_content_addressing', role='canonical_identity'):
+        digest = hashlib.sha256(encoded).hexdigest()
+    state_flow_note(snapshot_serializations=1, snapshot_serialized_bytes=len(encoded), snapshot_hashed_bytes=len(encoded), identity_kind='produced_cas', identity=digest)
     relative_path = (
         Path(DEFAULT_RESPONSE_FRAME_SNAPSHOT_DIR)
         / DEFAULT_RESPONSE_FRAME_SNAPSHOT_CONTENT_DIR
@@ -2706,6 +2743,7 @@ def _write_snapshot_ref(
     return ref
 
 
+@timed_operation('snapshot_file_matches', role='canonical_integrity')
 def _snapshot_file_matches(
     target: Path,
     *,
@@ -2716,13 +2754,16 @@ def _snapshot_file_matches(
         raw = target.read_bytes()
     except OSError:
         return False
+    state_flow_note(sidecar_verification_reads=1, sidecar_verification_read_bytes=len(raw))
     payload = raw[:-1] if raw.endswith(b'\n') else raw
+    state_flow_note(sidecar_verification_hashed_bytes=len(payload) if len(payload) == expected_size_bytes else 0)
     return (
         len(payload) == expected_size_bytes
         and hashlib.sha256(payload).hexdigest() == expected_sha256
     )
 
 
+@timed_operation('atomic_replace_file_bytes', role='caller_durability')
 def _atomic_replace_file_bytes(target: Path, payload: bytes) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, temp_name = tempfile.mkstemp(
@@ -2733,14 +2774,18 @@ def _atomic_replace_file_bytes(target: Path, payload: bytes) -> None:
     temp_path = Path(temp_name)
     try:
         with os.fdopen(file_descriptor, 'wb') as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, target)
+            with measure_operation('atomic_file_write', role='caller_durability'):
+                handle.write(payload)
+            with measure_operation('atomic_file_flush_fsync', role='caller_durability'):
+                handle.flush()
+                os.fsync(handle.fileno())
+        with measure_operation('atomic_replace', role='caller_durability'):
+            os.replace(temp_path, target)
         try:
             directory_fd = os.open(target.parent, os.O_RDONLY)
             try:
-                os.fsync(directory_fd)
+                with measure_operation('directory_fsync', role='caller_durability'):
+                    os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
         except OSError:
@@ -2754,6 +2799,7 @@ def _atomic_replace_file_bytes(target: Path, payload: bytes) -> None:
             pass
 
 
+@timed_operation('ensure_content_addressed_snapshot', role='canonical_truth')
 def _ensure_content_addressed_snapshot(
     target: Path,
     *,
@@ -2767,8 +2813,10 @@ def _ensure_content_addressed_snapshot(
         expected_sha256=expected_sha256,
         expected_size_bytes=len(encoded),
     ):
+        state_flow_note(cas_existing_matches=1)
         return
     _atomic_replace_file_bytes(target, encoded + b'\n')
+    state_flow_note(cas_actual_writes=1, cas_written_bytes=len(encoded)+1)
     if not _snapshot_file_matches(
         target,
         expected_sha256=expected_sha256,
@@ -3539,70 +3587,6 @@ def _artifact_identity_summary(canonicalized: Mapping[str, Any]) -> dict[str, An
     }
 
 
-def _canonical_artifact_aliases(artifacts: Any) -> dict[str, dict[str, Any]]:
-    aliases: dict[str, dict[str, Any]] = {}
-    if not isinstance(artifacts, list):
-        return aliases
-    for artifact in artifacts:
-        if not isinstance(artifact, Mapping):
-            continue
-        artifact_ref = _artifact_ref_from_projection(artifact)
-        if not artifact_ref:
-            continue
-        payload = {}
-        if artifact.get('alias_artifact_refs') not in (None, '', [], {}):
-            payload['alias_artifact_refs'] = artifact.get('alias_artifact_refs')
-        if artifact.get('alias_metadata') not in (None, '', [], {}):
-            payload['alias_metadata'] = artifact.get('alias_metadata')
-        if payload:
-            aliases[artifact_ref] = _json_safe(payload)
-    return aliases
-
-
-def _apply_artifact_identity_to_outputs(
-    outputs: Any,
-    *,
-    artifact_identity: Mapping[str, Any],
-    canonical_artifacts: Any,
-) -> list[dict[str, Any]]:
-    if not isinstance(outputs, list):
-        return []
-    identity = artifact_identity if isinstance(artifact_identity, Mapping) else {}
-    if not identity.get('canonicalization_required'):
-        return _json_safe(outputs)
-    alias_by_ref = _canonical_artifact_aliases(canonical_artifacts)
-    conflict_refs = {
-        str(item.get('artifact_ref') or '').strip()
-        for item in (identity.get('conflicts') or [])
-        if isinstance(item, Mapping) and str(item.get('artifact_ref') or '').strip()
-    }
-    projected: list[dict[str, Any]] = []
-    seen_refs: set[str] = set()
-    for item in outputs:
-        if not isinstance(item, Mapping):
-            continue
-        payload = dict(item)
-        artifact_ref = _artifact_ref_from_projection(payload)
-        if artifact_ref in conflict_refs:
-            if artifact_ref in seen_refs:
-                continue
-            seen_refs.add(artifact_ref)
-            payload['artifact_ref'] = artifact_ref
-            payload['status'] = 'repair_needed'
-            payload['blocked_reason'] = 'conflicting_duplicate_artifact_ref'
-            payload['final_projection_blocked'] = True
-            projected.append(_json_safe(payload))
-            continue
-        if artifact_ref:
-            if artifact_ref in seen_refs:
-                continue
-            seen_refs.add(artifact_ref)
-            if artifact_ref in alias_by_ref:
-                payload.update(alias_by_ref[artifact_ref])
-        projected.append(_json_safe(payload))
-    return projected
-
-
 def _prune_artifact_projections(frame: dict[str, Any]) -> None:
     output = frame.get('output') if isinstance(frame.get('output'), dict) else {}
     if isinstance(output.get('outputs'), list):
@@ -3648,6 +3632,10 @@ def _effective_snapshot_manifest(
     return effective
 
 
+@observe_transition('response_frame.callback_manifest_expansion',
+                    target=lambda a: exact_target(a['frame']),
+                    only_within=('late_fill.callback.lookup', 'late_fill.initial_lookup'))
+@observe_state('response_frame.manifest_expansion', 'compacted_frame', 'manifest_expanded_frame', labels=('RECONSTRUCTION',))
 def _expand_frame_snapshot_manifest(
     frame: Mapping[str, Any],
     *,
@@ -3826,6 +3814,15 @@ def _runtime_snapshot_payload(
         else None
     )
     if developer_diagnostics:
+        # Causal observations have their own small SHA sidecar. They must not
+        # copy or renormalize the graph/contract bodies on every invocation.
+        _externalize_large_children(
+            developer_diagnostics,
+            base_json_path=developer_diagnostics_json_path,
+            snapshot=snapshot,
+            keys={'causal_telemetry'},
+            min_size_bytes=1,
+        )
         _externalize_graph_patch_lifecycle_result_graph_bodies(
             developer_diagnostics,
             base_json_path=developer_diagnostics_json_path,
@@ -4479,7 +4476,16 @@ def _hydrate_manifest_authorized_snapshot_children(
     response_id: str,
     json_path: str,
     ref_depth: int = 0,
+    _defer_sanitize: bool = False,
 ) -> Any:
+    # Sanitize the complete restored tree once. Copying every subtree again at
+    # every recursion level makes large Late Fill snapshots prohibitively slow.
+    if not _defer_sanitize:
+        return _json_safe(_hydrate_manifest_authorized_snapshot_children(
+            value, frames_dir=frames_dir, trusted_manifest=trusted_manifest,
+            response_id=response_id, json_path=json_path, ref_depth=ref_depth,
+            _defer_sanitize=True,
+        ))
     if ref_depth > 128:
         return _json_safe(value)
     if isinstance(value, list):
@@ -4491,12 +4497,14 @@ def _hydrate_manifest_authorized_snapshot_children(
                 response_id=response_id,
                 json_path=_json_child_path(json_path, f'[{index}]'),
                 ref_depth=ref_depth,
+                _defer_sanitize=True,
             )
             for index, item in enumerate(value)
         ]
     if not isinstance(value, Mapping):
         return value
     payload = dict(value)
+    restored_keys = set()
     for raw_key, ref in list(payload.items()):
         key = str(raw_key or '').strip()
         if not key.endswith('_snapshot_ref') or not isinstance(ref, Mapping):
@@ -4527,9 +4535,13 @@ def _hydrate_manifest_authorized_snapshot_children(
             response_id=response_id,
             json_path=body_path,
             ref_depth=ref_depth + 1,
+            _defer_sanitize=True,
         )
+        restored_keys.add(body_key)
         payload.pop(raw_key, None)
     for key, item in list(payload.items()):
+        if key in restored_keys:
+            continue
         payload[key] = _hydrate_manifest_authorized_snapshot_children(
             item,
             frames_dir=frames_dir,
@@ -4537,8 +4549,9 @@ def _hydrate_manifest_authorized_snapshot_children(
             response_id=response_id,
             json_path=_json_child_path(json_path, str(key)),
             ref_depth=ref_depth,
+            _defer_sanitize=True,
         )
-    return _json_safe(payload)
+    return payload
 
 
 def _read_manifest_authorized_snapshot_payload(
@@ -4909,6 +4922,8 @@ def _public_body_snapshot_integrity_error(
     return None
 
 
+@timed_operation('compact_response_frame_for_ledger', role='canonical_truth')
+@observe_state('response_frame.compact', 'response_frame_before_compaction', 'compacted_response_frame', labels=('NEW_REPRESENTATION',), full_compaction=True, full_normalization=True)
 def compact_response_frame_for_ledger(
     response_frame: Mapping[str, Any],
     *,
@@ -5141,6 +5156,8 @@ def compact_response_frame_for_ledger(
     return _json_safe(frame)
 
 
+@timed_operation('write_response_frame_index', role='derived_recovery_index')
+@observe_state('response_index.write', 'ledger_representation', 'response_index', labels=('NEW_REPRESENTATION',))
 def _write_response_frame_index(
     enriched_frame: Mapping[str, Any],
     *,
@@ -5245,7 +5262,9 @@ def _write_response_frame_index(
         )
         + '\n'
     ).encode('utf-8')
+    state_flow_note(index_serializations=1, index_serialized_bytes=len(encoded_index))
     _atomic_replace_file_bytes(target, encoded_index)
+    state_flow_note(index_writes=1, index_written_bytes=len(encoded_index))
 
 
 def load_response_frame_index(
@@ -6015,6 +6034,7 @@ def attest_response_frame_index(
         return result
 
 
+@observe_state('response_frame.verify_epoch', 'ledger_and_response_index', 'verified_epoch', labels=('REVALIDATION', 'NEW_AUTHORITY_BOUNDARY'), new_authority_boundary=True)
 def verify_response_frame_epoch(
     *,
     frames_dir: Path | str = DEFAULT_RESPONSE_FRAMES_DIR,
@@ -6201,6 +6221,7 @@ def verify_response_frame_epoch(
             'line_length',
         )
         rebound_responses: dict[str, Any] = {}
+        response_map_rebound = False
         source_frame_sha256_by_response: dict[str, str] = {}
         for response_id in sorted(scanned_response_ids):
             entry = responses.get(response_id)
@@ -6229,6 +6250,11 @@ def verify_response_frame_epoch(
             rebound_entry = dict(entry)
             rebound_entry['ledger_path'] = str(ledger_path)
             rebound_entry['ledger_name'] = ledger_path.name
+            if (
+                entry.get('ledger_path') != rebound_entry['ledger_path']
+                or entry.get('ledger_name') != rebound_entry['ledger_name']
+            ):
+                response_map_rebound = True
             rebound_responses[response_id] = rebound_entry
             source_frame_sha256_by_response[response_id] = str(
                 scanned_entry.get('source_frame_sha256') or ''
@@ -6265,7 +6291,16 @@ def verify_response_frame_epoch(
             # bind its derived acceleration digest to those in-memory bytes.
             # ``response_map_digest`` returned below remains the exact source
             # index digest and neither source file is changed.
-            'response_map_digest': _response_map_digest(rebound_responses),
+            # Both mappings are private to this verification call. Only the
+            # two fields above can differ; exact unchanged values preserve the
+            # already verified digest. Relocation (including merely different
+            # path spelling) still requires a new digest. This does not reuse
+            # file freshness evidence or bypass downstream map verification.
+            'response_map_digest': (
+                _response_map_digest(rebound_responses)
+                if response_map_rebound
+                else verified_response_map_digest
+            ),
         })
         return {
             'ok': True,
@@ -6290,6 +6325,7 @@ def verify_response_frame_epoch(
         }
 
 
+@observe_state('response_frame.build', 'live_response_record', 'response_frame_before_compaction', labels=('NEW_REPRESENTATION',))
 def build_response_frame(
     response_payload: Mapping[str, Any],
     *,
@@ -6426,7 +6462,7 @@ def build_response_frame(
             if isinstance(output, Mapping)
             and not response_item_is_internal_control_work(output)
         ]
-    outputs = _apply_artifact_identity_to_outputs(
+    outputs = apply_artifact_identity_to_outputs(
         outputs,
         artifact_identity=artifact_identity,
         canonical_artifacts=output_artifacts,
@@ -6527,6 +6563,7 @@ def attach_response_frame(
     return payload
 
 
+@observe_state('response_frame.persist', 'response_frame_before_compaction', 'ledger_representation', labels=('NEW_AUTHORITY_BOUNDARY', 'NEW_REPRESENTATION'), new_authority_boundary=True)
 def _persist_response_frame_locked(
     response_frame: Mapping[str, Any],
     *,
@@ -6648,11 +6685,15 @@ def _persist_response_frame_locked(
         else:
             line_offset = 0
     byte_offset = target.stat().st_size if target.exists() else 0
-    encoded_line = json.dumps(_json_safe(ledger_frame), ensure_ascii=False, sort_keys=True).encode('utf-8') + b'\n'
+    with measure_operation('ledger_serialization', role='canonical_truth'):
+        encoded_line = json.dumps(_json_safe(ledger_frame), ensure_ascii=False, sort_keys=True).encode('utf-8') + b'\n'
+    state_flow_note(ledger_serializations=1, ledger_serialized_bytes=len(encoded_line))
     with target.open('ab') as handle:
-        handle.write(encoded_line)
-        handle.flush()
-        os.fsync(handle.fileno())
+        with measure_operation('ledger_append_flush_fsync', role='canonical_durability'):
+            handle.write(encoded_line)
+            handle.flush()
+            os.fsync(handle.fileno())
+    state_flow_note(ledger_appends=1, ledger_written_bytes=len(encoded_line))
     _write_response_frame_index(
         ledger_frame,
         ledger_path=target,
@@ -6920,6 +6961,22 @@ def response_payload_from_frame(
                 outputs=canonical_outputs,
             )
             payload['artifacts'] = _json_safe(public_artifacts)
+    # Slot hydration cannot overturn the frozen frame's artifact adjudication.
+    # A conflict is resolved by a newly validated frame, never by a read.
+    artifact_identity = (
+        output.get('artifact_identity')
+        if isinstance(output.get('artifact_identity'), Mapping)
+        else {}
+    )
+    if artifact_identity.get('canonicalization_required'):
+        payload['outputs'] = apply_artifact_identity_to_outputs(
+            payload.get('outputs'),
+            artifact_identity=artifact_identity,
+            canonical_artifacts=payload.get('artifacts'),
+        )
+        payload['artifacts'] = filter_public_response_artifacts(
+            payload, payload.get('artifacts'), outputs=payload['outputs'],
+        )
     payload['durability'] = {
         'source': 'response_frame_ledger',
         'recovered': True,
@@ -6938,6 +6995,10 @@ def response_payload_from_frame(
     return safe_payload
 
 
+@observe_transition('response_frame.callback_payload_hydration',
+                    target=lambda a: exact_target(a['response_frame']),
+                    only_within=('late_fill.callback.lookup', 'late_fill.initial_lookup'))
+@observe_state('response_frame.canonical_reconstruction', 'compacted_frame_and_CAS', 'canonical_response_payload', labels=('RECONSTRUCTION', 'REVALIDATION'), full_reconstruction=True, full_hydration=True)
 def _canonical_response_payload_from_frame(
     response_frame: Mapping[str, Any],
     *,
@@ -6981,11 +7042,13 @@ def load_response_frame_records(
     }
 
 
+@timed_operation('read_indexed_response_frame', role='canonical_parent_lookup')
 def _read_indexed_response_frame(
     index_entry: Mapping[str, Any],
     *,
     ledger_path: Path,
     response_id: str,
+    _raw_line_digests: Optional[list[str]] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
     byte_offset = _coerce_frame_sequence(index_entry.get('byte_offset'))
     if byte_offset is None or byte_offset < 0:
@@ -6998,6 +7061,7 @@ def _read_indexed_response_frame(
             raw_line = handle.readline()
     except OSError as exc:
         return None, {'code': 'response_frame_index_read_failed', 'message': str(exc)}
+    state_flow_note(indexed_frame_reads=1, indexed_frame_read_bytes=len(raw_line))
     if not raw_line:
         return None, {'code': 'response_frame_index_empty_line', 'message': 'Index byte offset did not contain a ledger line.'}
     try:
@@ -7014,6 +7078,8 @@ def _read_indexed_response_frame(
         return None, {'code': 'response_frame_index_frame_mismatch', 'message': 'Indexed frame id does not match the ledger line.'}
     if latest_frame_sequence not in (None, '') and frame.get('frame_sequence') != latest_frame_sequence:
         return None, {'code': 'response_frame_index_sequence_mismatch', 'message': 'Indexed frame sequence does not match the ledger line.'}
+    if _raw_line_digests is not None:
+        _raw_line_digests.append(hashlib.sha256(raw_line).hexdigest())
     return frame, None
 
 
@@ -7027,7 +7093,15 @@ def _expand_sidecar_child_refs(
     current_json_path: str = '',
     source_response_id: str = '',
     trusted_child_refs: Optional[Mapping[str, Any]] = None,
+    _defer_sanitize: bool = False,
 ) -> Any:
+    if not _defer_sanitize:
+        return _json_safe(_expand_sidecar_child_refs(
+            value, frames_dir=frames_dir, depth=depth, max_depth=max_depth,
+            strict_child_refs=strict_child_refs, current_json_path=current_json_path,
+            source_response_id=source_response_id, trusted_child_refs=trusted_child_refs,
+            _defer_sanitize=True,
+        ))
     if depth >= max_depth:
         return _json_safe(value)
     if isinstance(value, dict):
@@ -7117,8 +7191,9 @@ def _expand_sidecar_child_refs(
                 current_json_path=_json_child_path(current_json_path, key),
                 source_response_id=source_response_id,
                 trusted_child_refs=trusted_child_refs,
+                _defer_sanitize=True,
             )
-        return _json_safe(payload)
+        return payload
     if isinstance(value, list):
         return [
             _expand_sidecar_child_refs(
@@ -7133,10 +7208,11 @@ def _expand_sidecar_child_refs(
                 ),
                 source_response_id=source_response_id,
                 trusted_child_refs=trusted_child_refs,
+                _defer_sanitize=True,
             )
             for index, item in enumerate(value)
         ]
-    return _json_safe(value)
+    return value
 
 
 def _read_snapshot_ref_payload(
@@ -7161,8 +7237,10 @@ def _read_snapshot_ref_payload(
         raw = target.read_bytes()
     except OSError:
         return None
+    state_flow_note(sidecar_payload_reads=1, sidecar_payload_read_bytes=len(raw), identity_kind='consumed_cas', identity=ref.get('sha256'))
     expected_sha = str(ref.get('sha256') or '').strip()
     if expected_sha:
+        state_flow_note(sidecar_payload_hashed_bytes=len(raw.rstrip(b'\n')))
         actual_sha = hashlib.sha256(raw.rstrip(b'\n')).hexdigest()
         if actual_sha != expected_sha:
             return None
@@ -7170,6 +7248,7 @@ def _read_snapshot_ref_payload(
         payload = json.loads(raw.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+    state_flow_note(sidecar_payload_json_decodes=1, sidecar_payload_decoded_bytes=len(raw))
     if expand_child_refs:
         sidecar_manifest = (
             ref.get('sidecar_manifest')
@@ -7194,7 +7273,7 @@ def _read_snapshot_ref_payload(
             ).strip(),
             trusted_child_refs=trusted_child_refs,
         )
-    return _json_safe(payload)
+    return payload if expand_child_refs else _json_safe(payload)
 
 
 _GRAPH_REBASE_OBSERVATION_GRAPH_KEYS = {
@@ -7362,6 +7441,7 @@ def _read_observation_snapshot_bytes(
     ref: Any,
     *,
     frames_dir: Path | str,
+    _read_witness: Optional[list[tuple[bytes, str, bytes]]] = None,
 ) -> tuple[bytes, Optional[dict[str, Any]]]:
     if not isinstance(ref, Mapping):
         return b'', None
@@ -7369,13 +7449,23 @@ def _read_observation_snapshot_bytes(
     if not str(relative_path) or relative_path.is_absolute() or '..' in relative_path.parts:
         return b'', {'code': 'response_frame_snapshot_ref_invalid'}
     target = Path(frames_dir) / relative_path
+    before = _response_frame_file_state(target) if _read_witness is not None else None
     try:
         raw = target.read_bytes()
     except OSError as exc:
         return b'', {'code': 'response_frame_snapshot_read_failed', 'message': str(exc)}
+    state_flow_note(observation_sidecar_reads=1, observation_sidecar_read_bytes=len(raw), identity_kind='consumed_cas', identity=ref.get('sha256'))
     expected_sha = str(ref.get('sha256') or '').strip()
+    state_flow_note(observation_sidecar_hashed_bytes=len(raw.rstrip(b'\n')) if expected_sha else 0)
     if expected_sha and hashlib.sha256(raw.rstrip(b'\n')).hexdigest() != expected_sha:
         return b'', {'code': 'response_frame_snapshot_digest_mismatch'}
+    if _read_witness is not None:
+        after = _response_frame_file_state(target)
+        _read_witness.append((
+            _observation_binding_bytes(ref),
+            hashlib.sha256(raw).hexdigest(),
+            _observation_binding_bytes(after) if before is not None and before == after else b'',
+        ))
     return raw, None
 
 
@@ -7383,12 +7473,14 @@ def _read_observation_snapshot_payload(
     ref: Any,
     *,
     frames_dir: Path | str,
+    _read_witness: Optional[list[tuple[bytes, str, bytes]]] = None,
 ) -> tuple[Any, Optional[dict[str, Any]]]:
     if not isinstance(ref, Mapping) or not str(ref.get('path') or '').strip():
         return None, None
     raw, snapshot_error = _read_observation_snapshot_bytes(
         ref,
         frames_dir=frames_dir,
+        **({'_read_witness': _read_witness} if _read_witness is not None else {}),
     )
     if snapshot_error:
         return None, snapshot_error
@@ -7399,6 +7491,7 @@ def _read_observation_snapshot_payload(
             'code': 'response_frame_snapshot_corrupt',
             'message': str(exc),
         }
+    state_flow_note(observation_json_decodes=1, observation_decoded_bytes=len(raw))
     return _json_safe(payload), None
 
 
@@ -7665,6 +7758,7 @@ def _hydrate_observation_named_snapshots(
     *,
     keys: set[str],
     frames_dir: Path | str,
+    _read_witness: Optional[list[tuple[bytes, str, bytes]]] = None,
     base_json_path: str = '',
     errors: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
@@ -7678,6 +7772,7 @@ def _hydrate_observation_named_snapshots(
         expanded, snapshot_error = _read_observation_snapshot_payload(
             ref,
             frames_dir=frames_dir,
+            **({'_read_witness': _read_witness} if _read_witness is not None else {}),
         )
         if snapshot_error:
             if errors is not None:
@@ -7836,18 +7931,150 @@ def _project_graph_closure_observation(
     return _json_safe(projected)
 
 
+def _observation_binding_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+
+def _observation_reuse_binding(
+    response_id: str,
+    frames_dir: Path | str,
+    index_state: Mapping[str, Any],
+    verified_epoch: Optional[Mapping[str, Any]],
+) -> Optional[bytes]:
+    """Bind private observation inputs to the still-current verified source epoch."""
+    if not isinstance(verified_epoch, Mapping) or verified_epoch.get('ok') is not True:
+        return None
+    if verified_epoch.get('relocated') is True:
+        return None
+    ledger = Path(str(verified_epoch.get('ledger_path') or ''))
+    index = Path(str(verified_epoch.get('index_path') or ''))
+    root = Path(frames_dir).resolve()
+    if ledger.resolve().parent != root or index.resolve().parent != root:
+        return None
+    if (
+        _response_frame_file_state(ledger) != verified_epoch.get('ledger_file_state')
+        or _response_frame_file_state(index) != verified_epoch.get('index_file_state')
+        or index_state.get('response_map_digest') != verified_epoch.get('response_map_digest')
+    ):
+        return None
+    entry = (index_state.get('responses') or {}).get(response_id)
+    if not isinstance(entry, Mapping):
+        return None
+    # The complete map is rehashed by the ordinary loader/freshness check.
+    # Its attested digest binds every entry; only the consumed entry is copied.
+    return _observation_binding_bytes({
+        'response_id': response_id,
+        'frames_dir': str(root),
+        'index': {k: v for k, v in index_state.items() if k != 'responses'},
+        'entry': entry,
+        'epoch': {k: v for k, v in verified_epoch.items() if k != 'index_state'},
+    })
+
+
+def _observation_read_witness_is_current(
+    reads: list[tuple[bytes, str, bytes]] | tuple,
+    frames_dir: Path | str,
+) -> bool:
+    return all(
+        state and _observation_binding_bytes(_response_frame_file_state(
+            Path(frames_dir) / json.loads(ref)['path']
+        )) == state
+        for ref, _digest, state in reads
+    )
+
+
+class _ObservationReuseCandidate:
+    """Single-use private receipt, containing only immutable bytes/tuples.
+
+    Never serialize this object into a response, index, registry, or epoch.
+    The first caller's mutable observation has no alias into this receipt.
+    """
+
+    __slots__ = ('_receipt', '_lock')
+
+    def __init__(self, receipt: tuple):
+        self._receipt = receipt
+        self._lock = threading.Lock()
+
+    def take(self) -> Optional[tuple]:
+        with self._lock:
+            receipt, self._receipt = self._receipt, None
+        return receipt
+
+
+@observe_state('readiness.verify_private_reuse', 'private_observation_candidate', 'verified_observation_or_fallback', labels=('REVALIDATION',))
+def _reuse_response_observation_if_current(
+    candidate: Any,
+    response_id: str,
+    *,
+    frames_dir: Path | str,
+    index_state: Mapping[str, Any],
+    verified_epoch: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Recheck source bytes and normal integrity gates, skipping only JSON hydration.
+
+    Failure is a cache miss, not authority to recover or accept stale evidence.
+    The caller runs the unchanged canonical loader on any miss.
+    """
+    if type(candidate) is not _ObservationReuseCandidate:
+        return None
+    receipt = candidate.take()
+    if receipt is None:
+        return None
+    binding, observed_bytes, frame_digests, reads = receipt
+    if binding != _observation_reuse_binding(response_id, frames_dir, index_state, verified_epoch):
+        return None
+    entry = (index_state.get('responses') or {}).get(response_id)
+    ledger_path = Path(str(entry.get('ledger_path') or verified_epoch['ledger_path']))
+    if not _response_frame_index_has_verified_response_map(index_state, ledger_path):
+        return None
+    current_digests: list[str] = []
+    frame, error = _read_indexed_response_frame(
+        entry, ledger_path=ledger_path, response_id=response_id,
+        _raw_line_digests=current_digests,
+    )
+    if error or not frame or tuple(current_digests) != frame_digests:
+        return None
+    for ref_bytes, digest, file_state in reads:
+        ref = json.loads(ref_bytes)
+        target = Path(frames_dir) / ref['path']
+        before = _response_frame_file_state(target)
+        raw, error = _read_observation_snapshot_bytes(ref, frames_dir=frames_dir)
+        if (
+            error or _observation_binding_bytes(before) != file_state
+            or _response_frame_file_state(target) != before
+            or hashlib.sha256(raw).hexdigest() != digest
+        ):
+            return None
+    # A source read earlier in the sequence may have moved during a later read.
+    if not _observation_read_witness_is_current(reads, frames_dir):
+        return None
+    if binding != _observation_reuse_binding(response_id, frames_dir, index_state, verified_epoch):
+        return None
+    with measure_operation('readiness_observation_reuse', role='derived_readiness_evidence'):
+        state_flow_note(private_observation_reuses=1, private_observation_decoded_bytes=len(observed_bytes))
+        return json.loads(observed_bytes)
+
+
+@observe_state('response_frame.bounded_observation_load', 'ledger_and_CAS', 'bounded_observation', labels=('RECONSTRUCTION', 'REVALIDATION'), full_reconstruction=False, full_hydration=False)
 def load_latest_response_observation_state(
     response_id: str,
     *,
     frames_dir: Path | str = DEFAULT_RESPONSE_FRAMES_DIR,
     ledger_name: str = DEFAULT_RESPONSE_FRAME_LEDGER,
     index_state: Optional[Mapping[str, Any]] = None,
+    _verified_epoch: Optional[Mapping[str, Any]] = None,
+    _reuse_candidates: Optional[list[Any]] = None,
 ) -> dict[str, Any]:
     """Load bounded latest-frame truth for rollout observers without full hydration.
 
     This deliberately resolves only response identity, request metadata, Late
     Fill state, graph-rebase records, scope review, and rebase diagnostics.  It
     never expands artifact, output, work-tree, or unrelated recursive sidecars.
+
+    The private reuse output is opt-in for one readiness append only. It holds
+    immutable read receipts; callers must still pass all current authority and
+    integrity checks before skipping a second observation reconstruction.
     """
 
     normalized_id = str(response_id or '').strip()
@@ -7874,6 +8101,12 @@ def load_latest_response_observation_state(
     ledger_path = Path(
         str(entry.get('ledger_path') or '').strip()
         or _ledger_path(frames_dir=frames_dir, ledger_name=ledger_name)
+    )
+    read_witness = [] if _reuse_candidates is not None else None
+    raw_line_digests = [] if _reuse_candidates is not None else None
+    reuse_binding = (
+        _observation_reuse_binding(normalized_id, frames_dir, current_index, _verified_epoch)
+        if _reuse_candidates is not None else None
     )
     # A size-aligned entry is not enough: a failed index write followed by an
     # unrelated append can make an older response coordinate look current.
@@ -7903,6 +8136,7 @@ def load_latest_response_observation_state(
         entry,
         ledger_path=ledger_path,
         response_id=normalized_id,
+        **({'_raw_line_digests': raw_line_digests} if raw_line_digests is not None else {}),
     )
     if not frame:
         return {
@@ -7927,6 +8161,7 @@ def load_latest_response_observation_state(
     runtime_snapshot, runtime_snapshot_error = _read_observation_snapshot_payload(
         runtime_ref,
         frames_dir=frames_dir,
+        **({'_read_witness': read_witness} if read_witness is not None else {}),
     )
     if runtime_snapshot_error:
         return _observation_snapshot_failure(
@@ -7950,6 +8185,7 @@ def load_latest_response_observation_state(
     raw_graph, graph_snapshot_error = _read_observation_snapshot_payload(
         graph_ref,
         frames_dir=frames_dir,
+        **({'_read_witness': read_witness} if read_witness is not None else {}),
     )
     if graph_snapshot_error:
         return _observation_snapshot_failure(
@@ -7973,6 +8209,7 @@ def load_latest_response_observation_state(
         frames_dir=frames_dir,
         base_json_path='runtime.request_phase_graph',
         errors=graph_snapshot_errors,
+        **({'_read_witness': read_witness} if read_witness is not None else {}),
     )
     if graph_snapshot_errors:
         graph_snapshot_error = graph_snapshot_errors[0]
@@ -7998,6 +8235,7 @@ def load_latest_response_observation_state(
     raw_diagnostics, diagnostics_snapshot_error = _read_observation_snapshot_payload(
         diagnostics_ref,
         frames_dir=frames_dir,
+        **({'_read_witness': read_witness} if read_witness is not None else {}),
     )
     if diagnostics_snapshot_error:
         return _observation_snapshot_failure(
@@ -8018,6 +8256,7 @@ def load_latest_response_observation_state(
         frames_dir=frames_dir,
         base_json_path='runtime.developer_diagnostics',
         errors=diagnostics_snapshot_errors,
+        **({'_read_witness': read_witness} if read_witness is not None else {}),
     )
     if diagnostics_snapshot_errors:
         diagnostics_snapshot_error = diagnostics_snapshot_errors[0]
@@ -8079,6 +8318,7 @@ def load_latest_response_observation_state(
         raw_closure, closure_snapshot_error = _read_observation_snapshot_payload(
             closure_ref,
             frames_dir=frames_dir,
+            **({'_read_witness': read_witness} if read_witness is not None else {}),
         )
         if closure_snapshot_error:
             return _observation_snapshot_failure(
@@ -8100,6 +8340,7 @@ def load_latest_response_observation_state(
             adequacy, adequacy_snapshot_error = _read_observation_snapshot_payload(
                 adequacy_ref,
                 frames_dir=frames_dir,
+                **({'_read_witness': read_witness} if read_witness is not None else {}),
             )
             if adequacy_snapshot_error:
                 return _observation_snapshot_failure(
@@ -8139,6 +8380,7 @@ def load_latest_response_observation_state(
     late_fill, late_fill_snapshot_error = _read_observation_snapshot_payload(
         late_fill_ref,
         frames_dir=frames_dir,
+        **({'_read_witness': read_witness} if read_witness is not None else {}),
     )
     if late_fill_snapshot_error:
         return _observation_snapshot_failure(
@@ -8192,6 +8434,7 @@ def load_latest_response_observation_state(
         request_content, request_content_snapshot_error = _read_observation_snapshot_payload(
             request_content_ref,
             frames_dir=frames_dir,
+            **({'_read_witness': read_witness} if read_witness is not None else {}),
         )
         if request_content_snapshot_error:
             return _observation_snapshot_failure(
@@ -8239,7 +8482,7 @@ def load_latest_response_observation_state(
     }
     if isinstance(frame.get('frame_relation'), Mapping):
         response_payload['frame_relation'] = _json_safe(frame.get('frame_relation'))
-    return {
+    observed = {
         'ok': True,
         'response_payload': response_payload,
         'response_frame': projected_frame,
@@ -8247,6 +8490,22 @@ def load_latest_response_observation_state(
         'index_used': True,
         'bounded_observation': True,
     }
+    if (
+        _reuse_candidates is not None
+        and reuse_binding is not None
+        and reuse_binding == _observation_reuse_binding(
+            normalized_id, frames_dir, current_index, _verified_epoch
+        )
+        and raw_line_digests == [
+            (_verified_epoch.get('source_frame_sha256_by_response') or {}).get(normalized_id)
+        ]
+        and _observation_read_witness_is_current(read_witness, frames_dir)
+    ):
+        _reuse_candidates.append(_ObservationReuseCandidate((
+            reuse_binding, _observation_binding_bytes(observed),
+            tuple(raw_line_digests), tuple(read_witness),
+        )))
+    return observed
 
 
 _RESPONSE_WIRE_TEXT_PREVIEW_LIMIT = _response_wire_policy.INDEXED_TEXT_PREVIEW_LIMIT
@@ -8396,6 +8655,7 @@ def _response_wire_frame_projection(
     )
 
 
+@observe_state('response_frame.bounded_wire_load', 'ledger_and_index', 'bounded_wire_state', labels=('RECONSTRUCTION', 'REVALIDATION'), full_hydration=False, full_reconstruction=False)
 def load_latest_response_wire_state(
     response_id: str,
     *,
@@ -8833,6 +9093,7 @@ def load_latest_response_wire_state(
     return result
 
 
+@observe_state('response_frame.canonical_load', 'ledger_and_CAS', 'canonical_frame', labels=('RECONSTRUCTION', 'REVALIDATION', 'NEW_AUTHORITY_BOUNDARY'), new_authority_boundary=True)
 def load_latest_response_state(
     response_id: str,
     *,

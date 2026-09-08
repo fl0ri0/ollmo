@@ -12,6 +12,10 @@ from helpers.model_capabilities import (
     CAPABILITY_TEXT_TO_SPEECH,
     CAPABILITY_VISION_ANALYSIS,
 )
+from ollmo_core.inference import (
+    _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE,
+    explicit_svg_artifact_request_spans,
+)
 from ollmo_g.text_artifact_revision_intent import classify_named_text_revision_intent
 from ollmo_services.tts_source import resolve_explicit_tts_source
 
@@ -579,7 +583,29 @@ _VISUAL_ANALYSIS_ACTION_RE = re.compile(
 )
 _VISUAL_ACTION_TARGET_RE = re.compile(
     r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|render(?:s)?|'
-    r'bild(?:er|es|ern|e)?|foto(?:s)?|aufnahme(?:n)?|poster(?:bild(?:er)?)?)\b',
+    r'bild(?:er|es|ern|e)?|foto(?:s)?|aufnahme(?:n)?|poster(?:bild(?:er)?)?|png|jpe?g)\b',
+    re.IGNORECASE,
+)
+_RASTER_GENERATION_TARGET_RE = re.compile(
+    r'\s+(?:(?:an?|one|two|three|four|five|six|exactly|only|new|single|'
+    r'ein(?:e|en|es)?|genau|nur|neu(?:e|en|es)?|\d+)\s+)*(?:png|jpe?g)\b'
+    r'(?=\s*(?:$|[.;,!?]|\b(?:image|photo|picture|illustration|bild|foto|'
+    r'of|with|showing|depicting|and|und)\b))',
+    re.IGNORECASE,
+)
+_VISUAL_REPRESENTATION_EXCLUSION_RE = re.compile(
+    r"\b(?:do\s+not|don[\'’]?t|dont|must\s+not|should\s+not|never)\s+use\b",
+    re.IGNORECASE,
+)
+_VISUAL_REPRESENTATION_TARGET_RE = re.compile(
+    r'\b(?:placeholders?|base64|data\s*urls?|svg|html)\b|'
+    r'\b(?:external|remote)\s+(?:image\s+)?urls?\b',
+    re.IGNORECASE,
+)
+_ADDITIONAL_VISUAL_TARGET_PREFIX_RE = re.compile(
+    r'\b(?:extra|additional|duplicate|duplicated|further|more|'
+    r'zusaetzlich(?:e|en|er|es)?|zusatzlich(?:e|en|er|es)?|'
+    r'weitere?|doppelte?)\s+$',
     re.IGNORECASE,
 )
 _VISUAL_SEPARATE_TARGET_RE = re.compile(
@@ -1472,6 +1498,31 @@ def _latest_affirmative_visual_generation_action_start(prompt: str) -> int:
     return latest_start
 
 
+def _has_affirmative_raster_generation_action(prompt: str) -> bool:
+    """A directly requested PNG/JPEG is a binary image target, not a path reference."""
+    for action in _VISUAL_GENERATION_ACTION_RE.finditer(prompt):
+        target = _RASTER_GENERATION_TARGET_RE.match(prompt, action.end())
+        if target and not intent_span_is_literal_payload(prompt, action.start(), target.end()):
+            if not visual_action_is_negated(prompt, action.start(), target.end()):
+                return True
+    return False
+
+
+def _mask_visual_representation_exclusions(prompt: str) -> str:
+    """Alternative-representation prohibitions supply no positive image cues."""
+    chars = list(prompt)
+    for match in _VISUAL_REPRESENTATION_EXCLUSION_RE.finditer(prompt):
+        boundary = _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE.search(prompt, match.end())
+        end = boundary.start() if boundary else len(prompt)
+        objects = prompt[match.end():end]
+        if (
+            _VISUAL_REPRESENTATION_TARGET_RE.search(objects)
+            and not _VISUAL_GENERATION_ACTION_RE.search(objects)
+        ):
+            chars[match.start():end] = ' ' * (end - match.start())
+    return ''.join(chars)
+
+
 def _has_affirmative_audio_materialization_action(prompt: str) -> bool:
     """Return whether the current command scope contains executable TTS work."""
 
@@ -1868,6 +1919,21 @@ def _latest_explicit_visual_defer_end(normalized_prompt: str) -> int:
                 local_end,
             ):
                 continue
+            visual_targets = list(_VISUAL_ACTION_TARGET_RE.finditer(local_prompt))
+            if visual_targets and all(
+                _ADDITIONAL_VISUAL_TARGET_PREFIX_RE.search(local_prompt[:target.start()])
+                for target in visual_targets
+            ):
+                # A ban on additional images constrains a separately requested
+                # producer; it does not cancel that producer. With no affirmative
+                # request, the negative clause still cannot create image work.
+                outside_constraint = (
+                    prompt[:match.start()]
+                    + ' ' * len(local_prompt)
+                    + prompt[match.start() + len(local_prompt):]
+                )
+                if _latest_affirmative_visual_generation_action_start(outside_constraint) >= 0:
+                    continue
             if materialization_negation_match_is_output_contrast(
                 local_prompt,
                 0,
@@ -1879,7 +1945,22 @@ def _latest_explicit_visual_defer_end(normalized_prompt: str) -> int:
                 0,
                 local_end,
             )
-            if _VISUAL_ACTION_TARGET_RE.search(scope):
+            has_visual_target = bool(_VISUAL_ACTION_TARGET_RE.search(scope))
+            if not has_visual_target:
+                prior_scope = prompt[max(0, match.start() - 220):match.start()]
+                has_prior_visual_target = bool(
+                    _VISUAL_ACTION_TARGET_RE.search(prior_scope)
+                )
+                has_deferred_visual_pronoun = any(
+                    _VISUAL_CONTENT_CONSTRAINT_DEFER_OBJECT_RE.search(
+                        scope[action.end():].lstrip()
+                    )
+                    for action in _VISUAL_GENERATION_ACTION_RE.finditer(scope)
+                )
+                has_visual_target = bool(
+                    has_prior_visual_target and has_deferred_visual_pronoun
+                )
+            if has_visual_target:
                 contrast = _VISUAL_ACTION_POLARITY_RESET_RE.search(
                     prompt,
                     match.start(),
@@ -1952,8 +2033,16 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         if 'direct_tts_source_contract' not in tts_cues:
             tts_cues.append('direct_tts_source_contract')
     tts_negative, tts_negative_cues = _score_rules(command_text, _TTS_NEGATIVE_RULES)
-    visual_command_text = command_text
+    # Explicit SVG construction belongs to text-artifact materialization. Mask
+    # only its typed action span so separate binary-image requests survive.
+    visual_chars = list(_mask_visual_representation_exclusions(command_text))
+    for start, end in explicit_svg_artifact_request_spans(command_text):
+        visual_chars[start:end] = ' ' * (end - start)
+    visual_command_text = ''.join(visual_chars)
     image_positive, image_cues = _score_rules(visual_command_text, _IMAGE_POSITIVE_RULES)
+    if _has_affirmative_raster_generation_action(visual_command_text):
+        image_positive = max(image_positive, 5)
+        image_cues.append('direct_raster_generation_request')
     image_negative, image_negative_cues = _score_rules(visual_command_text, _IMAGE_NEGATIVE_RULES)
     vision_positive, vision_cues = _score_rules(visual_command_text, _VISION_POSITIVE_RULES)
     stt_positive, stt_cues = _score_rules(command_text, _STT_POSITIVE_RULES)
@@ -2201,7 +2290,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         explicit_defer_materialization
         and not affirmative_visual_action_overrides_defer
         and re.search(
-            r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?|animation(?:en)?)\b',
+            r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?|animation(?:en)?|png|jpe?g)\b',
             visual_command_text,
         )
     )

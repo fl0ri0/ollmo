@@ -1163,7 +1163,27 @@ class InferApiTests(unittest.TestCase):
             11436,
             "qwen3.5:27b",
             [{"role": "user", "content": "say hi"}],
+            timeout_sec=1200,
         )
+
+    @patch("ollmo_webserver._lookup_instance")
+    @patch("ollmo_webserver._ollama_chat")
+    def test_chat_timeout_honors_request_budget_without_pdf_advice(self, mock_chat, mock_lookup):
+        mock_lookup.return_value = {
+            'instance_id': 'qwen-1', 'port': 11436, 'model': 'qwen3.5:27b',
+            'backend': 'ollama', 'capability': 'chat',
+        }
+        mock_chat.side_effect = Timeout('request timed out')
+        response = self.client.post('/api/infer', json={
+            'instance_id': 'qwen-1', 'prompt': 'Prepare a website',
+            'infer_timeout_sec': 600,
+        })
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(mock_chat.call_args.kwargs['timeout_sec'], 600)
+        error = response.get_json()['error']
+        self.assertIn('infer_timeout_sec', error)
+        self.assertNotIn('PDF', error)
+        self.assertNotIn('pdf_page_timeout_sec', error)
 
     @patch("ollmo_webserver._persist_text_artifact_locally")
     @patch("ollmo_webserver._lookup_instance")

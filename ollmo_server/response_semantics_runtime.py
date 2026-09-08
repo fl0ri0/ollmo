@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
+from ollmo_services.artifact_contracts import (
+    saved_file_dependency_contract, saved_file_consumption_artifact_issue,
+)
+from ollmo_services.events import observe_call, exact_target, judgment_summary
+
 import hashlib
 import html
 import json
@@ -182,6 +189,12 @@ _CSS_KNOWN_INVALID_PROPERTY_VALUES = {
 }
 _HERO_LOCAL_IMAGE_SIGNAL_RE = re.compile(
     r'\b(?:hero|hero[-_\s]?image|background|hintergrund|titelbild|title\s+image)\b',
+    re.IGNORECASE,
+)
+_HERO_IMAGE_PLACEMENT_SIGNAL_RE = re.compile(
+    r'\b(?:hero|titelbild|title\s+image|background[-_\s]+image|hintergrundbild)\b|'
+    r'\b(?:image|picture|photo|bild)\s+(?:as|als)\s+'
+    r'(?:(?:the|a|den|einen)\s+)?(?:background|hintergrund)\b',
     re.IGNORECASE,
 )
 _HTML_HERO_BLOCK_RE = re.compile(
@@ -594,6 +607,12 @@ _SEMANTIC_PHASE_PAYLOAD_KEYS = (
     'batch_prompts_source',
     'batch_prompt_source_phase_id',
     'batch_prompt_expected_count',
+    'batch_prompt_expected_count_invalid',
+    'batch_prompt_actual_count',
+    'branch_contract_error',
+    'candidate_extraction_issue',
+    'materialization_blocked',
+    'repair_action',
     'requires_artifact',
     'text_artifact_extension',
     'text_artifact_source_name',
@@ -744,13 +763,14 @@ _MULTI_IMAGE_HEADING_LINE_RE = re.compile(
     r'(?i)^(?:(?:image|bild|scene|variation|variante|variant|version|prompt)\s*(?:\d+|[ivx]+)?|(?:image|bild)\s+prompt\s*(?:\d+|[ivx]+)?)(?:\s*(?:[-–—:]|\().*)?$'
 )
 _INLINE_LABELED_IMAGE_PROMPT_LINE_RE = re.compile(
-    r'(?i)^\s*(?:[-*#>\u2022]+\s*)?(?:\*\*+|__+|\*)?\s*'
+    r'(?i)^\s*(?:[-*#>\u2022]+\s*)?'
+    r'(?:(?:\*\*+|__+|`+|\*+)\s*)*'
     r'(?:'
     r'(?:image|bild|visual|scene)(?:[\s_-]*prompt)?[\s_-]*(?:\d+|[ivx]+)?(?:\s*\([^)]+\))?'
     r'|prompt[\s_-]*(?:\d+|[ivx]+)?(?:\s*\([^)]+\))?'
     r'|[a-z0-9][\w ._-]{0,80}\.(?:png|jpe?g|webp|gif|avif)'
     r')'
-    r'\s*(?:\*\*+|__+|\*)?\s*:\s*(?P<body>.*)$'
+    r'\s*(?:(?:\*\*+|__+|`+|\*+)\s*)*:\s*(?P<body>.*)$'
 )
 _SEQUENTIAL_BOLD_ALPHA_IMAGE_PROMPT_LINE_RE = re.compile(
     r'^\s*(?:[-*#>\u2022]+\s+)?'
@@ -791,11 +811,11 @@ _EMBEDDED_LABELED_IMAGE_PROMPT_RE = re.compile(
     r'\s*(?:\*\*+|__+|\*)?\s*:)|\Z)'
 )
 _IMAGE_ASSET_LABEL_PREFIX_RE = re.compile(
-    r'(?is)^(?:\*\*+|__+|`+|\*+)?\s*'
+    r'(?is)^(?:(?:\*\*+|__+|`+|\*+)\s*)*'
     r'(?:(?:<b>|<strong>)\s*)?'
     r'[a-z0-9][\w ._-]{0,100}\.(?:png|jpe?g|webp|gif|avif)'
     r'(?:\s*</(?:b|strong)>)?'
-    r'\s*(?:\*\*+|__+|`+|\*+)?\s*:\s*'
+    r'\s*(?:(?:\*\*+|__+|`+|\*+)\s*)*:\s*'
 )
 _FILENAME_SOCIAL_ASSET_ROW_RE = re.compile(
     r'(?im)^\s*(?:[-*#>\u2022]+\s*)?(?:\d{1,3}|[ivx]+)[.)]\s*'
@@ -820,6 +840,35 @@ _NAMED_TEXT_ARTIFACT_FILENAME_RE = re.compile(
     + r')(?![A-Za-z0-9_-])',
     re.IGNORECASE,
 )
+
+
+def _parse_image_batch_expected_count(
+    raw_value: Any,
+    *,
+    present: bool,
+) -> tuple[int, bool]:
+    """Return ``(count, invalid)`` without treating malformed metadata as absent.
+
+    A missing/empty field is the legacy single-image shape. Once a non-empty
+    count carrier is present, malformed or out-of-range values must remain
+    visible to the image contract instead of silently becoming zero.
+    """
+
+    if not present or raw_value in (None, '', [], {}):
+        return 0, False
+    if isinstance(raw_value, bool):
+        return 0, True
+    try:
+        count = int(raw_value)
+    except (TypeError, ValueError):
+        return 0, True
+    if count < 1 or count > 26:
+        return 0, True
+    if isinstance(raw_value, float) and not raw_value.is_integer():
+        return 0, True
+    return count, False
+
+
 _NUMBERED_IMAGE_PROMPT_SEGMENT_PATTERNS = (
     r'(?ms)(?:^|\n)\s*\d+[.)]\s*(?P<body>.*?)(?=(?:\n\s*\d+[.)]\s*)|\Z)',
     r'(?ms)(?:^|\s)\d+[.)]\s*(?P<body>.*?)(?=(?:\s+\d+[.)]\s+)|\Z)',
@@ -3774,7 +3823,55 @@ def _prompt_binds_graph_prepared_text_artifact_before_transform(
         )
     )
     if not coordinators:
-        return False
+        # A later sentence may refer to a named output in this preparation
+        # graph ("Create styles.css. Use it for the page background"). Bind the
+        # declaration to its exact owed artifact, not to an arbitrary earlier
+        # noun or a claim that the file already exists.
+        declarations = list(re.finditer(
+            rf'(?i)\b(?:{_SAME_TURN_TEXT_SOURCE_ACTION_PATTERN})\b',
+            prompt_text[:transform_match.start()],
+        ))
+        if not declarations or reference not in {'it', 'es'}:
+            return False
+        declaration = declarations[-1]
+        if (
+            _offset_is_inside_quote(prompt_text, declaration.start())
+            or not _action_offset_is_user_directive(prompt_text, declaration.start())
+        ):
+            return False
+        declaration_end = _sentence_clause_end(prompt_text, declaration.end())
+        declaration_text = prompt_text[declaration.start():declaration_end]
+        # A requested output derived from unspecified input does not supply
+        # that input. It must pass the ordinary source checks independently.
+        if re.search(
+            r'(?i)\b(?:from|using|based\s+on|derived\s+from|aus|anhand|auf\s+basis)\b',
+            declaration_text,
+        ):
+            return False
+        intervening = prompt_text[declaration_end:transform_match.start()]
+        if (
+            _COMPETING_DEICTIC_SOURCE_QUALIFIER_RE.search(intervening)
+            or _EXTERNAL_ARTIFACT_SOURCE_LOCATOR_RE.search(intervening)
+        ):
+            return False
+        requests = [
+            item for item in detect_text_artifact_requests(declaration_text)
+            if item.get('source') == 'explicit_extension'
+        ]
+        if len(requests) != 1:
+            return False
+        requested = requests[0]
+        matches = [
+            phase for phase in text_artifact_successors
+            if isinstance(phase.get('artifact_request'), Mapping)
+            and all(
+                phase['artifact_request'].get(key) == requested.get(key)
+                for key in ('source_name', 'extension')
+            )
+            and str(phase.get('contract_state') or '').lower()
+            not in {'reserved', 'candidate', 'optional', 'waived', 'superseded'}
+        ]
+        return len(matches) == 1
     source_scope = prefix[:coordinators[-1].start()]
     source_binding = re.search(
         r'(?is)\b(?:from|using|based\s+on|derived\s+from|aus|anhand|auf\s+basis)\b'
@@ -4113,6 +4210,10 @@ def _normalize_handoff_heading_line(raw_line: Any) -> str:
     text = _strip_handoff_markdown_wrappers(raw_line)
     text = re.sub(r'^\s*#{1,6}\s*', '', text).strip()
     text = re.sub(r'^\s*[-*>\u2022]+\s*', '', text).strip()
+    # Decorative emoji and pictograms are presentation, not heading identity.
+    # Strip only the non-word prefix so translated/alphanumeric headings remain
+    # intact and later structural classifiers can reason about their wording.
+    text = re.sub(r'^[\W_]+', '', text, flags=re.UNICODE).strip()
     return text.rstrip(':').strip()
 
 
@@ -4127,11 +4228,11 @@ def _is_image_prompt_section_heading(raw_line: Any) -> bool:
         return True
     return bool(
         re.fullmatch(
-            r'(?:image|bild|visual|asset|art)[\w\s/-]{0,80}(?:prompt|prompts|requirements|assets|briefs?|manifests?)',
+            r'(?:image|bild|visual|asset|art)[\w\s/-]{0,80}(?:prompt|prompts|requirements|instructions?|directions?|assets|briefs?|manifests?)',
             match_heading,
         )
         or re.fullmatch(
-            r'(?:prompt|prompts|requirements|assets|briefs?|manifests?)[\w\s/-]{0,80}(?:image|bild|visual|art)',
+            r'(?:prompt|prompts|requirements|instructions?|directions?|assets|briefs?|manifests?)[\w\s/-]{0,80}(?:image|bild|visual|art)',
             match_heading,
         )
     )
@@ -4409,6 +4510,8 @@ def _clean_numbered_image_prompt_candidate(raw_value: Any) -> str:
         bounded_lines.append(raw_line)
     text = '\n'.join(bounded_lines).strip()
     if not text:
+        return ''
+    if _NAMED_TEXT_ARTIFACT_FILENAME_RE.search(text):
         return ''
     embedded_body = _embedded_labeled_image_prompt_body(text)
     if embedded_body:
@@ -8298,6 +8401,8 @@ class ResponseSemanticsRuntimeOwner:
             }
         )
 
+    @observe_call('response_semantics.build_global_semantic_closure_review',
+                  result=judgment_summary)
     def build_global_semantic_closure_review(
         self,
         *,
@@ -9741,7 +9846,62 @@ class ResponseSemanticsRuntimeOwner:
         normalized_capability = normalize_capability(capability)
         if normalized_capability == CAPABILITY_IMAGE_GENERATION:
             artifact_prompt = str(semantic_payload.get('artifact_prompt') or '').strip()
-            if not artifact_prompt:
+            expected_batch_count, invalid_batch_count = _parse_image_batch_expected_count(
+                semantic_payload.get('batch_prompt_expected_count'),
+                present='batch_prompt_expected_count' in semantic_payload,
+            )
+            batch_prompts = [
+                str(item or '').strip()
+                for item in (semantic_payload.get('batch_prompts') or [])
+                if str(item or '').strip()
+            ]
+            exact_counted_batch = bool(
+                expected_batch_count < 2
+                or len(batch_prompts) == expected_batch_count
+            )
+            counted_batch_incomplete = bool(
+                expected_batch_count >= 2
+                and not exact_counted_batch
+            )
+            blocked_batch_contract = bool(
+                semantic_payload.get('materialization_blocked') is True
+                or str(
+                    semantic_payload.get('branch_contract_error') or ''
+                ).strip()
+                == 'incomplete_image_prompt_batch'
+                or invalid_batch_count
+                or counted_batch_incomplete
+            )
+            if invalid_batch_count or counted_batch_incomplete:
+                # A counted image cohort is executable only when every
+                # branch-local slot is present. Never turn the preparation
+                # response (or a stale prompt carried beside it) into a
+                # shared image prompt when that contract is incomplete.
+                semantic_payload.pop('artifact_prompt', None)
+                semantic_payload.pop('artifact_prompt_source', None)
+                semantic_payload.pop('batch_prompts', None)
+                semantic_payload.pop('batch_prompts_source', None)
+                semantic_payload.pop('batch_prompt_source_phase_id', None)
+                semantic_payload.update(
+                    {
+                        'branch_contract_error': 'incomplete_image_prompt_batch',
+                        'candidate_extraction_issue': (
+                            'invalid_image_prompt_batch_count'
+                            if invalid_batch_count
+                            else 'missing_exact_branch_local_image_prompt_batch'
+                        ),
+                        **(
+                            {'batch_prompt_expected_count': expected_batch_count}
+                            if not invalid_batch_count
+                            else {'batch_prompt_expected_count_invalid': True}
+                        ),
+                        'batch_prompt_actual_count': len(batch_prompts),
+                        'materialization_blocked': True,
+                        'repair_action': RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT,
+                        'counted_batch_prompt_carriers_blocked': True,
+                    }
+                )
+            if not artifact_prompt and not blocked_batch_contract:
                 shared_body = str(semantic_payload.get('content_payload') or '').strip()
                 if shared_body:
                     semantic_payload['artifact_prompt'] = shared_body
@@ -10148,8 +10308,6 @@ class ResponseSemanticsRuntimeOwner:
             else {}
         )
         pending_from_state = artifact_late_fill.get('pending_branches')
-        if isinstance(pending_from_state, list) and pending_from_state:
-            return [dict(item) for item in pending_from_state if isinstance(item, Mapping)]
         completed_capabilities = set(
             normalize_capability_list(artifact_late_fill.get('completed_capabilities'))
         )
@@ -10164,7 +10322,114 @@ class ResponseSemanticsRuntimeOwner:
             if isinstance(item, Mapping) and str(item.get('branch_id') or item.get('phase_id') or '').strip()
         }
         candidates: list[dict[str, Any]] = []
-        candidate_branch_ids: set[str] = set()
+
+        def records_share_branch_identity(
+            left: Mapping[str, Any],
+            right: Mapping[str, Any],
+        ) -> bool:
+            left_capability = normalize_capability(left.get('capability'))
+            right_capability = normalize_capability(right.get('capability'))
+            if (
+                left_capability
+                and right_capability
+                and left_capability != right_capability
+            ):
+                return False
+            left_output_type = str(left.get('output_type') or '').strip().lower()
+            right_output_type = str(right.get('output_type') or '').strip().lower()
+            if (
+                left_output_type
+                and right_output_type
+                and left_output_type != right_output_type
+            ):
+                return False
+            left_obligation_id = str(left.get('obligation_id') or '').strip()
+            right_obligation_id = str(right.get('obligation_id') or '').strip()
+            if (
+                left_obligation_id
+                and right_obligation_id
+                and left_obligation_id != right_obligation_id
+            ):
+                return False
+            index_keys = (
+                'queue_index',
+                'candidate_selection_index',
+                'prompt_selection_index',
+                'image_prompt_index',
+                'artifact_prompt_index',
+            )
+
+            def positive_index(source: Mapping[str, Any]) -> int:
+                for key in index_keys:
+                    try:
+                        value = int(source.get(key) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+                return 0
+
+            left_index = positive_index(left)
+            right_index = positive_index(right)
+            if left_index and right_index and left_index != right_index:
+                return False
+            left_branch_id = str(left.get('branch_id') or '').strip()
+            right_branch_id = str(right.get('branch_id') or '').strip()
+            if left_branch_id and left_branch_id == right_branch_id:
+                return True
+            if left_obligation_id and right_obligation_id:
+                return left_obligation_id == right_obligation_id
+            left_phase_id = str(left.get('phase_id') or '').strip()
+            right_phase_id = str(right.get('phase_id') or '').strip()
+            return bool(left_phase_id and left_phase_id == right_phase_id)
+
+        def remember_candidate(candidate: dict[str, Any]) -> None:
+            def branch_payload_score(source: Mapping[str, Any]) -> int:
+                branch_id = str(source.get('branch_id') or '').strip()
+                phase_id = str(source.get('phase_id') or '').strip()
+                score = 4 if branch_id and phase_id and branch_id != phase_id else 0
+                for key in (
+                    'artifact_prompt',
+                    'artifact_prompt_source',
+                    'content_payload',
+                    'content_payload_source',
+                    'phase_summary',
+                    'stage_direction',
+                    'batch_prompts',
+                ):
+                    if source.get(key) not in (None, '', [], {}):
+                        score += 2
+                if source.get('depends_on') not in (None, '', [], {}):
+                    score += 1
+                return score
+
+            for existing in candidates:
+                if not records_share_branch_identity(existing, candidate):
+                    continue
+                primary, supplement = (
+                    (candidate, existing)
+                    if branch_payload_score(candidate) > branch_payload_score(existing)
+                    else (existing, candidate)
+                )
+                merged = dict(primary)
+                for key, value in supplement.items():
+                    if merged.get(key) in (None, '', [], {}) and value not in (
+                        None,
+                        '',
+                        [],
+                        {},
+                    ):
+                        merged[key] = value
+                existing.clear()
+                existing.update(merged)
+                return
+            candidates.append(candidate)
+
+        if isinstance(pending_from_state, list) and pending_from_state:
+            for item in pending_from_state:
+                if isinstance(item, Mapping):
+                    remember_candidate(dict(item))
+            return candidates
         route_runtime = (
             route_info.get('route_runtime')
             if isinstance(route_info.get('route_runtime'), dict)
@@ -10224,13 +10489,11 @@ class ResponseSemanticsRuntimeOwner:
                 continue
             if identity in completed_branch_ids or identity in failed_branch_ids:
                 continue
-            if identity in candidate_branch_ids:
-                continue
-            candidate_branch_ids.add(identity)
-            candidates.append(
+            remember_candidate(
                 {
                     'branch_id': branch_id or phase_id,
                     'phase_id': phase_id or branch_id,
+                    'obligation_id': str(raw_branch.get('obligation_id') or '').strip() or None,
                     'capability': capability,
                     'output_type': str(raw_branch.get('output_type') or '').strip().lower() or self.artifact_type_for_capability(capability),
                     'depends_on': [
@@ -10277,13 +10540,11 @@ class ResponseSemanticsRuntimeOwner:
                 continue
             if identity in completed_branch_ids or identity in failed_branch_ids:
                 continue
-            if identity in candidate_branch_ids:
-                continue
-            candidate_branch_ids.add(identity)
-            candidates.append(
+            remember_candidate(
                 {
                     'branch_id': branch_id or phase_id,
                     'phase_id': phase_id or branch_id,
+                    'obligation_id': str(candidate.get('obligation_id') or '').strip() or None,
                     'capability': capability,
                     'output_type': str(candidate.get('output_type') or '').strip().lower() or self.artifact_type_for_capability(capability),
                     'depends_on': [
@@ -10335,10 +10596,7 @@ class ResponseSemanticsRuntimeOwner:
                 continue
             if identity in completed_branch_ids or identity in failed_branch_ids:
                 continue
-            if identity in candidate_branch_ids:
-                continue
-            candidate_branch_ids.add(identity)
-            candidates.append(
+            remember_candidate(
                 {
                     'branch_id': branch_id or phase_id,
                     'phase_id': phase_id or branch_id,
@@ -10517,10 +10775,35 @@ class ResponseSemanticsRuntimeOwner:
                     'batch_prompts_source',
                     'batch_prompt_source_phase_id',
                     'batch_prompt_expected_count',
+                    'batch_prompt_expected_count_invalid',
+                    'batch_prompt_actual_count',
+                    'branch_contract_error',
+                    'candidate_extraction_issue',
+                    'materialization_blocked',
+                    'repair_action',
+                    'counted_batch_prompt_carriers_blocked',
                 ):
                     value = semantic_payload.get(key)
                     if value not in (None, '', [], {}):
                         payload[key] = value
+                if (
+                    expected_capability == CAPABILITY_IMAGE_GENERATION
+                    and semantic_payload.get('materialization_blocked') is True
+                    and str(semantic_payload.get('branch_contract_error') or '').strip()
+                    == 'incomplete_image_prompt_batch'
+                ):
+                    for key in (
+                        'content_payload',
+                        'phase_summary',
+                        'artifact_prompt',
+                        'artifact_prompt_source',
+                        'batch_prompts',
+                        'batch_prompts_source',
+                        'batch_prompt_source_phase_id',
+                        'batch_prompt_expected_count',
+                    ):
+                        payload.pop(key, None)
+                    return payload
                 if self.artifact_gap_is_already_fulfilled(payload, artifact_payload):
                     continue
                 expanded_branches, expansion = self._expand_image_pending_branches_from_batch_prompts(
@@ -10548,32 +10831,67 @@ class ResponseSemanticsRuntimeOwner:
                         if value not in (None, '', [], {}):
                             payload[key] = value
                     expected_count = 0
+                    invalid_expected_count = False
                     request_phase_graph = (
                         route_runtime.get('request_phase_graph')
                         if isinstance(route_runtime.get('request_phase_graph'), Mapping)
                         else {}
                     )
                     if isinstance(request_phase_graph.get('prompt_intent'), Mapping):
-                        expected_count = int(
-                            request_phase_graph.get('prompt_intent', {}).get('requested_visual_output_count') or 0
+                        prompt_intent = request_phase_graph.get('prompt_intent') or {}
+                        expected_count, invalid_expected_count = (
+                            _parse_image_batch_expected_count(
+                                prompt_intent.get('requested_visual_output_count'),
+                                present='requested_visual_output_count' in prompt_intent,
+                            )
                         )
                     plain_alpha_authority = self.plain_alpha_image_prompt_prepare_authority(
                         request_phase_graph,
                         expected_count=expected_count,
+                    )
+                    numbered_image_authority = self.numbered_image_prepare_authority(
+                        request_phase_graph
+                    )
+                    batch_prompt_authority = (
+                        numbered_image_authority or plain_alpha_authority
                     )
                     batch_prompts = self.extract_batch_image_prompts(
                         output_text,
                         expected_count=expected_count,
                         allow_plain_alpha_sequence=bool(plain_alpha_authority),
                     )
+                    if invalid_expected_count:
+                        for key in (
+                            'content_payload',
+                            'phase_summary',
+                            'artifact_prompt',
+                            'artifact_prompt_source',
+                            'batch_prompts',
+                            'batch_prompts_source',
+                            'batch_prompt_source_phase_id',
+                            'batch_prompt_expected_count',
+                        ):
+                            payload.pop(key, None)
+                        payload['branch_contract_error'] = (
+                            'incomplete_image_prompt_batch'
+                        )
+                        payload['candidate_extraction_issue'] = (
+                            'invalid_image_prompt_batch_count'
+                        )
+                        payload['batch_prompt_expected_count_invalid'] = True
+                        payload['batch_prompt_actual_count'] = len(batch_prompts)
+                        payload['materialization_blocked'] = True
+                        payload['repair_action'] = RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT
+                        payload['counted_batch_prompt_carriers_blocked'] = True
+                        return payload
                     if len(batch_prompts) > 1:
                         payload['batch_prompts'] = batch_prompts
                         payload['batch_prompt_expected_count'] = (
                             expected_count if expected_count >= 2 else len(batch_prompts)
                         )
-                        if plain_alpha_authority:
+                        if batch_prompt_authority:
                             payload['batch_prompts_source'] = 'semantic_prepare_phase_output'
-                            payload['batch_prompt_source_phase_id'] = plain_alpha_authority[
+                            payload['batch_prompt_source_phase_id'] = batch_prompt_authority[
                                 'source_phase_id'
                             ]
                         # Once a complete ordered batch is proven, its first item
@@ -14358,7 +14676,10 @@ class ResponseSemanticsRuntimeOwner:
         html_contents: list[str],
         css_contents: list[str],
     ) -> bool:
-        if _HERO_LOCAL_IMAGE_SIGNAL_RE.search(str(prompt_text or '')):
+        # A page background color does not require image placement. Keep the
+        # broader selector signal for existing artifact regions, but require
+        # image-specific placement language when inspecting the request.
+        if _HERO_IMAGE_PLACEMENT_SIGNAL_RE.search(str(prompt_text or '')):
             return True
         return any(cls._html_hero_snippets(content) for content in html_contents) or any(
             cls._css_hero_snippets(content) for content in css_contents
@@ -14487,22 +14808,43 @@ class ResponseSemanticsRuntimeOwner:
             if _content_has_unresolved_link_placeholder(content):
                 add_issue(record, 'text artifact still contains placeholder or unresolved link tokens')
 
-        for html_record in html_records:
+        grouped_assets: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+        for asset_record in link_asset_records:
+            extension = _text_artifact_extension_from_record(asset_record)
+            source_name = _artifact_source_name(asset_record).lower()
+            if not source_name:
+                source_name = Path(_artifact_path(asset_record)).stem.lower()
+            grouped_assets.setdefault(
+                (extension, source_name or extension),
+                [],
+            ).append(asset_record)
+
+        script_extensions = {'js', 'mjs', 'cjs'}
+        for html_index, html_record in enumerate(html_records):
             html_content = content_by_id.get(id(html_record), '')
             if not html_content:
                 continue
-            grouped_assets: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-            for asset_record in link_asset_records:
-                if asset_record is html_record:
-                    continue
-                extension = _text_artifact_extension_from_record(asset_record)
-                source_name = _artifact_source_name(asset_record).lower()
-                if not source_name:
-                    source_name = Path(_artifact_path(asset_record)).stem.lower()
-                grouped_assets.setdefault((extension, source_name or extension), []).append(asset_record)
-            for asset_group in grouped_assets.values():
+            for (extension, _source_name), asset_group in grouped_assets.items():
                 if not asset_group:
                     continue
+                if extension in script_extensions:
+                    linked_by_any_page = any(
+                        any(
+                            has_any_token(
+                                content_by_id.get(id(candidate_html), ''),
+                                asset_record,
+                            )
+                            for asset_record in asset_group
+                        )
+                        for candidate_html in html_records
+                    )
+                    if linked_by_any_page:
+                        continue
+                    # A page-specific script is a response-level dependency,
+                    # not a mandate that every page execute it. When no page
+                    # links the script, emit one repair target only.
+                    if html_index != 0:
+                        continue
                 if not any(has_any_token(html_content, asset_record) for asset_record in asset_group):
                     asset_record = asset_group[0]
                     add_issue(
@@ -14517,26 +14859,18 @@ class ResponseSemanticsRuntimeOwner:
                 for record in linked_text_records
                 if content_by_id.get(id(record), '')
             )
-            for image_record in image_records:
-                if not all_link_content or not has_any_token(all_link_content, image_record):
-                    preferred_target = next(
-                        (
-                            record for record in link_asset_records
-                            if _text_artifact_extension_from_record(record) == 'css'
-                        ),
-                        html_records[0] if html_records else linked_text_records[0],
-                    )
-                    add_issue(
-                        preferred_target,
-                        f'Generated image artifact is not linked by its real saved path `{_ollmo_relative_path(_artifact_path(image_record))}`',
-                    )
             css_records = [
                 record for record in text_records
                 if _text_artifact_extension_from_record(record) == 'css'
             ]
             html_contents = [content_by_id.get(id(record), '') for record in html_records]
             css_contents = [content_by_id.get(id(record), '') for record in css_records]
-            if (
+            missing_image_records = [
+                image_record
+                for image_record in image_records
+                if not all_link_content or not has_any_token(all_link_content, image_record)
+            ]
+            hero_rebind_required = (
                 self._hero_local_image_required(
                     prompt_text,
                     html_contents=html_contents,
@@ -14547,17 +14881,54 @@ class ResponseSemanticsRuntimeOwner:
                     css_contents=css_contents,
                     image_records=image_records,
                 )
-            ):
-                preferred_target = self._preferred_hero_image_rebind_target(
+            )
+            hero_target = None
+            hero_designated_image = None
+            if hero_rebind_required:
+                hero_target = self._preferred_hero_image_rebind_target(
                     html_records=html_records,
                     css_records=css_records,
                     content_by_id=content_by_id,
                 )
-                if preferred_target is not None:
-                    add_issue(
-                        preferred_target,
-                        'Hero section does not use a concrete generated image artifact path; bind one saved generated image into the hero/header image or background',
+                if (
+                    hero_target is not None
+                    and _text_artifact_extension_from_record(hero_target) == 'css'
+                    and missing_image_records
+                ):
+                    # A CSS-owned hero repair will make one currently missing
+                    # generated image concrete. Reserve that exact image for
+                    # the hero target so Closure does not also schedule an
+                    # overlapping HTML repair for the same obligation.
+                    hero_designated_image = missing_image_records[0]
+                if hero_target is not None:
+                    hero_issue = (
+                        'Hero section does not use a concrete generated image artifact path; '
+                        'bind one saved generated image into the hero/header image or background'
                     )
+                    if hero_designated_image is not None:
+                        hero_issue += (
+                            f' using `{_ollmo_relative_path(_artifact_path(hero_designated_image))}`'
+                        )
+                    add_issue(
+                        hero_target,
+                        hero_issue,
+                    )
+
+            for image_record in missing_image_records:
+                if image_record is hero_designated_image:
+                    continue
+                # General image representation belongs to the composed page.
+                # CSS is authoritative only for the one concrete image owned
+                # by the dedicated hero-background repair above.
+                preferred_target = (
+                    html_records[0]
+                    if html_records
+                    else linked_text_records[0]
+                )
+                add_issue(
+                    preferred_target,
+                    f'Generated image artifact is not linked by its real saved path `{_ollmo_relative_path(_artifact_path(image_record))}`',
+                )
 
         if not issues_by_target:
             return []
@@ -16113,6 +16484,13 @@ class ResponseSemanticsRuntimeOwner:
             if value not in (None, '', [], {})
         }
 
+    @observe_call('response_semantics.build_graph_closure_review',
+                  target=lambda a: exact_target(a['artifact_payload'] or {}),
+                  result=judgment_summary)
+    def _saved_file_consumption_review(self, branch, payload):
+        return saved_file_consumption_artifact_issue(
+            branch, payload, self._resolved_semantic_review_artifact_path)
+
     def build_graph_closure_review(
         self,
         output_text: str,
@@ -16387,12 +16765,21 @@ class ResponseSemanticsRuntimeOwner:
             elif source_status in _WAIVED_OBLIGATION_STATUSES:
                 status = 'waived'
                 evidence = 'explicit_obligation_waiver'
+            elif raw_source.get('branch_contract_error') == 'saved_file_dependency_unbound':
+                status = 'blocked'
+                evidence = 'saved_file_dependency_unbound'
             elif branch_id and branch_id in failed_branch_ids:
                 status = 'blocked'
                 evidence = 'late_fill_failed_branch'
             elif branch_id and branch_id in cancelled_branch_ids:
                 status = 'waived'
                 evidence = 'late_fill_cancelled_branch'
+            elif saved_file_dependency_contract(raw_source):
+                saved_issue = self._saved_file_consumption_review(raw_source, artifact_info)
+                status = 'blocked' if saved_issue else 'fulfilled'
+                evidence = saved_issue or 'saved_file_consumption_verified'
+                if not saved_issue:
+                    consumed_artifact_type_counts['text'] = consumed_artifact_type_counts.get('text', 0) + 1
             elif text_artifact_revision_required:
                 revision_evidence = str(
                     text_artifact_revision_evidence.get('evidence') or ''
@@ -17046,25 +17433,90 @@ class ResponseSemanticsRuntimeOwner:
                     )
                 )
                 expected_count = 0
-                if isinstance(request_phase_graph, Mapping) and isinstance(request_phase_graph.get('prompt_intent'), Mapping):
-                    expected_count = int(request_phase_graph.get('prompt_intent', {}).get('requested_visual_output_count') or 0)
+                invalid_expected_count = False
+                if (
+                    isinstance(request_phase_graph, Mapping)
+                    and isinstance(request_phase_graph.get('prompt_intent'), Mapping)
+                ):
+                    prompt_intent = request_phase_graph.get('prompt_intent') or {}
+                    raw_expected_count = prompt_intent.get(
+                        'requested_visual_output_count'
+                    )
+                    expected_count, invalid_expected_count = (
+                        _parse_image_batch_expected_count(
+                            raw_expected_count,
+                            present='requested_visual_output_count' in prompt_intent,
+                        )
+                    )
+                    # Older underplanned graphs used numeric zero to mean
+                    # "unknown", before counted visual obligations became an
+                    # explicit contract.  Preserve that narrow recovery path:
+                    # strong numbered image prompts may still expand the one
+                    # planned branch.  A counted graph (or any other malformed
+                    # count carrier) remains fail-closed.
+                    if (
+                        invalid_expected_count
+                        and raw_expected_count in (0, '0')
+                        and not bool(
+                            prompt_intent.get('counted_visual_output_obligation')
+                        )
+                    ):
+                        invalid_expected_count = False
+                extraction_expected_count = expected_count
                 if expected_count <= 0:
                     expected_count = len(pending_branches)
+                    # A single pending image branch can be an underplanned
+                    # graph.  Let the strong numbered-prompt parser discover
+                    # the complete cohort so closure review can expand it.
+                    # With multiple planned branches, retain their count as
+                    # the extraction bound to avoid treating unrelated
+                    # numbered prose as additional image work.
+                    extraction_expected_count = (
+                        0 if len(pending_branches) == 1 else expected_count
+                    )
                 batch_prompts = self.extract_batch_image_prompts(
                     output_text,
-                    expected_count=expected_count,
+                    expected_count=extraction_expected_count,
                     allow_plain_alpha_sequence=False,
                 )
-                if len(batch_prompts) > 1:
+                if len(batch_prompts) > 1 and not invalid_expected_count:
                     payload['batch_prompts'] = batch_prompts
                     payload['batch_prompt_expected_count'] = (
                         expected_count if expected_count >= 2 else len(batch_prompts)
                     )
-                    if str(payload.get('artifact_prompt') or '').strip() == str(batch_prompts[0]).strip():
-                        payload['artifact_prompt_source'] = (
-                            str(payload.get('artifact_prompt_source') or '').strip()
-                            or 'semantic_batch_prompts'
+                    expanded_branches, expansion = (
+                        self._expand_image_pending_branches_from_batch_prompts(
+                            payload.get('pending_branches') or pending_branches,
+                            batch_prompts,
                         )
+                    )
+                    if expansion:
+                        payload['pending_branches'] = expanded_branches
+                        payload['pending_capabilities'] = normalize_capability_list(
+                            [
+                                item.get('capability')
+                                for item in expanded_branches
+                                if isinstance(item, Mapping)
+                            ]
+                        )
+                        payload['prepared_image_prompt_branch_expansion'] = expansion
+                elif invalid_expected_count:
+                    for key in (
+                        'artifact_prompt',
+                        'artifact_prompt_source',
+                        'batch_prompts',
+                        'batch_prompts_source',
+                        'batch_prompt_source_phase_id',
+                        'batch_prompt_expected_count',
+                    ):
+                        payload.pop(key, None)
+                    payload['branch_contract_error'] = 'incomplete_image_prompt_batch'
+                    payload['candidate_extraction_issue'] = 'invalid_image_prompt_batch_count'
+                    payload['batch_prompt_expected_count_invalid'] = True
+                    payload['batch_prompt_actual_count'] = len(batch_prompts)
+                    payload['materialization_blocked'] = True
+                    payload['repair_action'] = RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT
+                    payload['counted_batch_prompt_carriers_blocked'] = True
             return payload
 
         if isinstance(base_gap, dict):
@@ -17076,6 +17528,7 @@ class ResponseSemanticsRuntimeOwner:
             return payload
         return None
 
+    @observe_state('late_fill.state_build', 'prior_late_fill_and_branch_results', 'late_fill_state', labels=('NEW_REPRESENTATION',))
     def build_late_fill_state(
         self,
         artifact_gap: dict[str, Any],
@@ -17153,6 +17606,18 @@ class ResponseSemanticsRuntimeOwner:
             if value not in (None, '', [], {}):
                 payload[key] = str(value).strip() or None
         for key in (
+            'branch_contract_error',
+            'candidate_extraction_issue',
+            'materialization_blocked',
+            'counted_batch_prompt_carriers_blocked',
+            'batch_prompt_expected_count_invalid',
+        ):
+            value = artifact_gap.get(key)
+            if value in (None, '', [], {}):
+                value = previous.get(key)
+            if value not in (None, '', [], {}):
+                payload[key] = value
+        for key in (
             'ghost_repair_feedback',
             'repair_scope',
             'repair_mode',
@@ -17217,11 +17682,42 @@ class ResponseSemanticsRuntimeOwner:
         raw_batch_prompt_expected_count = artifact_gap.get('batch_prompt_expected_count')
         if raw_batch_prompt_expected_count in (None, '', [], {}):
             raw_batch_prompt_expected_count = previous.get('batch_prompt_expected_count')
-        try:
-            batch_prompt_expected_count = int(raw_batch_prompt_expected_count or 0)
-        except (TypeError, ValueError):
-            batch_prompt_expected_count = 0
-        if 2 <= batch_prompt_expected_count <= 26:
+        has_batch_prompt_expected_count = raw_batch_prompt_expected_count not in (
+            None,
+            '',
+            [],
+            {},
+        )
+        batch_prompt_expected_count, invalid_batch_prompt_count = (
+            _parse_image_batch_expected_count(
+                raw_batch_prompt_expected_count,
+                present=has_batch_prompt_expected_count,
+            )
+        )
+        invalid_batch_prompt_count = bool(
+            invalid_batch_prompt_count
+            or payload.get('batch_prompt_expected_count_invalid') is True
+        )
+        if invalid_batch_prompt_count:
+            # Preserve malformed count metadata as explicit contract truth;
+            # do not normalize it to zero and let a later state transition
+            # accidentally reopen a shared or partial image prompt carrier.
+            if has_batch_prompt_expected_count:
+                payload['batch_prompt_expected_count'] = raw_batch_prompt_expected_count
+            payload['batch_prompt_expected_count_invalid'] = True
+            payload['batch_prompt_actual_count'] = len(
+                [
+                    item
+                    for item in (payload.get('batch_prompts') or [])
+                    if str(item or '').strip()
+                ]
+            )
+            payload['branch_contract_error'] = 'incomplete_image_prompt_batch'
+            payload['candidate_extraction_issue'] = 'invalid_image_prompt_batch_count'
+            payload['materialization_blocked'] = True
+            payload['repair_action'] = RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT
+            payload['counted_batch_prompt_carriers_blocked'] = True
+        elif 2 <= batch_prompt_expected_count <= 26:
             payload['batch_prompt_expected_count'] = batch_prompt_expected_count
         for key in ('pending_branches', 'completed_branches', 'failed_branches', 'cancelled_branches', 'active_branches'):
             value = artifact_gap.get(key)
@@ -17651,6 +18147,71 @@ class ResponseSemanticsRuntimeOwner:
             return 'vision analysis'
         return normalized.replace('_', ' ') if normalized else 'follow-up materialization'
 
+    def numbered_image_prepare_authority(
+        self,
+        phase_graph: Any,
+    ) -> dict[str, Any]:
+        """Prove that one prepare phase directly produces an exact image cohort."""
+
+        if not isinstance(phase_graph, Mapping):
+            return {}
+        graph = dict(phase_graph)
+        if not current_phase_is_graph_resolved(graph):
+            return {}
+        if current_phase_capability(graph) != CAPABILITY_CHAT:
+            return {}
+        current_phase = self._current_phase_payload(graph)
+        current_phase_id = str(current_phase.get('phase_id') or '').strip()
+        current_phase_kind = str(current_phase.get('kind') or '').strip().lower()
+        current_phase_role = str(current_phase.get('role') or '').strip().lower()
+        if (
+            not current_phase_id
+            or (current_phase_kind != 'prepare' and current_phase_role != 'text_preparation')
+        ):
+            return {}
+        prompt_intent = (
+            graph.get('prompt_intent')
+            if isinstance(graph.get('prompt_intent'), Mapping)
+            else {}
+        )
+        if not bool(prompt_intent.get('counted_visual_output_obligation')):
+            return {}
+        expected_count, invalid_expected_count = _parse_image_batch_expected_count(
+            prompt_intent.get('requested_visual_output_count'),
+            present='requested_visual_output_count' in prompt_intent,
+        )
+        if invalid_expected_count or not 2 <= expected_count <= 26:
+            return {}
+
+        direct_image_children: list[dict[str, Any]] = []
+        for raw_branch in downstream_phase_records(graph):
+            if not isinstance(raw_branch, Mapping):
+                continue
+            if normalize_capability(raw_branch.get('capability')) != CAPABILITY_IMAGE_GENERATION:
+                continue
+            dependencies = [
+                str(item or '').strip()
+                for item in (raw_branch.get('depends_on') or [])
+                if str(item or '').strip()
+            ]
+            if dependencies == [current_phase_id]:
+                direct_image_children.append(dict(raw_branch))
+        if len(direct_image_children) != expected_count:
+            return {}
+        queue_indexes: list[int] = []
+        for child in direct_image_children:
+            try:
+                queue_indexes.append(int(child.get('queue_index') or 0))
+            except (TypeError, ValueError):
+                return {}
+        if sorted(queue_indexes) != list(range(1, expected_count + 1)):
+            return {}
+        return {
+            'kind': 'graph_direct_numbered_image_producer_contract',
+            'source_phase_id': current_phase_id,
+            'expected_count': expected_count,
+        }
+
     def numbered_audio_prepare_authority(
         self,
         phase_graph: Any,
@@ -17763,6 +18324,7 @@ class ResponseSemanticsRuntimeOwner:
             if isinstance(prepare_contract.get('phase_graph'), Mapping)
             else {}
         )
+        numbered_image_contract = self.numbered_image_prepare_authority(phase_graph)
         numbered_audio_contract = self.numbered_audio_prepare_authority(phase_graph)
         downstream_labels = [
             self._format_prepare_phase_capability_label(candidate)
@@ -17786,16 +18348,54 @@ class ResponseSemanticsRuntimeOwner:
             'Do not mention being text-only, incapable, unable to help, or that another model or route will finish the task.',
             'Preserve the user-requested tone, structure, wording constraints, and exactness requirements when they belong to the content itself.',
         ]
+        if numbered_image_contract:
+            expected_image_count = int(numbered_image_contract['expected_count'])
+            lines.append(
+                'Start the response with exactly one `### Image Generation Prompts` section.'
+            )
+            lines.append(
+                f'Under that heading, return exactly {expected_image_count} numbered image prompts '
+                f'using labels 1. through {expected_image_count}.'
+            )
+            lines.append(
+                'Each numbered prompt feeds exactly one downstream image-generation branch. '
+                'Keep every prompt self-contained, visually concrete, distinct, and in the '
+                'user-requested order; do not merge, omit, duplicate, or add slots.'
+            )
+            lines.append(
+                'Keep code, data, filenames, implementation notes, and downstream review claims '
+                'outside the numbered image prompts.'
+            )
+            if any(
+                capability != CAPABILITY_IMAGE_GENERATION
+                for capability in downstream_capabilities
+            ):
+                lines.append(
+                    f'After image prompt {expected_image_count}, continue with separately labeled '
+                    'substantive content required by non-image downstream phases. Keep each requested '
+                    'file or payload in its own clearly named section.'
+                )
         if numbered_audio_contract:
             expected_count = int(numbered_audio_contract['expected_count'])
-            lines.append(
-                f'Return exactly {expected_count} numbered, directly speakable bodies using the labels '
-                f'1. through {expected_count}. Each numbered body must be self-contained and distinct, '
-                'and its text must contain only wording that should be spoken.'
-            )
-            lines.append(
-                'Do not add any other heading, label, bullet, explanation, or meta commentary.'
-            )
+            if numbered_image_contract:
+                lines.append(
+                    'After the image-prompt section and before any file sections, add exactly one '
+                    '`### Text-to-Speech Payload` section.'
+                )
+                lines.append(
+                    f'In that section, return exactly {expected_count} numbered, directly speakable '
+                    f'bodies using the labels 1. through {expected_count}. Each numbered body must be '
+                    'self-contained and distinct, and its text must contain only wording that should be spoken.'
+                )
+            else:
+                lines.append(
+                    f'Return exactly {expected_count} numbered, directly speakable bodies using the labels '
+                    f'1. through {expected_count}. Each numbered body must be self-contained and distinct, '
+                    'and its text must contain only wording that should be spoken.'
+                )
+                lines.append(
+                    'Do not add any other heading, label, bullet, explanation, or meta commentary.'
+                )
             language_labels = {'de': 'German', 'en': 'English'}
             for variant in numbered_audio_contract.get('variants') or []:
                 lang_code = str(variant.get('lang_code') or '').strip().lower()
@@ -17807,14 +18407,15 @@ class ResponseSemanticsRuntimeOwner:
                 lines.append(
                     f'Numbered body {int(variant["index"])} must be in {language}{role_clause}.'
                 )
-        else:
+        elif not numbered_image_contract:
             lines.append(
                 'Do not add headings, labels, prompt wrappers, bullet framing, or meta commentary unless the user explicitly requested them.'
             )
         if CAPABILITY_IMAGE_GENERATION in downstream_capabilities:
-            lines.append(
-                'If downstream image generation depends on this text, make the body prompt-ready and visually concrete.'
-            )
+            if not numbered_image_contract:
+                lines.append(
+                    'If downstream image generation depends on this text, make the body prompt-ready and visually concrete.'
+                )
         if CAPABILITY_TEXT_TO_SPEECH in downstream_capabilities:
             if numbered_audio_contract:
                 lines.append(
@@ -17824,7 +18425,11 @@ class ResponseSemanticsRuntimeOwner:
                 lines.append(
                     'If downstream speech depends on this text, make the body directly speakable without capability notes.'
                 )
-        if len(downstream_capabilities) > 1 and not numbered_audio_contract:
+        if (
+            len(downstream_capabilities) > 1
+            and not numbered_audio_contract
+            and not numbered_image_contract
+        ):
             lines.append(
                 'When multiple downstream phases depend on the same text, produce one clean reusable body that all of them can consume.'
             )
@@ -17905,17 +18510,23 @@ class ResponseSemanticsRuntimeOwner:
         capability: Optional[str] = None,
     ) -> dict[str, Any]:
         existing = self._extract_semantic_phase_payload_from_payload(source_payload)
-        if existing:
+        normalized_capability = normalize_capability(capability)
+        prepared_text = str(output_text or '').strip()
+        # A non-empty chat preparation output is the newest semantic source.
+        # Re-evaluate it even when an earlier payload already carried shared
+        # or full-display semantic fields; otherwise stale fields can bypass
+        # counted-batch validation entirely. Preserve existing semantics when
+        # there is no new preparation output or this is not a chat phase.
+        if existing and (normalized_capability != CAPABILITY_CHAT or not prepared_text):
             return existing
-        if normalize_capability(capability) != CAPABILITY_CHAT:
+        if normalized_capability != CAPABILITY_CHAT:
             return {}
         prepare_contract = self.resolve_prepare_phase_contract(
             route_payload=route_payload,
             request_payload=request_payload,
         )
-        prepared_text = str(output_text or '').strip()
         if not prepare_contract or not prepared_text:
-            return {}
+            return existing
         downstream = [
             normalize_capability(candidate)
             for candidate in (prepare_contract.get('downstream_capabilities') or [])
@@ -17927,14 +18538,25 @@ class ResponseSemanticsRuntimeOwner:
             if isinstance(prepare_contract.get('phase_graph'), Mapping)
             else {}
         )
-        if isinstance(phase_graph.get('prompt_intent'), Mapping):
-            expected_visual_output_count = int(
-                phase_graph.get('prompt_intent', {}).get('requested_visual_output_count') or 0
+        prompt_intent = (
+            phase_graph.get('prompt_intent')
+            if isinstance(phase_graph.get('prompt_intent'), Mapping)
+            else {}
+        )
+        expected_visual_output_count, invalid_visual_output_count = (
+            _parse_image_batch_expected_count(
+                prompt_intent.get('requested_visual_output_count'),
+                present='requested_visual_output_count' in prompt_intent,
             )
+        )
         plain_alpha_authority = self.plain_alpha_image_prompt_prepare_authority(
             phase_graph,
             expected_count=expected_visual_output_count,
         )
+        numbered_image_authority = self.numbered_image_prepare_authority(
+            phase_graph
+        )
+        batch_prompt_authority = numbered_image_authority or plain_alpha_authority
         if not downstream:
             return {}
         semantic_payload: dict[str, Any] = {}
@@ -17957,16 +18579,47 @@ class ResponseSemanticsRuntimeOwner:
                 expected_count=expected_visual_output_count,
                 allow_plain_alpha_sequence=bool(plain_alpha_authority),
             )
-            if len(batch_prompts) > 1:
+            incomplete_counted_batch = bool(
+                invalid_visual_output_count
+                or expected_visual_output_count >= 2
+                and len(batch_prompts) != expected_visual_output_count
+            )
+            if incomplete_counted_batch:
+                diagnostic_prompts = self.extract_batch_image_prompts(
+                    prepared_text,
+                    allow_plain_alpha_sequence=bool(plain_alpha_authority),
+                )
+                image_payload.pop('artifact_prompt', None)
+                image_payload.pop('artifact_prompt_source', None)
+                image_payload.update(
+                    {
+                        'branch_contract_error': 'incomplete_image_prompt_batch',
+                        'candidate_extraction_issue': (
+                            'invalid_image_prompt_batch_count'
+                            if invalid_visual_output_count
+                            else 'missing_exact_branch_local_image_prompt_batch'
+                        ),
+                        **(
+                            {'batch_prompt_expected_count': expected_visual_output_count}
+                            if not invalid_visual_output_count
+                            else {'batch_prompt_expected_count_invalid': True}
+                        ),
+                        'batch_prompt_actual_count': len(diagnostic_prompts),
+                        'materialization_blocked': True,
+                        'repair_action': RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT,
+                        'counted_batch_prompt_carriers_blocked': True,
+                    }
+                )
+            if len(batch_prompts) > 1 and not incomplete_counted_batch:
                 image_payload['batch_prompts'] = batch_prompts
                 image_payload['batch_prompt_expected_count'] = (
                     expected_visual_output_count
                     if expected_visual_output_count >= 2
                     else len(batch_prompts)
                 )
-                if plain_alpha_authority:
+                if batch_prompt_authority:
                     image_payload['batch_prompts_source'] = 'semantic_prepare_phase_output'
-                    image_payload['batch_prompt_source_phase_id'] = plain_alpha_authority[
+                    image_payload['batch_prompt_source_phase_id'] = batch_prompt_authority[
                         'source_phase_id'
                     ]
                 if str(image_payload.get('artifact_prompt_source') or '').strip() == 'full_display_text':
@@ -17974,6 +18627,8 @@ class ResponseSemanticsRuntimeOwner:
                     image_payload['artifact_prompt_source'] = 'semantic_batch_prompts'
                     image_payload.setdefault('phase_summary', batch_prompts[0])
             if (
+                not incomplete_counted_batch
+                and
                 semantic_payload.get('content_payload')
                 and str(image_payload.get('artifact_prompt_source') or '').strip() == 'full_display_text'
             ):

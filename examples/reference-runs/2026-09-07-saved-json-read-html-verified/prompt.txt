@@ -1,0 +1,1 @@
+Save read-check.json with values [7,11]. Read the actually saved read-check.json again. Create read-check.html from the read data with a table containing both values and their sum. Use self-contained HTML with embedded CSS and no external resources. Return exactly these two files.

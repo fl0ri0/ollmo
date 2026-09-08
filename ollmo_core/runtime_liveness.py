@@ -180,7 +180,9 @@ def runtime_instance_liveness(
     busy = activity in BUSY_RUNTIME_ACTIVITIES
     advisory_degraded = readiness == 'degraded' or status == 'degraded'
     last_error = runtime_status_value(instance, 'last_error')
-    selectable = not hard_unavailable and not fresh_cooldown
+    # Current positive liveness outranks advisory failure history.
+    confirmed_live = process_alive is True and port_listening is True
+    selectable = not hard_unavailable and (confirmed_live or not fresh_cooldown)
     return {
         'process_alive': process_alive,
         'port_listening': port_listening,

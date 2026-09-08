@@ -1,12 +1,188 @@
 import subprocess
 import sys
+import json
 from pathlib import Path
 
+import pytest
+
+import scripts.ollmo_run_monitor as monitor
 from scripts.ollmo_run_monitor import (
     _collect_runtime_repair_authority,
     _render_human,
     _wave_diagnostic_from_history,
 )
+
+
+def test_late_fill_skip_is_clean_only_when_already_fulfilled_without_work() -> None:
+    late_fill = {
+        'status': 'skipped',
+        'skip_reason': 'already_fulfilled',
+        'skip_kind': 'no_work_needed',
+        'skip_source': 'late_fill_prune',
+    }
+
+    assert monitor._late_fill_is_clean(late_fill) is True
+
+
+def test_other_late_fill_skip_is_not_clean() -> None:
+    late_fill = {
+        'status': 'skipped',
+        'skip_reason': 'already_fulfilled',
+        'skip_kind': 'no_work_needed',
+        'skip_source': 'manual_override',
+    }
+
+    assert monitor._late_fill_is_clean(late_fill) is False
+
+
+def _synthetic_terminal_report(
+    response_id: str,
+    frame_id: str,
+    frame_sequence: int,
+    *,
+    verdict: str,
+    lifecycle_state: str,
+) -> dict:
+    return {
+        'response_id': response_id,
+        'frame_id': frame_id,
+        'frame_sequence': frame_sequence,
+        'reported_at': '2026-09-03T12:00:00Z',
+        'verdict': verdict,
+        'lifecycle_state': lifecycle_state,
+        'human_report': f'{verdict} {frame_id}',
+    }
+
+
+def test_monitor_emits_report_for_same_response_successor_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_id = 'resp_same_response_retry'
+    latest = {
+        'line': 1,
+        'bytes': 1,
+        'frame_id': f'{response_id}:frame-1',
+        'frame_sequence': 1,
+    }
+
+    monkeypatch.setattr(
+        monitor,
+        '_scan_responses',
+        lambda _root: ([response_id], {response_id: dict(latest)}),
+    )
+
+    def fake_build_report(_root, _response_id, _next_response_id, latest_line):
+        frame_sequence = int(latest_line['frame_sequence'])
+        if frame_sequence == 1:
+            return _synthetic_terminal_report(
+                response_id,
+                latest_line['frame_id'],
+                frame_sequence,
+                verdict='needs_attention',
+                lifecycle_state='repair_needed',
+            )
+        return _synthetic_terminal_report(
+            response_id,
+            latest_line['frame_id'],
+            frame_sequence,
+            verdict='clean',
+            lifecycle_state='completed',
+        )
+
+    monkeypatch.setattr(monitor, '_build_report', fake_build_report)
+    state_dir = tmp_path / 'monitor'
+
+    assert monitor.run_once(tmp_path, state_dir, quiet=True) == 0
+    latest.update(
+        {
+            'line': 2,
+            'frame_id': f'{response_id}:frame-2',
+            'frame_sequence': 2,
+        }
+    )
+    assert monitor.run_once(tmp_path, state_dir, quiet=True) == 0
+
+    reports = [
+        json.loads(line)
+        for line in (state_dir / 'reports.jsonl').read_text().splitlines()
+    ]
+    assert [(item['frame_id'], item['verdict']) for item in reports] == [
+        (f'{response_id}:frame-1', 'needs_attention'),
+        (f'{response_id}:frame-2', 'clean'),
+    ]
+
+
+def test_monitor_does_not_duplicate_same_response_same_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_id = 'resp_same_response_no_duplicate'
+    latest = {
+        'line': 1,
+        'bytes': 1,
+        'frame_id': f'{response_id}:frame-1',
+        'frame_sequence': 1,
+    }
+    monkeypatch.setattr(
+        monitor,
+        '_scan_responses',
+        lambda _root: ([response_id], {response_id: dict(latest)}),
+    )
+    monkeypatch.setattr(
+        monitor,
+        '_build_report',
+        lambda _root, _response_id, _next_response_id, latest_line: (
+            _synthetic_terminal_report(
+                response_id,
+                latest_line['frame_id'],
+                latest_line['frame_sequence'],
+                verdict='clean',
+                lifecycle_state='completed',
+            )
+        ),
+    )
+    state_dir = tmp_path / 'monitor'
+
+    assert monitor.run_once(tmp_path, state_dir, quiet=True) == 0
+    assert monitor.run_once(tmp_path, state_dir, quiet=True) == 0
+    assert len((state_dir / 'reports.jsonl').read_text().splitlines()) == 1
+
+
+def test_monitor_legacy_frameless_report_remains_response_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_id = 'resp_legacy_frameless'
+    latest = {
+        'line': 2,
+        'bytes': 1,
+        'frame_id': f'{response_id}:frame-2',
+        'frame_sequence': 2,
+    }
+    monkeypatch.setattr(
+        monitor,
+        '_scan_responses',
+        lambda _root: ([response_id], {response_id: dict(latest)}),
+    )
+    state_dir = tmp_path / 'monitor'
+    state_dir.mkdir(parents=True)
+    (state_dir / 'reports.jsonl').write_text(
+        json.dumps(
+            {
+                'response_id': response_id,
+                'reported_at': '2026-09-03T12:00:00Z',
+                'verdict': 'clean',
+                'lifecycle_state': 'completed',
+                'human_report': 'legacy frame-less report',
+            }
+        )
+        + '\n'
+    )
+
+    assert monitor.run_once(tmp_path, state_dir, quiet=True) == 0
+    assert monitor.run_once(tmp_path, state_dir, quiet=True) == 0
+    assert len((state_dir / 'reports.jsonl').read_text().splitlines()) == 1
 
 
 def test_monitor_compatibility_entrypoint_imports_from_any_working_directory(

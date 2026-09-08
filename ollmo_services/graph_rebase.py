@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.events import observe_call, exact_target, judgment_summary
+
 from collections.abc import Mapping, Sequence
 import copy
 import hashlib
@@ -2806,6 +2808,12 @@ def build_graph_rebase_execution_contract_proof(
     )
 
 
+@observe_call('graph_rebase.validate_graph_rebase_proposal',
+              target=lambda a: exact_target(a['proposal']),
+              inputs=lambda a: {'proposal_identity': exact_target(a['proposal']),
+                                'evidence_refs': a['proposal'].get('evidence_refs')},
+              evidence=lambda a: a['proposal'].get('evidence_refs'),
+              result=judgment_summary)
 def validate_graph_rebase_proposal(
     proposal: Mapping[str, Any],
     *,

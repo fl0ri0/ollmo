@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
+from ollmo_services.artifact_contracts import (
+    read_saved_file_snapshot, saved_file_dependency_contract,
+    saved_file_consumer_prompt, saved_file_read_text, saved_file_read_issue, saved_file_consumption_issue,
+    saved_file_consumption_artifact_issue,
+)
+from ollmo_services.events import (
+    observe_call,
+    observe_transition, transition_span, transition_attempt, transition_binding,
+    observe_request,
+    exact_target,
+    select_fields,
+    judgment_summary,
+    causal_event,
+    traced_thread_target,
+)
+
 import copy
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import unicodedata
@@ -25,6 +45,7 @@ from helpers.session_controls import (
 from ollmo_g.control_hints import infer_tts_language_from_prompt
 from ollmo_core.inference import TEXT_ARTIFACT_EXTENSIONS, extract_text_artifact_payloads
 from ollmo_core.runtime_liveness import (
+    runtime_instance_liveness,
     runtime_instance_is_selectable,
     runtime_instance_score,
     runtime_liveness_summary,
@@ -48,7 +69,10 @@ from ollmo_server.recovery_contract import (
     normalize_recovery_suggested_action,
 )
 from ollmo_server.repair_gate_runtime import classify_repair_execution_policy
-from ollmo_server.responses_runtime import terminal_repair_loop_is_fully_satisfied
+from ollmo_server.responses_runtime import (
+    repair_contract_matches_completion,
+    terminal_repair_loop_is_fully_satisfied,
+)
 from ollmo_server.response_semantics_runtime import (
     ResponseSemanticsRuntimeOwner,
     _bounded_visual_evidence_from_selected_message as _extract_bounded_visual_evidence_from_selected_message,
@@ -60,11 +84,18 @@ from ollmo_server.response_semantics_runtime import (
     _extract_sequential_bold_alpha_image_prompt_lines,
     _extract_html_image_card_prompt_units,
     _extract_numbered_image_prompt_section,
+    _parse_image_batch_expected_count,
     _extract_social_manifest_pipe_image_prompt_lines,
     _strip_social_manifest_image_prompt_metadata,
     control_json_envelope_suspected,
 )
-from ollmo_services.artifact_contracts import sanitize_artifact_record
+from ollmo_services.artifact_contracts import (
+    artifact_authority_rank,
+    artifact_is_current_authoritative,
+    artifact_logical_identities_match,
+    select_authoritative_artifact_records,
+    sanitize_artifact_record,
+)
 from ollmo_services.artifact_registry import refresh_text_artifact_record_from_saved_path
 from ollmo_services.graph_rebase import (
     graph_rebase_prompt_contains_root,
@@ -343,8 +374,10 @@ _SEMANTIC_EXECUTION_CONTROL_ACTIONS = {
     'superseded': 'superseded',
 }
 _LINK_REBIND_TEXT_EXTENSIONS = {'html', 'htm', 'css', 'js', 'mjs', 'cjs', 'json'}
-_LINK_REBIND_HTML_TARGET_EXTENSIONS = {'css', 'js', 'mjs', 'cjs'}
-_TERMINAL_MATERIALIZABLE_LOCAL_DEPENDENCY_EXTENSIONS = {'css', 'js', 'mjs', 'cjs', 'json'}
+_LINK_REBIND_HTML_TARGET_EXTENSIONS = {'html', 'htm', 'css', 'js', 'mjs', 'cjs'}
+_TERMINAL_MATERIALIZABLE_LOCAL_DEPENDENCY_EXTENSIONS = {
+    'html', 'htm', 'css', 'js', 'mjs', 'cjs', 'json'
+}
 _LINK_REBIND_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp', 'gif'}
 _LINK_REBIND_EXTENSION_FAMILIES = {
     'image': frozenset({'png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg'}),
@@ -359,7 +392,7 @@ _LINK_REBIND_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _LINK_REBIND_ATTR_RE = re.compile(
-    r'(?P<prefix>\b(?:href|src)\s*=\s*)(?P<quote>[\'"])(?P<url>[^\'"]+)(?P=quote)',
+    r'(?P<prefix>\b(?:href|src)\s*=\s*)(?P<quote>[\'"])(?P<url>[^\'"]*)(?P=quote)',
     re.IGNORECASE,
 )
 _LINK_REBIND_FETCH_RE = re.compile(
@@ -410,7 +443,8 @@ _LINK_REBIND_PLACEHOLDER_RE = re.compile(
 )
 _LINK_REBIND_JSON_PATH_KEY_RE = re.compile(
     r'^(?:'
-    r'(?:image|audio|video|media|asset|artifact|font|style|stylesheet|script)[_-](?:paths?|urls?|uris?|srcs?|hrefs?|files?)'
+    r'(?:image|picture|photo|audio|sound|voice|video|movie|media|asset|artifact|font|style|stylesheet|script)'
+    r'|(?:image|picture|photo|audio|sound|voice|video|movie|media|asset|artifact|font|style|stylesheet|script)[_-](?:paths?|urls?|uris?|srcs?|hrefs?|files?)'
     r'|(?:paths?|urls?|uris?|srcs?|hrefs?|files?)'
     r'|.+[_-](?:paths?|urls?|uris?|srcs?|hrefs?|files?)'
     r')$',
@@ -466,6 +500,9 @@ _COALESCED_TEXT_ARTIFACT_RECOVERY_MAX_ATTEMPTS = 2
 _TTS_AUTO_RECOVERY_POLICY_ID = 'tts_bounded_materialization_recovery_v1'
 _TTS_AUTO_RECOVERY_TRIGGER = 'tts_auto_recovery'
 _TTS_AUTO_RECOVERY_MAX_ATTEMPTS = 2
+EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID = (
+    'explicit_image_excluded_pool_retry_v1'
+)
 _TARGET_BOUND_SAVED_TEXT_SYNTAX_REPAIR_TRIGGER = (
     'target_bound_saved_text_syntax_repair'
 )
@@ -726,6 +763,7 @@ class LateFillRuntimeOwner:
     ] = None
     load_external_targets: Optional[Callable[..., list[dict[str, Any]]]] = None
     execute_external_chat_phase: Optional[Callable[..., dict[str, Any]]] = None
+    resolve_saved_file_input_path: Optional[Callable[[str], Optional[Path]]] = None
 
     @staticmethod
     def _artifact_gap_is_required_text_materialization(artifact_gap: Optional[Mapping[str, Any]]) -> bool:
@@ -1226,6 +1264,227 @@ class LateFillRuntimeOwner:
                     return False
         return True
 
+    def _artifact_gap_allows_excluded_candidate_reuse_for_explicit_image_retry(
+        self,
+        artifact_gap: Optional[Mapping[str, Any]],
+    ) -> bool:
+        """Authorize one user-triggered image retry after local pool exhaustion."""
+
+        gap = artifact_gap if isinstance(artifact_gap, Mapping) else {}
+        recovery_attempt = (
+            gap.get('recovery_attempt')
+            if isinstance(gap.get('recovery_attempt'), Mapping)
+            else {}
+        )
+        recovery_state = (
+            gap.get('recovery_state')
+            if isinstance(gap.get('recovery_state'), Mapping)
+            else {}
+        )
+        execution_contract = (
+            gap.get('execution_contract')
+            if isinstance(gap.get('execution_contract'), Mapping)
+            else {}
+        )
+        output_contract = (
+            execution_contract.get('output_contract')
+            if isinstance(execution_contract.get('output_contract'), Mapping)
+            else {}
+        )
+        policy_values = {
+            str(source.get('excluded_reuse_policy_id') or '').strip()
+            for source in (gap, recovery_attempt, recovery_state)
+        }
+        if policy_values != {EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID}:
+            return False
+        if any(
+            source.get('automatic_follow_up_allowed') is not False
+            for source in (gap, recovery_attempt, recovery_state)
+        ):
+            return False
+        if any(
+            source.get('auto_execute') is not False
+            for source in (recovery_attempt, recovery_state)
+        ):
+            return False
+        attempt_trigger = str(recovery_attempt.get('trigger') or '').strip().lower()
+        state_trigger = str(recovery_state.get('trigger') or '').strip().lower()
+        if attempt_trigger != 'explicit_retry_endpoint' or state_trigger != attempt_trigger:
+            return False
+        capabilities = {
+            self.normalize_capability(value)
+            for value in (
+                gap.get('expected_capability'),
+                gap.get('active_capability'),
+                execution_contract.get('capability'),
+                recovery_attempt.get('capability'),
+                recovery_state.get('capability'),
+            )
+            if str(value or '').strip()
+        }
+        if capabilities != {self.capability_image_generation}:
+            return False
+        output_type = str(
+            gap.get('output_type')
+            or execution_contract.get('output_type')
+            or gap.get('missing_artifact_type')
+            or ''
+        ).strip().lower()
+        if output_type != 'image' or output_contract.get('required') is not True:
+            return False
+        action = normalize_recovery_suggested_action(
+            recovery_state.get('suggested_action')
+            or gap.get('repair_action')
+            or gap.get('recovery_action')
+            or gap.get('suggested_action'),
+            default='',
+        )
+        if action not in {
+            RECOVERY_ACTION_RETRY_EXCLUDING_INSTANCE,
+            RECOVERY_ACTION_START_COMPATIBLE_INSTANCE,
+        }:
+            return False
+        prior_error_codes = {
+            str(value or '').strip().upper()
+            for value in (
+                recovery_attempt.get('prior_error_code'),
+                recovery_state.get('prior_error_code'),
+            )
+            if str(value or '').strip()
+        }
+        if prior_error_codes != {'NO_COMPATIBLE_INSTANCE'}:
+            return False
+        if str(recovery_state.get('retry_scope') or '').strip() != 'same_branch':
+            return False
+        branch_id = str(
+            gap.get('branch_id') or execution_contract.get('branch_id') or ''
+        ).strip()
+        if not branch_id or any(
+            str(source.get('branch_id') or '').strip() != branch_id
+            for source in (recovery_attempt, recovery_state)
+        ):
+            return False
+        if any(
+            source.get('preserve_intent') is not True
+            for source in (recovery_attempt, recovery_state)
+        ):
+            return False
+        if any(
+            source.get('needs_external_input') is True
+            or source.get('materialization_blocked') is True
+            for source in (gap, recovery_state)
+        ):
+            return False
+        if gap.get('repair_work_available') is False:
+            return False
+        artifact_prompt = str(gap.get('artifact_prompt') or '').strip()
+        artifact_prompt_source = str(
+            gap.get('artifact_prompt_source') or ''
+        ).strip()
+        authoritative_prompt_sources = {
+            'semantic_batch_prompt',
+            'semantic_batch_prompts',
+            'semantic_prepare_phase_output',
+            'current_turn_direct_image_clause',
+            'action_input',
+            'prompt_blockquote_section',
+            'quoted_prompt_section',
+            'inline_prompt_capsule',
+            'current_turn_explicit_image_manifest',
+            'request_prompt_image_slots',
+        }
+        if (
+            not artifact_prompt
+            or artifact_prompt_source not in authoritative_prompt_sources
+        ):
+            return False
+        try:
+            expected_prompt_count = int(
+                gap.get('batch_prompt_expected_count') or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        if expected_prompt_count >= 2:
+            batch_prompts = (
+                gap.get('batch_prompts')
+                if isinstance(gap.get('batch_prompts'), list)
+                else []
+            )
+            exact_prompts = [
+                str(item or '').strip()
+                for item in batch_prompts
+                if str(item or '').strip()
+            ]
+            try:
+                selection_index = int(
+                    gap.get('image_prompt_selection_index')
+                    or execution_contract.get('queue_index')
+                    or 0
+                )
+            except (TypeError, ValueError):
+                return False
+            if (
+                len(batch_prompts) != expected_prompt_count
+                or len(exact_prompts) != expected_prompt_count
+                or not 1 <= selection_index <= expected_prompt_count
+                or artifact_prompt != exact_prompts[selection_index - 1]
+            ):
+                return False
+        attempt_excluded = {
+            str(item or '').strip()
+            for item in (recovery_attempt.get('excluded_instance_ids') or [])
+            if str(item or '').strip()
+        }
+        state_excluded = {
+            str(item or '').strip()
+            for item in (recovery_state.get('exclude_instance_ids') or [])
+            if str(item or '').strip()
+        }
+        gap_excluded = {
+            str(item or '').strip()
+            for item in (gap.get('excluded_instance_ids') or [])
+            if str(item or '').strip()
+        }
+        return bool(
+            attempt_excluded
+            and attempt_excluded == state_excluded
+            and attempt_excluded == gap_excluded
+        )
+
+    def _branch_is_explicit_image_excluded_pool_retry(
+        self,
+        branch: Mapping[str, Any],
+    ) -> bool:
+        if self.branch_capability(branch) != self.capability_image_generation:
+            return False
+        recovery_attempt = (
+            branch.get('recovery_attempt')
+            if isinstance(branch.get('recovery_attempt'), Mapping)
+            else {}
+        )
+        recovery_state = (
+            branch.get('recovery_state')
+            if isinstance(branch.get('recovery_state'), Mapping)
+            else {}
+        )
+        return bool(
+            branch.get('excluded_reuse_policy_id')
+            == EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+            and recovery_attempt.get('excluded_reuse_policy_id')
+            == EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+            and recovery_state.get('excluded_reuse_policy_id')
+            == EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+            and branch.get('automatic_follow_up_allowed') is False
+            and recovery_attempt.get('automatic_follow_up_allowed') is False
+            and recovery_state.get('automatic_follow_up_allowed') is False
+            and str(recovery_attempt.get('trigger') or '').strip().lower()
+            == 'explicit_retry_endpoint'
+            and str(recovery_state.get('trigger') or '').strip().lower()
+            == 'explicit_retry_endpoint'
+            and recovery_attempt.get('auto_execute') is False
+            and recovery_state.get('auto_execute') is False
+        )
+
     @classmethod
     def _artifact_gap_is_authoritative_bounded_text_artifact_repair(
         cls,
@@ -1244,17 +1503,8 @@ class LateFillRuntimeOwner:
         ).strip()
         if not target_path:
             return False
-        action = normalize_recovery_suggested_action(
-            gap.get('repair_action') or gap.get('recovery_action') or gap.get('suggested_action'),
-            default='',
-        )
-        if action not in {
-            RECOVERY_ACTION_REBIND_DEPENDENCY_EVIDENCE,
-            RECOVERY_ACTION_RETRY_SAME_BRANCH,
-        }:
-            return False
-        if gap.get('materialization_blocked') is True or gap.get('needs_external_input') is True:
-            return False
+        # Repair identity survives retry-action changes and compact projections.
+        # Execution permission is checked separately by the execution gate.
         content_payload_source = str(gap.get('content_payload_source') or '').strip()
         text_artifact_source = str(
             gap.get('text_artifact_source')
@@ -1267,6 +1517,7 @@ class LateFillRuntimeOwner:
                 'closure_linked_artifact_binding_review',
                 'closure_local_dependency_link_review',
                 'closure_composed_page_image_representation',
+                'closure_composed_site_image_composition',
                 'closure_hero_image_composition',
                 'closure_text_artifact_syntax_sanity',
                 'terminal_web_runtime_binding_review',
@@ -1275,6 +1526,7 @@ class LateFillRuntimeOwner:
                 'closure_link_rebind',
                 'closure_local_dependency_link',
                 'closure_composed_page_image_representation',
+                'closure_composed_site_image_composition',
                 'closure_hero_image_composition',
                 'closure_selector_binding_repair',
                 'closure_syntax_repair',
@@ -1870,6 +2122,18 @@ class LateFillRuntimeOwner:
         for source in (spec, branch, gap, prepare_args):
             if not isinstance(source, Mapping):
                 continue
+            request = source.get('artifact_request') or {}
+            if request.get('saved_file_producer') or request.get('saved_file_dependency'):
+                return True
+            if source.get('materialization_blocked') or source.get('branch_contract_error'):
+                return True
+            contract = source.get('execution_contract')
+            for dependency_owner in (source, contract if isinstance(contract, Mapping) else {}):
+                # One common preparation answer is safe to share. A consumer
+                # of any later phase must keep its own accepted input packet.
+                if any(str(item or '').strip() != 'phase-1'
+                       for item in (dependency_owner.get('depends_on') or [])):
+                    return True
             if source.get('disable_coalesced_text_artifact_retry') is True:
                 return True
             if source.get('coalesced_text_artifact_split_retry') is True:
@@ -1931,8 +2195,9 @@ class LateFillRuntimeOwner:
             return specs
         requests: list[dict[str, Any]] = []
         branch_refs: list[dict[str, Any]] = []
-        seen_request_identities: set[tuple[str, ...]] = set()
+        request_index_by_identity: dict[tuple[str, ...], int] = {}
         coalesced_indexes: set[int] = set()
+        seen_branch_ref_ids: set[str] = set()
         for index, (spec, branch) in enumerate(zip(specs, branches)):
             if self.normalize_capability(spec.get('capability')) != 'chat':
                 continue
@@ -1949,15 +2214,12 @@ class LateFillRuntimeOwner:
                 if target_path
                 else ('named', extension, source_name)
             )
-            if (
-                not request
-                or not extension
-                or request_identity in seen_request_identities
-            ):
+            if not request or not extension:
                 continue
-            seen_request_identities.add(request_identity)
             coalesced_indexes.add(index)
-            requests.append(request)
+            if request_identity not in request_index_by_identity:
+                request_index_by_identity[request_identity] = len(requests)
+                requests.append(request)
             prepare_args = (
                 spec.get('prepare_args')
                 if isinstance(spec.get('prepare_args'), Mapping)
@@ -1968,10 +2230,14 @@ class LateFillRuntimeOwner:
                 if isinstance(prepare_args.get('artifact_gap'), Mapping)
                 else {}
             )
+            branch_ref_id = self.branch_id(branch)
+            if not branch_ref_id or branch_ref_id in seen_branch_ref_ids:
+                continue
+            seen_branch_ref_ids.add(branch_ref_id)
             branch_refs.append(
                 {
-                    'branch_id': self.branch_id(branch),
-                    'phase_id': str(branch.get('phase_id') or self.branch_id(branch)).strip() or self.branch_id(branch),
+                    'branch_id': branch_ref_id,
+                    'phase_id': str(branch.get('phase_id') or branch_ref_id).strip() or branch_ref_id,
                     'capability': self.branch_capability(branch),
                     'output_type': branch.get('output_type'),
                     'text_artifact_extension': request.get('extension'),
@@ -1985,7 +2251,7 @@ class LateFillRuntimeOwner:
                     ),
                 }
             )
-        if len(requests) <= 1:
+        if len(coalesced_indexes) <= 1 or not requests or len(branch_refs) <= 1:
             return specs
         first_index = min(coalesced_indexes)
         base = dict(specs[first_index])
@@ -2127,6 +2393,12 @@ class LateFillRuntimeOwner:
                 or not any(isinstance(error, Mapping) and error for error in member_errors)
                 or any(
                     isinstance(error, Mapping) and error.get('retryable') is False
+                    for error in member_errors
+                )
+                or any(
+                    isinstance(error, Mapping)
+                    and error.get('code') == 'INSTANCE_UNAVAILABLE'
+                    and error.get('stage') == 'prepare_branch_plan'
                     for error in member_errors
                 )
             ):
@@ -2932,6 +3204,7 @@ class LateFillRuntimeOwner:
             'source',
             'role',
             'stage_direction',
+            'dependency_contract',
             'content_payload_source',
             'artifact_prompt_source',
             'candidate_selection_index',
@@ -2944,6 +3217,7 @@ class LateFillRuntimeOwner:
             'audio_variant_contract_source',
             'structured_output_contract',
             'branch_contract_error',
+            'candidate_extraction_issue',
             'audio_variant_contract_conflicting_fields',
             'candidate_id',
             'contract_state',
@@ -3035,6 +3309,9 @@ class LateFillRuntimeOwner:
             if value not in (None, '', [], {}):
                 contract[key] = _clean_contract_value(value)
 
+        if gap_payload.get('saved_file_read_evidence'):
+            contract['saved_file_read_evidence'] = copy.deepcopy(gap_payload['saved_file_read_evidence'])
+            contract['input_refs'] = copy.deepcopy(gap_payload.get('input_refs') or [])
         existing_contract = gap_payload.get('execution_contract')
         if isinstance(existing_contract, Mapping):
             for key, value in _clean_contract_value(existing_contract).items():
@@ -3095,7 +3372,12 @@ class LateFillRuntimeOwner:
         code = str(raw.get('code') or '').strip().upper()
         if not code:
             lowered = message.lower()
-            if 'timeout' in lowered or 'timed out' in lowered:
+            if (
+                stage == 'prepare_branch_plan'
+                and lowered.startswith('no ready late-fill instance for capability ')
+            ):
+                code = 'INSTANCE_UNAVAILABLE'
+            elif 'timeout' in lowered or 'timed out' in lowered:
                 code = 'BACKEND_TIMEOUT'
             elif any(token in lowered for token in ('unavailable', 'connection refused', 'offline')):
                 code = 'INSTANCE_UNAVAILABLE'
@@ -3123,6 +3405,7 @@ class LateFillRuntimeOwner:
         if exception_type:
             payload['exception_type'] = exception_type
         for key in (
+            'route_diagnostics',
             'reason_code',
             'defect_code',
             'defect_codes',
@@ -3217,6 +3500,11 @@ class LateFillRuntimeOwner:
         instance_id = str(attempt.get('instance_id') or '').strip()
         code = str(error.get('code') or '').strip().upper()
         message = str(error.get('message') or '').strip()
+        availability_recheck_required = bool(
+            code == 'INSTANCE_UNAVAILABLE'
+            and str(error.get('stage') or attempt.get('stage') or '').strip()
+            == 'prepare_branch_plan'
+        )
         explicit_action = normalize_recovery_suggested_action(
             error.get('repair_action') or error.get('recovery_action') or error.get('suggested_action'),
             default='',
@@ -3225,9 +3513,22 @@ class LateFillRuntimeOwner:
             code == 'DEPENDENCY_CHAIN_REPAIR_REQUIRED'
             or _DEPENDENCY_INPUT_MISSING_RE.search(message)
         )
+        owned_retryable_text_repair_failure = bool(
+            code == 'TEXT_ARTIFACT_REPAIR_OUTPUT_MISSING'
+            and retryable
+            and explicit_action
+            in {
+                RECOVERY_ACTION_RETRY_SAME_BRANCH,
+                RECOVERY_ACTION_RETRY_EXCLUDING_INSTANCE,
+            }
+        )
         branch_contract_repair = bool(
             code in {'BRANCH_CONTRACT_REPAIR_REQUIRED', 'CONTROL_VALIDATION_FAILED', 'PREPARE_FAILED'}
-            or _BRANCH_CONTRACT_REPAIR_RE.search(message)
+            or (
+                not owned_retryable_text_repair_failure
+                and not availability_recheck_required
+                and _BRANCH_CONTRACT_REPAIR_RE.search(message)
+            )
         )
         rebuild_promoted_obligations = bool(
             code == 'REBUILD_FROM_PROMOTED_OBLIGATIONS_REQUIRED'
@@ -3253,6 +3554,8 @@ class LateFillRuntimeOwner:
             suggested_action = RECOVERY_ACTION_MANUAL_REVIEW
         elif code == 'NO_COMPATIBLE_INSTANCE':
             suggested_action = RECOVERY_ACTION_START_COMPATIBLE_INSTANCE
+        elif availability_recheck_required:
+            suggested_action = RECOVERY_ACTION_RETRY_SAME_BRANCH
         elif instance_id:
             suggested_action = RECOVERY_ACTION_RETRY_EXCLUDING_INSTANCE
         else:
@@ -3277,6 +3580,8 @@ class LateFillRuntimeOwner:
             'error_code': code,
         }
         reason_code = str(error.get('reason_code') or '').strip()
+        if availability_recheck_required:
+            payload['availability_recheck_required'] = True
         if reason_code:
             payload['reason_code'] = reason_code
         defect_codes = [
@@ -3331,7 +3636,7 @@ class LateFillRuntimeOwner:
             value = error.get(key)
             if value not in (None, '', [], {}):
                 payload[key] = value
-        if instance_id and retryable:
+        if instance_id and retryable and not availability_recheck_required:
             payload['exclude_instance_ids'] = [instance_id]
         return payload
 
@@ -3370,6 +3675,7 @@ class LateFillRuntimeOwner:
                 payload[key] = value
         for key in (
             'repair_required',
+            'availability_recheck_required',
             'blocked_by_dependency_input',
             'blocked_by_branch_contract',
             'blocked_by_underplanned_promoted_obligations',
@@ -3385,7 +3691,7 @@ class LateFillRuntimeOwner:
             if value:
                 payload[key] = value
         instance_id = str(attempt_payload.get('instance_id') or '').strip()
-        if instance_id:
+        if instance_id and not recovery_context.get('availability_recheck_required'):
             payload['failed_instance_id'] = instance_id
         exclude_instance_ids = [
             str(item).strip()
@@ -3556,6 +3862,73 @@ class LateFillRuntimeOwner:
             'content_payload': content_payload,
         }
 
+    @staticmethod
+    def _late_fill_availability_poll_seconds() -> float:
+        try:
+            value = float(os.environ.get('OLLMO_LATE_FILL_AVAILABILITY_POLL_SEC', '5'))
+        except (TypeError, ValueError):
+            value = 5.0
+        return max(1.0, min(value, 60.0))
+
+    @classmethod
+    def build_availability_wait_branch(
+        cls, branch: Mapping[str, Any], *, error: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        diagnostics = error.get('route_diagnostics')
+        evidence = diagnostics.get('availability_wait') if isinstance(diagnostics, Mapping) else None
+        if (
+            error.get('code') != 'INSTANCE_UNAVAILABLE'
+            or error.get('stage') != 'prepare_branch_plan'
+            or not isinstance(evidence, Mapping)
+            or evidence.get('reason') != 'live_candidates_in_cooldown'
+            or not evidence.get('candidate_instance_ids')
+            or branch.get('automatic_follow_up_allowed') is False
+        ):
+            return None
+        now = time.time()
+        previous = branch.get('availability_wait')
+        previous = previous if isinstance(previous, Mapping) else {}
+        waiting = dict(branch)
+        for key in ('error', 'attempt', 'recovery_context', 'recovery_state'):
+            waiting.pop(key, None)
+        waiting['status'] = 'pending'
+        waiting['availability_wait'] = {
+            **dict(evidence),
+            'status': 'waiting',
+            'started_at_epoch': previous.get('started_at_epoch', now),
+            'next_check_epoch': now + cls._late_fill_availability_poll_seconds(),
+            'check_count': int(previous.get('check_count') or 0) + 1,
+        }
+        wait_event = causal_event('late_fill.availability', 'wait_started',
+            target=exact_target(branch), predicate='availability_poll_due',
+            unresolved_state='compatible_route_recheck_due',
+            next_check_epoch=waiting['availability_wait']['next_check_epoch'],
+            producer_instance_ids=evidence.get('candidate_instance_ids'),
+            producer_version=None, gates_complete=False,
+            required_rule='late_fill_availability_poll',
+            previous_wait_id=(previous.get('causal') or {}).get('wait_id'))
+        if wait_event:
+            waiting['availability_wait']['causal'] = {
+                'wait_id': wait_event['event_id'],
+                'next_check_epoch': waiting['availability_wait']['next_check_epoch'],
+                'process_boot_id': wait_event['process_boot_id'],
+                'start_monotonic_ns': wait_event['monotonic_ns'],
+            }
+        return waiting
+
+    @staticmethod
+    def availability_wait_delay(branch: Mapping[str, Any]) -> float:
+        wait = branch.get('availability_wait')
+        if not isinstance(wait, Mapping):
+            return 0.0
+        try:
+            remaining = float(wait.get('next_check_epoch') or 0) - time.time()
+            # A future timestamp beyond the supported poll range is stale
+            # after clock movement; revalidate rather than hide the work.
+            return 0.0 if remaining > 60 else max(0.0, remaining)
+        except (TypeError, ValueError):
+            return 0.0
+
     def auto_executable_repair_recovery_allowed(
         self,
         branch: Mapping[str, Any],
@@ -3563,6 +3936,15 @@ class LateFillRuntimeOwner:
         recovery_context: Mapping[str, Any],
     ) -> bool:
         if not isinstance(branch, Mapping) or not isinstance(recovery_context, Mapping):
+            return False
+        if recovery_context.get('availability_recheck_required') is True:
+            # The pending availability-wait path owns temporary pool waits;
+            # they must never consume bounded materialization retry attempts.
+            return False
+        if self._branch_is_explicit_image_excluded_pool_retry(branch):
+            # This policy authorizes exactly one user-triggered wave. A failed
+            # attempt returns to explicit user control instead of entering the
+            # ordinary required-image auto-repair loop.
             return False
         required_text_artifact = self._branch_is_required_text_artifact(branch)
         required_image_materialization = self._branch_is_required_image_materialization(branch)
@@ -3951,6 +4333,45 @@ class LateFillRuntimeOwner:
             remember(raw_control, source='branch_controls')
         return controls_by_branch_id
 
+    def _causal_execution_gate_inputs(self, branch, current_payload):
+        # Follow the gate's precedence. A sibling control or a lower-priority
+        # cancellation hint cannot change this owner's effective input identity.
+        branch = branch if isinstance(branch, Mapping) else {}
+        status = _normalized_terminal_status(branch.get('status'))
+        selected = {'branch_id': self.branch_id(branch),
+                    'phase_id': branch.get('phase_id'),
+                    'capability': self.branch_capability(branch), 'status': status}
+        if status:
+            selected['reason'] = str(branch.get('execution_gate_reason') or '').strip()
+            return selected
+        control = self.late_fill_branch_control_records(current_payload).get(self.branch_id(branch)) if current_payload is not None else None
+        if control:
+            selected['control'] = select_fields(control, ('status', 'action', 'reason', 'source', 'authority'))
+            status = _normalized_terminal_status(control.get('status') or control.get('action'))
+        if not status:
+            cancelled = self.parse_bool(branch.get('cancel_requested'), default=False)
+            selected['cancel_requested'] = cancelled
+            if cancelled:
+                selected['cancel_reason'] = str(branch.get('cancel_reason') or '').strip()
+        return selected
+
+    @observe_transition('late_fill.start_check', target=lambda a: exact_target(
+                        a['branch'], 'response_id', 'branch_id', 'phase_id',
+                        'attempt_id', 'attempt_count', 'attempt_number',
+                        'retry_count', 'auto_executable_repair_retry_count'),
+                        result=lambda value: {
+                            'gate_scope': 'semantic_execution_gate_current_branch_v1',
+                            'gate_check_complete': True,
+                            'gate_status': value.get('status'),
+                            'gate_action': value.get('action'),
+                            'aggregate_start_authority': 'not_established_by_this_gate',
+                        })
+    @observe_call('late_fill.semantic_execution_gate_decision',
+                  target=lambda a: exact_target(a['branch']),
+                  inputs=lambda a: a['self']._causal_execution_gate_inputs(a['branch'], a['current_payload']),
+                  authority=lambda a: {'rule': 'semantic_execution_gate_current_branch_v1'},
+                  evidence=lambda a: [], complete=True,
+                  required_rule='semantic_execution_gate_current_branch_v1', result=judgment_summary)
     def semantic_execution_gate_decision(
         self,
         branch: Mapping[str, Any],
@@ -4134,6 +4555,19 @@ class LateFillRuntimeOwner:
         current_payload: Mapping[str, Any],
         artifact_gap: Optional[Mapping[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
+        if any(
+            source.get('branch_contract_error') == 'saved_file_dependency_unbound'
+            for source in (branch, artifact_gap or {})
+        ):
+            return {
+                'code': 'DEPENDENCY_CHAIN_REPAIR_REQUIRED',
+                'message': 'The required saved-file read has no verified execution contract.',
+                'stage': 'dependency_gate',
+                'retryable': False,
+                'repair_action': RECOVERY_ACTION_REPAIR_DEPENDENCY_CHAIN,
+                'materialization_blocked': True,
+                'branch_contract_error': 'saved_file_dependency_unbound',
+            }
         if self._branch_depends_on_rejected_current_payload(branch, current_payload=current_payload):
             runtime = (
                 current_payload.get('runtime')
@@ -4190,6 +4624,10 @@ class LateFillRuntimeOwner:
             }
         gap_payload = artifact_gap if isinstance(artifact_gap, Mapping) else {}
         dependency_payload = self.branch_dependency_payload(branch, current_payload=current_payload)
+        if saved_file_dependency_contract(branch) and dependency_payload.get('branch_contract_error'):
+            return {'code': 'DEPENDENCY_CHAIN_REPAIR_REQUIRED',
+                    'message': dependency_payload['branch_contract_error'],
+                    'stage': 'dependency_gate', 'retryable': False, **dependency_payload}
         repair_gate_item: dict[str, Any] = dict(gap_payload)
         repair_gate_item.update(dict(branch))
         if dependency_payload:
@@ -4598,6 +5036,13 @@ class LateFillRuntimeOwner:
             'branch_contract_error',
             'audio_variant_contract_conflicting_fields',
             'materialization_blocked',
+            'batch_prompts',
+            'batch_prompts_source',
+            'batch_prompt_expected_count',
+            'batch_prompt_expected_count_invalid',
+            'batch_prompt_actual_count',
+            'counted_batch_prompt_carriers_blocked',
+            'candidate_extraction_issue',
         ):
             value = artifact_gap_payload.get(key)
             if value not in (None, '', [], {}):
@@ -4809,7 +5254,9 @@ class LateFillRuntimeOwner:
             )
             if text_artifact_prompt:
                 late_fill_payload['prompt'] = text_artifact_prompt
-                late_fill_payload['_prompt_hint'] = original_prompt or text_artifact_prompt
+                saved_contract = saved_file_dependency_contract(artifact_gap_payload)
+                late_fill_payload['_prompt_hint'] = (saved_contract['consumer_instruction']
+                    if saved_contract else original_prompt or text_artifact_prompt)
         elif (
             normalized_expected_capability == 'chat'
             and (
@@ -4851,6 +5298,86 @@ class LateFillRuntimeOwner:
                 normalized_expected_capability=normalized_expected_capability,
                 root_scoped_execution=root_scoped_execution,
             )
+        counted_image_prompt_expected, invalid_image_prompt_count = (
+            _parse_image_batch_expected_count(
+                artifact_gap_payload.get('batch_prompt_expected_count'),
+                present=(
+                    'batch_prompt_expected_count' in artifact_gap_payload
+                    and artifact_gap_payload.get('batch_prompt_expected_count')
+                    not in (None, '', [], {})
+                ),
+            )
+        )
+        counted_image_prompts = (
+            artifact_gap_payload.get('batch_prompts')
+            if isinstance(artifact_gap_payload.get('batch_prompts'), list)
+            else []
+        )
+        counted_image_prompt_actual = len(
+            [
+                item
+                for item in counted_image_prompts
+                if str(item or '').strip()
+            ]
+        )
+        counted_image_batch_blocked = bool(
+            normalized_expected_capability == self.capability_image_generation
+            and (
+                invalid_image_prompt_count
+                or (
+                    counted_image_prompt_expected >= 2
+                    and (
+                        len(counted_image_prompts) != counted_image_prompt_expected
+                        or counted_image_prompt_actual != counted_image_prompt_expected
+                    )
+                )
+            )
+        )
+        if counted_image_batch_blocked:
+            # No root prompt, preparation prose, history, or partial batch may
+            # become a fallback execution carrier for a missing counted slot.
+            for key in (
+                'prompt',
+                '_prompt_hint',
+                'input',
+                'messages',
+                'ghost_messages',
+                'artifact_prompt',
+                'content_payload',
+                'phase_summary',
+                'stage_direction',
+                'instruct',
+                'batch_prompts',
+                'artifact_prompt_source',
+                'content_payload_source',
+                'batch_prompts_source',
+                'batch_prompt_source_phase_id',
+                'batch_prompt_expected_count',
+            ):
+                late_fill_payload.pop(key, None)
+            late_fill_payload['branch_contract_error'] = (
+                'incomplete_image_prompt_batch'
+            )
+            late_fill_payload['materialization_blocked'] = True
+            if invalid_image_prompt_count:
+                late_fill_payload['batch_prompt_expected_count_invalid'] = True
+            else:
+                late_fill_payload['batch_prompt_expected_count'] = (
+                    counted_image_prompt_expected
+                )
+            late_fill_payload['batch_prompt_actual_count'] = (
+                counted_image_prompt_actual
+            )
+            late_fill_payload['repair_action'] = (
+                RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT
+            )
+            late_fill_payload['candidate_extraction_issue'] = (
+                'invalid_image_prompt_batch_count'
+                if invalid_image_prompt_count
+                else 'missing_exact_branch_local_image_prompt_batch'
+            )
+            late_fill_payload['counted_batch_prompt_carriers_blocked'] = True
+            return late_fill_payload
         late_fill_payload.pop('ghost_preview', None)
         semantic_review_stage = str(
             artifact_gap_payload.get('stage_direction') or ''
@@ -5419,6 +5946,12 @@ class LateFillRuntimeOwner:
                 source='per_branch_refresh',
             )
         used_runtime_candidate_snapshot = bool(runtime_candidate_snapshot)
+        explicit_image_retry_policy_eligible = bool(
+            normalized_expected_capability == self.capability_image_generation
+            and self._artifact_gap_allows_excluded_candidate_reuse_for_explicit_image_retry(
+                artifact_gap_payload
+            )
+        )
 
         def refresh_snapshot_candidates_from_live_truth(reason: str) -> bool:
             nonlocal instances, candidate_snapshot_meta
@@ -5440,7 +5973,10 @@ class LateFillRuntimeOwner:
                 }
                 return False
 
-            if reason == 'snapshot_tts_recovery_requires_live_alternative_check':
+            if reason in {
+                'snapshot_tts_recovery_requires_live_alternative_check',
+                'snapshot_explicit_image_retry_requires_live_pool_check',
+            }:
                 instances = [
                     dict(entry)
                     for entry in (live_instances or [])
@@ -5448,7 +5984,11 @@ class LateFillRuntimeOwner:
                 ]
                 candidate_snapshot_meta = self._runtime_candidate_snapshot_meta(
                     instances,
-                    source='per_branch_refresh_for_tts_recovery',
+                    source=(
+                        'per_branch_refresh_for_explicit_image_retry'
+                        if reason == 'snapshot_explicit_image_retry_requires_live_pool_check'
+                        else 'per_branch_refresh_for_tts_recovery'
+                    ),
                 )
                 candidate_snapshot_meta['refresh_reason'] = str(reason or '').strip()
                 candidate_snapshot_meta['snapshot_candidate_count'] = len(runtime_candidate_snapshot)
@@ -5590,6 +6130,7 @@ class LateFillRuntimeOwner:
             int,
             bool,
             bool,
+            bool,
             list[dict[str, Any]],
             list[dict[str, Any]],
         ]:
@@ -5650,9 +6191,27 @@ class LateFillRuntimeOwner:
                     artifact_gap_payload
                 )
             )
+            reuse_excluded_for_explicit_image_retry = bool(
+                normalized_expected_capability == self.capability_image_generation
+                and resolved_excluded_instance_ids
+                and usable_compatible_items
+                and not usable_nonexcluded_items
+                and all(
+                    str(entry.get('instance_id') or '').strip()
+                    in resolved_excluded_instance_ids
+                    for entry in usable_compatible_items
+                )
+                and self._artifact_gap_allows_excluded_candidate_reuse_for_explicit_image_retry(
+                    artifact_gap_payload
+                )
+            )
             base_items = (
                 all_items
-                if reuse_excluded_for_text_repair or reuse_excluded_for_tts_recovery
+                if (
+                    reuse_excluded_for_text_repair
+                    or reuse_excluded_for_tts_recovery
+                    or reuse_excluded_for_explicit_image_retry
+                )
                 else filtered_items
                 if resolved_excluded_instance_ids
                 else all_items
@@ -5673,6 +6232,7 @@ class LateFillRuntimeOwner:
                 excluded_count,
                 reuse_excluded_for_text_repair,
                 reuse_excluded_for_tts_recovery,
+                reuse_excluded_for_explicit_image_retry,
                 base_items,
                 usable_items,
             )
@@ -5683,11 +6243,14 @@ class LateFillRuntimeOwner:
             excluded_candidate_count,
             reuse_excluded_candidates_for_text_repair,
             reuse_excluded_candidate_for_tts_recovery,
+            reuse_excluded_candidates_for_explicit_image_retry,
             base_candidates,
             usable_candidates,
         ) = compute_candidate_pools()
         refresh_reason = ''
-        if reuse_excluded_candidate_for_tts_recovery and used_runtime_candidate_snapshot:
+        if explicit_image_retry_policy_eligible and used_runtime_candidate_snapshot:
+            refresh_reason = 'snapshot_explicit_image_retry_requires_live_pool_check'
+        elif reuse_excluded_candidate_for_tts_recovery and used_runtime_candidate_snapshot:
             refresh_reason = 'snapshot_tts_recovery_requires_live_alternative_check'
         elif not all_candidates:
             refresh_reason = 'snapshot_missing_expected_capability'
@@ -5704,11 +6267,16 @@ class LateFillRuntimeOwner:
                     excluded_candidate_count,
                     reuse_excluded_candidates_for_text_repair,
                     reuse_excluded_candidate_for_tts_recovery,
+                    reuse_excluded_candidates_for_explicit_image_retry,
                     base_candidates,
                     usable_candidates,
                 ) = compute_candidate_pools()
-            elif refresh_reason == 'snapshot_tts_recovery_requires_live_alternative_check':
+            elif refresh_reason in {
+                'snapshot_tts_recovery_requires_live_alternative_check',
+                'snapshot_explicit_image_retry_requires_live_pool_check',
+            }:
                 reuse_excluded_candidate_for_tts_recovery = False
+                reuse_excluded_candidates_for_explicit_image_retry = False
                 base_candidates = list(filtered_candidates)
                 usable_candidates = [
                     entry
@@ -5724,14 +6292,29 @@ class LateFillRuntimeOwner:
                 _late_fill_instance_unusable_summary(entry, capability=expected_capability)
                 for entry in base_candidates
             )
-            return (
-                late_fill_payload,
-                None,
-                attach_route_diagnostics(
-                    f"No ready late-fill instance for capability '{expected_capability}'. "
-                    f"Unusable instance ids: {unusable_text}."
-                ),
+            message = attach_route_diagnostics(
+                f"No ready late-fill instance for capability '{expected_capability}'. "
+                f"Unusable instance ids: {unusable_text}."
             )
+            temporary_candidates = []
+            for entry in base_candidates:
+                liveness = runtime_instance_liveness(entry, capability=expected_capability)
+                if (
+                    liveness['fresh_cooldown']
+                    and not liveness['hard_unavailable']
+                    and liveness['process_alive'] is True
+                    and liveness['port_listening'] is True
+                ):
+                    temporary_candidates.append((entry, liveness))
+            if temporary_candidates:
+                late_fill_payload['_late_fill_route_diagnostics']['availability_wait'] = {
+                    'reason': 'live_candidates_in_cooldown',
+                    'candidate_instance_ids': [
+                        str(entry.get('instance_id') or '') for entry, _ in temporary_candidates
+                    ],
+                    'cooldown_until': min(item['cooldown_until'] for _, item in temporary_candidates),
+                }
+            return late_fill_payload, None, message
         candidates = self._prefer_non_mlx_vlm_for_required_text_candidates(
             usable_candidates,
             artifact_gap_payload,
@@ -5830,6 +6413,7 @@ class LateFillRuntimeOwner:
                     if (
                         reuse_excluded_candidates_for_text_repair
                         or reuse_excluded_candidate_for_tts_recovery
+                        or reuse_excluded_candidates_for_explicit_image_retry
                     )
                     else ''
                 ),
@@ -5881,6 +6465,22 @@ class LateFillRuntimeOwner:
                 selected_instance_id,
                 artifact_gap_payload.get('branch_id'),
             )
+        if reuse_excluded_candidates_for_explicit_image_retry:
+            route_runtime_seed['selection_policy'] = (
+                'excluded_reuse_for_explicit_image_retry'
+            )
+            route_runtime_seed['excluded_instance_reuse_reason'] = (
+                'user_triggered_retry_after_ready_image_pool_exhausted'
+            )
+            route_runtime_seed['excluded_instance_reuse_instance_id'] = (
+                selected_instance_id
+            )
+            route_runtime_seed['excluded_instance_reuse_recovery_trigger'] = (
+                'explicit_retry_endpoint'
+            )
+            route_runtime_seed['excluded_reuse_policy_id'] = (
+                EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+            )
         route_runtime = self.merge_request_meta_runtime_truth({}, late_fill_payload, route_payload=route_runtime_seed)
         route_runtime['runtime_candidate_snapshot'] = dict(candidate_snapshot_meta)
         route_runtime['candidate_diagnostics'] = list(route_runtime_seed.get('candidate_diagnostics') or [])
@@ -5896,6 +6496,22 @@ class LateFillRuntimeOwner:
             route_runtime['tts_recovery_policy_id'] = str(
                 route_runtime_seed.get('tts_recovery_policy_id') or ''
             ).strip() or None
+        elif reuse_excluded_candidates_for_explicit_image_retry:
+            route_runtime['selection_policy'] = (
+                'excluded_reuse_for_explicit_image_retry'
+            )
+            route_runtime['excluded_instance_reuse_reason'] = str(
+                route_runtime_seed.get('excluded_instance_reuse_reason') or ''
+            ).strip()
+            route_runtime['excluded_instance_reuse_instance_id'] = (
+                selected_instance_id
+            )
+            route_runtime['excluded_instance_reuse_recovery_trigger'] = (
+                'explicit_retry_endpoint'
+            )
+            route_runtime['excluded_reuse_policy_id'] = (
+                EXPLICIT_IMAGE_EXCLUDED_POOL_RETRY_POLICY_ID
+            )
         elif selected_via_spread_retry:
             route_runtime['selection_policy'] = 'spread_retry_preferred_instance'
             route_runtime['spread_retry_reason'] = str(route_runtime_seed.get('spread_retry_reason') or '').strip()
@@ -7029,6 +7645,9 @@ class LateFillRuntimeOwner:
         *,
         current_payload: Optional[Mapping[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
+        saved_error = self.saved_file_consumption_error(branch, infer_result, current_payload=current_payload)
+        if saved_error:
+            return saved_error
         capability = self.branch_capability(branch)
         result_payload = dict(infer_result or {})
         if capability and not result_payload.get('capability'):
@@ -7465,6 +8084,79 @@ class LateFillRuntimeOwner:
                 return 0
             return count if 2 <= count <= 26 else 0
 
+        def records_share_image_obligation(
+            left: Mapping[str, Any],
+            right: Mapping[str, Any],
+        ) -> bool:
+            left_capability = self.normalize_capability(left.get('capability'))
+            right_capability = self.normalize_capability(right.get('capability'))
+            if (
+                left_capability
+                and right_capability
+                and left_capability != right_capability
+            ):
+                return False
+            left_output_type = str(left.get('output_type') or '').strip().lower()
+            right_output_type = str(right.get('output_type') or '').strip().lower()
+            if (
+                left_output_type
+                and right_output_type
+                and left_output_type != right_output_type
+            ):
+                return False
+            left_obligation_id = str(left.get('obligation_id') or '').strip()
+            right_obligation_id = str(right.get('obligation_id') or '').strip()
+            if (
+                left_obligation_id
+                and right_obligation_id
+                and left_obligation_id != right_obligation_id
+            ):
+                return False
+            index_keys = (
+                'queue_index',
+                'candidate_selection_index',
+                'prompt_selection_index',
+                'image_prompt_index',
+                'artifact_prompt_index',
+            )
+
+            def positive_index(source: Mapping[str, Any]) -> int:
+                for key in index_keys:
+                    try:
+                        value = int(source.get(key) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+                return 0
+
+            left_index = positive_index(left)
+            right_index = positive_index(right)
+            if left_index and right_index and left_index != right_index:
+                return False
+            left_branch_id = str(left.get('branch_id') or '').strip()
+            right_branch_id = str(right.get('branch_id') or '').strip()
+            if left_branch_id and left_branch_id == right_branch_id:
+                return True
+            if left_obligation_id and right_obligation_id:
+                return left_obligation_id == right_obligation_id
+            left_phase_id = str(left.get('phase_id') or '').strip()
+            right_phase_id = str(right.get('phase_id') or '').strip()
+            return bool(left_phase_id and left_phase_id == right_phase_id)
+
+        def distinct_image_obligation_records(
+            records: list[Mapping[str, Any]],
+        ) -> list[Mapping[str, Any]]:
+            distinct: list[Mapping[str, Any]] = []
+            for item in records:
+                if any(
+                    records_share_image_obligation(existing, item)
+                    for existing in distinct
+                ):
+                    continue
+                distinct.append(item)
+            return distinct
+
         current_late_fill = (
             current_payload.get('late_fill')
             if isinstance(current_payload.get('late_fill'), Mapping)
@@ -7525,7 +8217,7 @@ class LateFillRuntimeOwner:
         lifecycle_records.extend(
             item for item in graph_phases if isinstance(item, Mapping)
         )
-        cohort_indexes: dict[str, int] = {}
+        cohort_records: list[tuple[Mapping[str, Any], int]] = []
         if target_dependencies:
             for item in lifecycle_records:
                 capability = self.normalize_capability(item.get('capability'))
@@ -7545,17 +8237,29 @@ class LateFillRuntimeOwner:
                     continue
                 if not 1 <= queue_index <= 26:
                     continue
-                identity = str(
-                    item.get('branch_id')
-                    or item.get('phase_id')
-                    or f'queue:{queue_index}'
-                ).strip()
-                if identity:
-                    cohort_indexes[identity] = queue_index
-        ordered_indexes = sorted(set(cohort_indexes.values()))
+                matched_group_index = next(
+                    (
+                        index
+                        for index, (existing, _existing_queue_index)
+                        in enumerate(cohort_records)
+                        if records_share_image_obligation(existing, item)
+                    ),
+                    None,
+                )
+                if matched_group_index is None:
+                    cohort_records.append((item, queue_index))
+                else:
+                    existing, existing_queue_index = cohort_records[
+                        matched_group_index
+                    ]
+                    cohort_records[matched_group_index] = (
+                        existing,
+                        min(existing_queue_index, queue_index),
+                    )
+        ordered_indexes = sorted({queue_index for _item, queue_index in cohort_records})
         if (
-            len(cohort_indexes) >= 2
-            and len(ordered_indexes) == len(cohort_indexes)
+            len(cohort_records) >= 2
+            and len(ordered_indexes) == len(cohort_records)
             and ordered_indexes == list(range(1, len(ordered_indexes) + 1))
         ):
             return len(ordered_indexes)
@@ -7586,7 +8290,7 @@ class LateFillRuntimeOwner:
             return requested_count
 
         pending_branches = branch_gap.get('pending_branches')
-        pending_count = len([
+        pending_image_records = [
             item
             for item in (pending_branches if isinstance(pending_branches, list) else [])
             if isinstance(item, Mapping)
@@ -7594,7 +8298,10 @@ class LateFillRuntimeOwner:
                 self.normalize_capability(item.get('capability')) == self.capability_image_generation
                 or str(item.get('output_type') or '').strip().lower() == 'image'
             )
-        ])
+        ]
+        pending_count = len(
+            distinct_image_obligation_records(pending_image_records)
+        )
         return coerce_count(pending_count)
 
     @staticmethod
@@ -7602,12 +8309,14 @@ class LateFillRuntimeOwner:
         branch: Mapping[str, Any],
         branch_gap: Mapping[str, Any],
     ) -> bool:
-        prompt = str((branch or {}).get('artifact_prompt') or '').strip()
-        if not prompt:
-            return True
+        branch_prompt = str((branch or {}).get('artifact_prompt') or '').strip()
+        prompt = branch_prompt or str((branch_gap or {}).get('artifact_prompt') or '').strip()
         source = str(
-            (branch or {}).get('artifact_prompt_source')
-            or (branch_gap or {}).get('artifact_prompt_source')
+            (
+                (branch or {}).get('artifact_prompt_source')
+                if branch_prompt
+                else (branch_gap or {}).get('artifact_prompt_source')
+            )
             or ''
         ).strip()
         authoritative_sources = {
@@ -7624,8 +8333,18 @@ class LateFillRuntimeOwner:
             'request_prompt_image_slots',
             'current_turn_explicit_image_manifest',
         }
+        if (
+            not branch_prompt
+            and isinstance((branch_gap or {}).get('batch_prompts'), list)
+        ):
+            # A prompt on the shared gap is only the first prepared slot.  An
+            # expanded cohort must still select by each branch identity; only
+            # a prompt carried by the branch itself is already branch-local.
+            return True
         if source in authoritative_sources:
             return False
+        if not prompt:
+            return True
         normalized = re.sub(r'[`*]+', '', prompt).strip().lower()
         normalized = re.sub(r'\s+', ' ', normalized)
         if not normalized:
@@ -8450,7 +9169,19 @@ class LateFillRuntimeOwner:
             if str(value or '').strip()
         }
         if normalized_explicit_names:
-            return expected in normalized_explicit_names
+            if expected in normalized_explicit_names:
+                return True
+            extension = cls._artifact_record_extension(record)
+            if extension:
+                expected_identity = (extension, expected)
+                return any(
+                    artifact_logical_identities_match(
+                        expected_identity,
+                        (extension, explicit_name),
+                    )
+                    for explicit_name in normalized_explicit_names
+                )
+            return False
 
         path = cls._artifact_record_path(record)
         path_name = cls._normalized_text_artifact_source_name_for_match(path)
@@ -8756,6 +9487,338 @@ class LateFillRuntimeOwner:
                 existing_records.append(item)
         updated['saved_text_artifacts'] = cls.merge_unique_artifact_records(existing_records, [record])
         return updated
+
+    @classmethod
+    def _retained_input_alias_contract_from_plan(
+        cls,
+        plan: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        branch_wrapper = plan.get('branch') if isinstance(plan.get('branch'), Mapping) else {}
+        branch = (
+            branch_wrapper.get('branch')
+            if isinstance(branch_wrapper.get('branch'), Mapping)
+            else branch_wrapper
+        )
+        sources = [
+            source
+            for source in (
+                plan.get('effective_data'),
+                branch,
+                plan.get('execution_contract'),
+            )
+            if isinstance(source, Mapping)
+        ]
+        contract_candidates: list[Mapping[str, Any]] = []
+        for source in sources:
+            artifact_request = (
+                source.get('artifact_request')
+                if isinstance(source.get('artifact_request'), Mapping)
+                else source.get('text_artifact_request')
+                if isinstance(source.get('text_artifact_request'), Mapping)
+                else {}
+            )
+            if artifact_request:
+                contract_candidates.append(artifact_request)
+            contract_candidates.append(source)
+        retained_requested = any(
+            str(candidate.get('stage_direction') or '').strip()
+            == 'materialize_retained_input_alias'
+            or candidate.get('retained_input_alias_required') is True
+            for candidate in contract_candidates
+        )
+        if not retained_requested:
+            return {}
+
+        identity_keys = (
+            'stage_direction',
+            'text_artifact_extension',
+            'text_artifact_source_name',
+            'retained_input_alias_required',
+            'retained_input_binding_state',
+            'retained_input_source_path',
+            'retained_input_source_name',
+            'retained_input_target_name',
+        )
+        observed_values: dict[str, dict[Any, Any]] = {}
+
+        def comparable_value(key: str, value: Any) -> Any:
+            if key == 'retained_input_alias_required':
+                return bool(value)
+            token = str(value).strip()
+            if key in {
+                'stage_direction',
+                'text_artifact_extension',
+                'retained_input_binding_state',
+            }:
+                return token.casefold().lstrip('.')
+            if key in {
+                'text_artifact_source_name',
+                'retained_input_source_name',
+                'retained_input_target_name',
+            }:
+                return Path(token).name.casefold()
+            if key == 'retained_input_source_path':
+                return str(Path(token).expanduser().resolve(strict=False))
+            return token
+
+        for candidate in contract_candidates:
+            for key in identity_keys:
+                value = candidate.get(key)
+                if value in (None, '', [], {}):
+                    continue
+                observed_values.setdefault(key, {})[
+                    comparable_value(key, value)
+                ] = value
+        conflicts = {
+            key: list(values.values())
+            for key, values in observed_values.items()
+            if len(values) > 1
+        }
+        if conflicts:
+            conflict_keys = ', '.join(sorted(conflicts))
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_CONTRACT_CONFLICT: retained input '
+                f'identity disagrees across plan carriers ({conflict_keys}).'
+            )
+
+        contract: dict[str, Any] = {}
+        for candidate in contract_candidates:
+            for key in identity_keys:
+                value = candidate.get(key)
+                if value not in (None, '', [], {}):
+                    contract[key] = value
+        return contract
+
+    @staticmethod
+    def _sha256_for_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _materialize_retained_input_alias(
+        self,
+        plan: Mapping[str, Any],
+        contract: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        binding_state = str(contract.get('retained_input_binding_state') or '').strip().lower()
+        source_path = str(contract.get('retained_input_source_path') or '').strip()
+        source_name = str(contract.get('retained_input_source_name') or '').strip()
+        target_name = Path(
+            str(contract.get('retained_input_target_name') or '').strip()
+        ).name
+        extension = re.sub(
+            r'[^a-zA-Z0-9]+',
+            '',
+            str(
+                contract.get('text_artifact_extension')
+                or Path(target_name).suffix
+                or ''
+            ).strip().lower().lstrip('.'),
+        )
+        logical_source_name = str(
+            contract.get('text_artifact_source_name')
+            or Path(target_name).stem
+            or 'retained-input'
+        ).strip()
+        if binding_state != 'bound' or not source_path:
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_UNBOUND: the requested retained input '
+                'does not resolve to exactly one current input artifact.'
+            )
+        if (
+            not target_name
+            or target_name != str(contract.get('retained_input_target_name') or '').strip()
+            or not extension
+            or Path(target_name).suffix.lower().lstrip('.') != extension
+        ):
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_TARGET_INVALID: retained input target '
+                'must be one safe filename whose extension matches the contract.'
+            )
+        source = Path(source_path).expanduser()
+        try:
+            source = source.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_SOURCE_MISSING: retained input source is unavailable.'
+            ) from exc
+        if not source.is_file():
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_SOURCE_MISSING: retained input source is not a file.'
+            )
+        admitted_source_paths: set[Path] = set()
+        branch_wrapper = plan.get('branch') if isinstance(plan.get('branch'), Mapping) else {}
+        branch_payload = (
+            branch_wrapper.get('branch')
+            if isinstance(branch_wrapper.get('branch'), Mapping)
+            else branch_wrapper
+        )
+        for carrier in (plan.get('effective_data'), branch_payload):
+            if not isinstance(carrier, Mapping):
+                continue
+            for record in carrier.get('input_artifacts') or []:
+                if not isinstance(record, Mapping):
+                    continue
+                admitted_path = str(
+                    record.get('path')
+                    or record.get('source_path')
+                    or record.get('saved_text_path')
+                    or ''
+                ).strip()
+                if not admitted_path:
+                    continue
+                try:
+                    admitted_source_paths.add(
+                        Path(admitted_path).expanduser().resolve(strict=False)
+                    )
+                except (OSError, ValueError):
+                    continue
+            for key in ('file_path', 'route_artifact_path'):
+                admitted_path = str(carrier.get(key) or '').strip()
+                if not admitted_path:
+                    continue
+                try:
+                    admitted_source_paths.add(
+                        Path(admitted_path).expanduser().resolve(strict=False)
+                    )
+                except (OSError, ValueError):
+                    continue
+        if source not in admitted_source_paths:
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_SOURCE_NOT_ADMITTED: retained input source '
+                'must be one exact current input artifact.'
+            )
+        if source_name and Path(source_name).suffix.lower().lstrip('.') != extension:
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_EXTENSION_MISMATCH: retained input source '
+                'and requested target have different text-artifact extensions.'
+            )
+
+        try:
+            source_content = source.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_SOURCE_INVALID: retained input must be a readable text artifact.'
+            ) from exc
+        _canonical_content, content_error = self._text_artifact_content_payload_error(
+            source_content,
+            extension=extension,
+            saved_path=str(source),
+        )
+        if content_error:
+            raise RuntimeError(
+                f"{content_error.get('code') or 'RETAINED_INPUT_ALIAS_SOURCE_INVALID'}: "
+                f"{content_error.get('message') or 'retained input source failed validation'}"
+            )
+
+        source_sha256 = self._sha256_for_file(source)
+        allocation_digest = hashlib.sha256(
+            ('\0'.join((str(source), target_name, source_sha256))).encode('utf-8')
+        ).hexdigest()[:16]
+        target_dir = ARTIFACT_OUTPUTS_DOCUMENTS_DIR / (
+            f'retained_input_{allocation_digest}'
+        )
+        target = target_dir / target_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if not target.is_file() or self._sha256_for_file(target) != source_sha256:
+                raise RuntimeError(
+                    'RETAINED_INPUT_ALIAS_TARGET_COLLISION: allocated target '
+                    'already exists with different bytes.'
+                )
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f'.{target_name}.',
+                suffix='.tmp',
+                dir=str(target_dir),
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                shutil.copyfile(source, temporary)
+                if self._sha256_for_file(temporary) != source_sha256:
+                    raise RuntimeError(
+                        'RETAINED_INPUT_ALIAS_COPY_MISMATCH: copied bytes do not match the input.'
+                    )
+                os.replace(temporary, target)
+            finally:
+                try:
+                    if temporary.exists():
+                        temporary.unlink()
+                except OSError:
+                    pass
+
+        target_sha256 = self._sha256_for_file(target)
+        if target_sha256 != source_sha256:
+            raise RuntimeError(
+                'RETAINED_INPUT_ALIAS_COPY_MISMATCH: materialized target is not byte-identical.'
+            )
+        saved_error = self._text_artifact_saved_payload_error(
+            str(target),
+            extension=extension,
+        )
+        if saved_error:
+            raise RuntimeError(
+                f"{saved_error.get('code') or 'RETAINED_INPUT_ALIAS_TARGET_INVALID'}: "
+                f"{saved_error.get('message') or 'retained input target failed validation'}"
+            )
+
+        artifact_request = self._required_text_artifact_request(
+            contract,
+            {},
+            {},
+            extension=extension,
+            source_name=logical_source_name,
+            target_path=str(target),
+        )
+        artifact_request.update(
+            {
+                'source': 'retained_input_alias',
+                'target_path': str(target),
+                'retained_input_alias_required': True,
+                'retained_input_binding_state': 'bound',
+                'retained_input_source_path': str(source),
+                'retained_input_source_name': source_name or source.name,
+                'retained_input_target_name': target_name,
+            }
+        )
+        result = self._with_required_text_artifact_saved_result(
+            {},
+            target_path=str(target),
+            content=source_content,
+            extension=extension,
+            source_name=logical_source_name,
+            artifact_request=artifact_request,
+            evidence='retained_input_alias_byte_copy',
+        )
+        result.update(
+            {
+                'retained_input_alias_required': True,
+                'retained_input_binding_state': 'bound',
+                'retained_input_source_path': str(source),
+                'retained_input_source_name': source_name or source.name,
+                'retained_input_target_name': target_name,
+                'retained_input_source_sha256': source_sha256,
+                'retained_input_target_sha256': target_sha256,
+                'retained_input_byte_identical': True,
+            }
+        )
+        for record in result.get('saved_text_artifacts') or []:
+            if not isinstance(record, dict):
+                continue
+            record.update(
+                {
+                    'retained_input_source_path': str(source),
+                    'retained_input_source_name': source_name or source.name,
+                    'retained_input_target_name': target_name,
+                    'retained_input_source_sha256': source_sha256,
+                    'retained_input_target_sha256': target_sha256,
+                    'retained_input_byte_identical': True,
+                }
+            )
+        return result
 
     def _materialize_required_text_artifact_target_path(
         self,
@@ -9257,6 +10320,11 @@ class LateFillRuntimeOwner:
                         or artifact_request.get('target_path')
                     ),
                     'artifact_request': artifact_request,
+                    'branch_id': result.get('branch_id'),
+                    'phase_id': result.get('phase_id'),
+                    'obligation_id': result.get('obligation_id'),
+                    'source_response_id': str(payload.get('id') or '').strip() or None,
+                    'origin': 'late_fill_result',
                 }
             )
         expected_extension = str(extension or '').strip().lower().lstrip('.')
@@ -9279,12 +10347,28 @@ class LateFillRuntimeOwner:
                 expected_source_name,
             ):
                 continue
-            matching_records_by_path.setdefault(path, record)
+            existing = matching_records_by_path.get(path)
+            if (
+                existing is None
+                or artifact_authority_rank(record, response_id=str(payload.get('id') or '').strip())
+                > artifact_authority_rank(existing, response_id=str(payload.get('id') or '').strip())
+            ):
+                matching_records_by_path[path] = record
 
-        # A name/extension pair is branch identity only when it resolves to one
-        # concrete current-response file. Choosing the first of multiple saved
-        # siblings would silently turn ambiguous evidence into fulfillment.
-        if len(matching_records_by_path) != 1:
+        # Filesystem proximity is not current-response authority. One current
+        # response-owned candidate may safely beat any number of stale linked
+        # siblings, while multiple current candidates remain fail-closed.
+        response_id = str(payload.get('id') or '').strip()
+        authoritative_paths = {
+            path: record
+            for path, record in matching_records_by_path.items()
+            if artifact_is_current_authoritative(record, response_id=response_id)
+        }
+        if len(authoritative_paths) > 1:
+            return {}
+        if len(authoritative_paths) == 1:
+            matching_records_by_path = authoritative_paths
+        elif len(matching_records_by_path) != 1:
             return {}
 
         for path, record in matching_records_by_path.items():
@@ -9610,6 +10694,31 @@ class LateFillRuntimeOwner:
         branch: Mapping[str, Any],
         payload: Mapping[str, Any],
     ) -> bool:
+        if saved_file_dependency_contract(branch):
+            return not saved_file_consumption_artifact_issue(
+                branch, payload, self.resolve_saved_file_input_path)
+        if branch.get('branch_contract_error') == 'saved_file_dependency_unbound':
+            return False
+        if (branch.get('artifact_request') or {}).get('saved_file_producer'):
+            results = [r for r in (payload.get('late_fill') or {}).get('fill_results') or []
+                if isinstance(r, Mapping) and r.get('branch_id') == branch.get('branch_id')
+                and r.get('phase_id') == branch.get('phase_id')]
+            if len(results) != 1:
+                return False
+            snapshot = results[0].get('saved_file_output_snapshot') or {}
+            artifacts = results[0].get('artifacts') or []
+            if not any(isinstance(a, Mapping) and all(snapshot.get(key) and a.get(key) == snapshot[key]
+                for key in ('artifact_ref', 'artifact_id', 'path', 'source_response_id', 'branch_id', 'phase_id'))
+                for a in artifacts):
+                return False
+            try:
+                current = read_saved_file_snapshot(snapshot['path'], self.resolve_saved_file_input_path)
+                if (snapshot.get('source_response_id') != payload.get('id') or
+                        any(current[key] != snapshot.get(key) for key in ('sha256', 'size_bytes'))):
+                    return False
+            except (OSError, ValueError, KeyError):
+                return False
+
         if self._text_artifact_revision_required(branch):
             return self._text_artifact_revision_write_proven(branch, payload)
         if self._artifact_gap_is_authoritative_bounded_text_artifact_repair(branch):
@@ -9657,7 +10766,8 @@ class LateFillRuntimeOwner:
             cls._text_artifact_target_path_from_mapping(branch)
             or cls._text_artifact_target_path_from_mapping(artifact_request)
         )
-        if not target_path:
+        branch_id = str(branch.get('branch_id') or branch.get('phase_id') or '').strip()
+        if not target_path or not branch_id:
             return False
         late_fill = (
             payload.get('late_fill')
@@ -9666,6 +10776,8 @@ class LateFillRuntimeOwner:
         )
 
         def path_matches(record: Mapping[str, Any]) -> bool:
+            if str(record.get('branch_id') or record.get('phase_id') or '').strip() != branch_id:
+                return False
             candidate = str(
                 record.get('target_path')
                 or record.get('to_path')
@@ -9890,6 +11002,44 @@ class LateFillRuntimeOwner:
         return not token or bool(_EXTERNAL_LINK_RE.match(token))
 
     @staticmethod
+    def _link_rebind_is_dynamic_template_url(
+        content: str, position: int, url: str, *, target_path: str,
+    ) -> bool:
+        """An interpolated JS template URL is an expression, not a missing file.
+
+        Limit the exemption to script source and actual template literals so
+        literal HTML placeholders still reach the ordinary repair checks.
+        This is a static mutation guard, not proof that the expression resolves.
+        """
+        if not re.search(r'(?<!\\)(?:\\\\)*\$\{', url):
+            return False
+        extension = Path(target_path).suffix.lower()
+        script = content
+        offset = 0
+        if extension not in {'.js', '.mjs', '.cjs'}:
+            enclosing = next(
+                (match for match in _INLINE_SCRIPT_RE.finditer(content)
+                 if match.start('body') <= position < match.end('body')),
+                None,
+            )
+            if enclosing is None:
+                return False
+            script = enclosing.group('body')
+            offset = enclosing.start('body')
+        # Consume ordinary quoted strings and comments as well, so backticks
+        # inside them cannot grant a template-expression exemption.
+        tokens = re.finditer(
+            r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|'
+            r'//[^\n]*|/\*[\s\S]*?\*/|`(?:\\.|[^`\\])*`',
+            script,
+        )
+        return any(
+            match.group(0).startswith('`')
+            and match.start() < position - offset < match.end()
+            for match in tokens
+        )
+
+    @staticmethod
     def _link_tokens_for_artifact(record: Mapping[str, Any]) -> set[str]:
         tokens: set[str] = set()
         path = LateFillRuntimeOwner._artifact_record_path(record)
@@ -9991,6 +11141,78 @@ class LateFillRuntimeOwner:
     def _collect_link_rebind_artifact_records(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(payload, Mapping):
             return []
+        public_artifact_refs: set[str] = set()
+        public_artifact_paths: set[str] = set()
+
+        def normalized_artifact_path(value: Any) -> str:
+            token = str(value or '').strip()
+            if not token:
+                return ''
+            try:
+                return str(Path(token).expanduser().resolve(strict=False))
+            except (OSError, ValueError):
+                return token
+
+        def add_public_output_identity(raw_record: Any) -> None:
+            if not isinstance(raw_record, Mapping):
+                return
+            artifact_ref = str(
+                raw_record.get('artifact_ref')
+                or raw_record.get('ref')
+                or raw_record.get('artifact_id')
+                or ''
+            ).strip()
+            if artifact_ref:
+                public_artifact_refs.add(artifact_ref)
+            path = normalized_artifact_path(self._artifact_record_path(raw_record))
+            if path:
+                public_artifact_paths.add(path)
+            for key in ('artifact', 'output_artifact'):
+                add_public_output_identity(raw_record.get(key))
+            for key in ('artifacts', 'output_artifacts'):
+                for artifact in raw_record.get(key) or []:
+                    add_public_output_identity(artifact)
+
+        public_output_lists: list[list[Any]] = []
+        for raw_outputs in (payload.get('outputs'),):
+            if isinstance(raw_outputs, list):
+                public_output_lists.append(raw_outputs)
+        response_frame = (
+            payload.get('response_frame')
+            if isinstance(payload.get('response_frame'), Mapping)
+            else {}
+        )
+        frame_output = (
+            response_frame.get('output')
+            if isinstance(response_frame.get('output'), Mapping)
+            else {}
+        )
+        if isinstance(frame_output.get('outputs'), list):
+            public_output_lists.append(frame_output.get('outputs') or [])
+        legacy_output = (
+            payload.get('output')
+            if isinstance(payload.get('output'), Mapping)
+            else {}
+        )
+        if isinstance(legacy_output.get('outputs'), list):
+            public_output_lists.append(legacy_output.get('outputs') or [])
+        for output_list in public_output_lists:
+            for output in output_list:
+                add_public_output_identity(output)
+        has_public_artifact_identity = bool(public_artifact_refs or public_artifact_paths)
+
+        def record_is_public_output(record: Mapping[str, Any]) -> bool:
+            artifact_ref = str(
+                record.get('artifact_ref')
+                or record.get('ref')
+                or record.get('artifact_id')
+                or ''
+            ).strip()
+            if artifact_ref and artifact_ref in public_artifact_refs:
+                return True
+            path = normalized_artifact_path(self._artifact_record_path(record))
+            return bool(path and path in public_artifact_paths)
+
         slot_by_ref: dict[str, Mapping[str, Any]] = {}
         for slot in payload.get('output_slots') or []:
             if not isinstance(slot, Mapping):
@@ -10020,9 +11242,12 @@ class LateFillRuntimeOwner:
                 return
             record = dict(defaults or {})
             record.update(dict(raw_record))
+            if has_public_artifact_identity:
+                record['_link_rebind_public_output'] = record_is_public_output(record)
             artifact_ref = str(record.get('artifact_ref') or record.get('ref') or '').strip()
             slot = slot_by_ref.get(artifact_ref) if artifact_ref else None
             if isinstance(slot, Mapping):
+                record['_link_rebind_output_slot'] = True
                 for key in ('branch_id', 'phase_id', 'slot_id'):
                     if record.get(key) in (None, '', [], {}) and slot.get(key) not in (None, '', [], {}):
                         record[key] = slot.get(key)
@@ -10069,7 +11294,9 @@ class LateFillRuntimeOwner:
             for artifact in raw_artifacts or []:
                 add_record(
                     artifact,
-                    defaults={'_link_rebind_public_output': True},
+                    defaults={
+                        '_link_rebind_public_output': not has_public_artifact_identity,
+                    },
                 )
         for key in ('input_artifacts', 'reference_artifacts', 'selected_reference_artifacts'):
             for artifact in payload.get(key) or []:
@@ -10123,6 +11350,7 @@ class LateFillRuntimeOwner:
                     or execution_contract.get('dependency_contract')
                 ),
                 'source': 'late_fill_result',
+                'source_response_id': str(payload.get('id') or '').strip() or None,
             }
             if str(result.get('saved_text_path') or '').strip():
                 add_record(
@@ -10185,7 +11413,10 @@ class LateFillRuntimeOwner:
                 )
             for artifact in result.get('artifacts') or []:
                 add_record(artifact, defaults=defaults)
-        return records
+        return select_authoritative_artifact_records(
+            records,
+            response_id=str(payload.get('id') or '').strip(),
+        )
 
     @classmethod
     def _preferred_asset_for_url(
@@ -10260,18 +11491,62 @@ class LateFillRuntimeOwner:
         url: str,
         candidates: list[dict[str, Any]],
     ) -> Optional[dict[str, Any]]:
-        """Resolve a sibling text artifact only from exact path/name identity."""
+        """Resolve a sibling text artifact from exact name and output ownership."""
         token = str(url or '').split('?', 1)[0].split('#', 1)[0].strip()
         requested_name = Path(token).name
         if not requested_name:
             return None
+        matches: list[tuple[tuple[int, ...], dict[str, Any]]] = []
         for record in candidates:
             path = cls._artifact_record_path(record)
-            if path and Path(path).name.lower() == requested_name.lower():
-                return record
-            if cls._artifact_record_matches_text_artifact_source_name(record, requested_name):
-                return record
-        return None
+            exact_basename = bool(
+                path
+                and Path(path).name.lower() == requested_name.lower()
+            )
+            exact_source_name = cls._artifact_record_matches_text_artifact_source_name(
+                record,
+                requested_name,
+            )
+            if not exact_basename and not exact_source_name:
+                continue
+            target_path = str(record.get('text_artifact_target_path') or '').strip()
+            target_is_record_path = False
+            if path and target_path:
+                try:
+                    target_is_record_path = (
+                        Path(target_path).expanduser().resolve(strict=False)
+                        == Path(path).expanduser().resolve(strict=False)
+                    )
+                except (OSError, ValueError):
+                    target_is_record_path = target_path == path
+            rank = (
+                *artifact_authority_rank(record),
+                int(record.get('_link_rebind_output_slot') is True),
+                int(bool(str(record.get('slot_id') or '').strip())),
+                int(
+                    bool(str(record.get('branch_id') or '').strip())
+                    and bool(str(record.get('phase_id') or '').strip())
+                ),
+                int(target_is_record_path),
+                int(str(record.get('source') or '').strip() == 'late_fill_result'),
+                int(record.get('_link_rebind_public_output') is True),
+                int(exact_basename),
+            )
+            matches.append((rank, record))
+        if not matches:
+            return None
+        best_rank = max(rank for rank, _record in matches)
+        strongest = [record for rank, record in matches if rank == best_rank]
+        strongest_paths = {
+            cls._artifact_record_path(record)
+            for record in strongest
+            if cls._artifact_record_path(record)
+        }
+        if len(strongest_paths) <= 1:
+            return strongest[0]
+        # Preserve deterministic legacy behavior for unbound evidence, but do
+        # not guess between two response/branch-owned current generations.
+        return strongest[0] if best_rank[0] < 3 else None
 
     @classmethod
     def _unique_artifact_records_by_path(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10376,6 +11651,8 @@ class LateFillRuntimeOwner:
         cls,
         payload: Mapping[str, Any],
         consumer_record: Mapping[str, Any],
+        *,
+        identity_only: bool = False,
     ) -> list[str]:
         dependency_ids = cls._link_rebind_dependency_values(consumer_record)
         consumer_tokens = cls._link_rebind_record_identity_tokens(consumer_record)
@@ -10410,6 +11687,14 @@ class LateFillRuntimeOwner:
             )
 
         def record_targets_consumer(record: Mapping[str, Any]) -> bool:
+            if identity_only:
+                branch_id = consumer_record.get('branch_id')
+                if branch_id and record.get('branch_id'):
+                    return record.get('branch_id') == branch_id
+                return bool(
+                    consumer_record.get('phase_id')
+                    and record.get('phase_id') == consumer_record.get('phase_id')
+                )
             if consumer_tokens & cls._link_rebind_record_identity_tokens(record):
                 return True
             artifact_request = (
@@ -10447,8 +11732,12 @@ class LateFillRuntimeOwner:
         payload: Mapping[str, Any],
         consumer_record: Mapping[str, Any],
         asset_records: list[dict[str, Any]],
+        *,
+        identity_only: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str], str]:
-        dependency_ids = cls._link_rebind_consumer_dependency_ids(payload, consumer_record)
+        dependency_ids = cls._link_rebind_consumer_dependency_ids(
+            payload, consumer_record, identity_only=identity_only,
+        )
         if not dependency_ids:
             return list(asset_records), [], 'artifact_set_fallback_without_declared_dependencies'
         dependency_tokens = set(dependency_ids)
@@ -10470,6 +11759,26 @@ class LateFillRuntimeOwner:
             for record in graph_records
             if cls._link_rebind_record_identity_tokens(record) & consumer_tokens
         ]
+        if identity_only:
+            # A compact saved result can omit the binding policy while the
+            # exact pending/active repair still owns it. Do not consult other
+            # branches through a shared artifact ref or target path.
+            consumer_graph_records = [
+                record for record in graph_records
+                if record.get('branch_id') == consumer_record.get('branch_id')
+                or (
+                    not record.get('branch_id') and consumer_record.get('phase_id')
+                    and record.get('phase_id') == consumer_record.get('phase_id')
+                )
+            ]
+            late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+            consumer_graph_records.extend(
+                record
+                for key in ('pending_branches', 'active_branches', 'failed_branches')
+                for record in late_fill.get(key) or []
+                if isinstance(record, Mapping)
+                and record.get('branch_id') == consumer_record.get('branch_id')
+            )
 
         def has_local_visual_binding(record: Mapping[str, Any]) -> bool:
             execution_contract = (
@@ -10767,6 +12076,7 @@ class LateFillRuntimeOwner:
         *,
         target_path: str = '',
         preferred_family: str = '',
+        preferred_record: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         if cls._url_is_external_or_empty(url):
             token = str(url or '').strip()
@@ -10794,6 +12104,15 @@ class LateFillRuntimeOwner:
             if _LINK_REBIND_PLACEHOLDER_RE.search(url):
                 return True
             if target_path and cls._local_link_target_exists(url, target_path=target_path):
+                if preferred_record:
+                    current_path = cls._local_link_target_path(url, target_path=target_path)
+                    selected_path = cls._artifact_record_path(preferred_record)
+                    if current_path and selected_path:
+                        try:
+                            selected_path = str(Path(selected_path).expanduser().resolve(strict=False))
+                        except (OSError, ValueError):
+                            pass
+                        return current_path != selected_path
                 return False
             return bool(preferred_family)
         matching_records = cls._link_rebind_records_for_extension(
@@ -10806,6 +12125,15 @@ class LateFillRuntimeOwner:
         if _LINK_REBIND_PLACEHOLDER_RE.search(url):
             return True
         if target_path and cls._local_link_target_exists(url, target_path=target_path):
+            if preferred_record:
+                current_path = cls._local_link_target_path(url, target_path=target_path)
+                selected_path = cls._artifact_record_path(preferred_record)
+                if current_path and selected_path:
+                    try:
+                        selected_path = str(Path(selected_path).expanduser().resolve(strict=False))
+                    except (OSError, ValueError):
+                        pass
+                    return current_path != selected_path
             return False
         return True
 
@@ -10906,8 +12234,60 @@ class LateFillRuntimeOwner:
 
         def replace_attr(match: re.Match[str]) -> str:
             url = match.group('url')
-            if self._link_rebind_url_matches_record_identity(url, target_record):
+            if not url.strip():
+                # An empty image slot has no identity to rank or infer. Bind
+                # only one concrete dependency already scoped to this consumer;
+                # response-wide siblings cannot supply the missing authority.
+                family = self._link_rebind_attr_context_family(content, match.start())
+                if family != 'image' or not re.search(r'\bsrc\s*=', match.group('prefix'), re.IGNORECASE):
+                    return match.group(0)
+                candidates = self._unique_artifact_records_by_path(
+                    self._link_rebind_records_for_family('image', asset_records)
+                )
+                if len(candidates) != 1:
+                    return match.group(0)
+                linked_path = self._artifact_record_path(candidates[0])
+                if not linked_path or not Path(linked_path).expanduser().is_file():
+                    return match.group(0)
+                replacement = self._relative_artifact_link(from_path=target_path, to_path=linked_path)
+                if not replacement:
+                    return match.group(0)
+                changes.append({'from': url, 'to': replacement, 'linked_path': linked_path,
+                                'kind': 'attribute_link', 'selection_policy': 'unique_declared_image_dependency'})
+                return f"{match.group('prefix')}{match.group('quote')}{replacement}{match.group('quote')}"
+            if self._link_rebind_is_dynamic_template_url(
+                match.string, match.start('url'), url, target_path=target_path,
+            ):
                 return match.group(0)
+            if self._link_rebind_url_matches_record_identity(url, target_record):
+                if self._local_link_target_exists(url, target_path=target_path):
+                    return match.group(0)
+                linked_path = self._artifact_record_path(target_record)
+                if not linked_path:
+                    return match.group(0)
+                path_token = str(url or '').split('?', 1)[0].split('#', 1)[0]
+                suffix = str(url or '')[len(path_token):]
+                replacement = (
+                    self._relative_artifact_link(
+                        from_path=target_path,
+                        to_path=linked_path,
+                    )
+                    + suffix
+                )
+                if replacement == url:
+                    return match.group(0)
+                changes.append(
+                    {
+                        'from': url,
+                        'to': replacement,
+                        'linked_path': linked_path,
+                        'kind': 'self_attribute_link',
+                    }
+                )
+                return (
+                    f"{match.group('prefix')}{match.group('quote')}"
+                    f"{replacement}{match.group('quote')}"
+                )
             extension = Path(url.split('?', 1)[0].split('#', 1)[0]).suffix.lower().lstrip('.')
             preferred_family = self._link_rebind_attr_context_family(content, match.start())
             candidates = self._link_rebind_records_for_extension(
@@ -10915,20 +12295,50 @@ class LateFillRuntimeOwner:
                 asset_records,
                 preferred_family=preferred_family,
             )
+            if is_exact_named_text_link(url):
+                named_text_records = (
+                    static_fetch_asset_records
+                    if static_fetch_asset_records is not None
+                    else asset_records
+                )
+                exact_named_candidates = [
+                    record
+                    for record in self._link_rebind_records_for_extension(
+                        extension,
+                        named_text_records,
+                        preferred_family=preferred_family,
+                    )
+                    if self._link_rebind_url_matches_record_identity(url, record)
+                ]
+                if exact_named_candidates:
+                    candidates = exact_named_candidates
             fallback_family = ''
             if not candidates:
                 candidates, fallback_family = unique_same_response_family_fallback(
                     extension,
                     preferred_family,
                 )
+            preferred_record = (
+                choose_asset_record(url, candidates)
+                if is_exact_named_text_link(url)
+                else None
+            )
             if not self._link_url_needs_rebind(
                 url,
                 candidates,
                 target_path=target_path,
                 preferred_family=preferred_family,
+                preferred_record=preferred_record,
             ):
                 return match.group(0)
-            replacement, record = replacement_for_asset(url, candidates)
+            if preferred_record:
+                record = preferred_record
+                replacement = self._relative_artifact_link(
+                    from_path=target_path,
+                    to_path=self._artifact_record_path(record),
+                )
+            else:
+                replacement, record = replacement_for_asset(url, candidates)
             if not record or replacement == url:
                 return match.group(0)
             changes.append(
@@ -10957,6 +12367,10 @@ class LateFillRuntimeOwner:
 
         def replace_url(match: re.Match[str]) -> str:
             url = match.group('url')
+            if self._link_rebind_is_dynamic_template_url(
+                match.string, match.start('url'), url, target_path=target_path,
+            ):
+                return match.group(0)
             if self._link_rebind_url_matches_record_identity(url, target_record):
                 return match.group(0)
             extension = Path(url.split('?', 1)[0].split('#', 1)[0]).suffix.lower().lstrip('.')
@@ -11015,13 +12429,22 @@ class LateFillRuntimeOwner:
                     )
                 )
             ]
+            preferred_record = self._exact_asset_record_for_url(url, candidates)
             if not self._link_url_needs_rebind(
                 url,
                 candidates,
                 target_path=target_path,
+                preferred_record=preferred_record,
             ):
                 return match.group(0)
-            replacement, record = replacement_for_asset(url, candidates)
+            if preferred_record:
+                record = preferred_record
+                replacement = self._relative_artifact_link(
+                    from_path=target_path,
+                    to_path=self._artifact_record_path(record),
+                )
+            else:
+                replacement, record = replacement_for_asset(url, candidates)
             if not record or replacement == url:
                 return match.group(0)
             changes.append(
@@ -11160,6 +12583,102 @@ class LateFillRuntimeOwner:
             rebound += '\n'
         return rebound, changes
 
+    def _terminal_link_rebind_write_owners(
+        self,
+        payload: Mapping[str, Any],
+        records: list[dict[str, Any]],
+        *,
+        target_path: str,
+        original: str,
+        rebound: str,
+        asset_records: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Bind a real write to independently verified, already-owned repairs.
+
+        Path grouping is only physical write coalescing. Ownership comes from
+        unmerged saved records plus the exact branch's bounded repair contract.
+        Never copy identities from same-target pending work into a saved record.
+        """
+        late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+        branches = [
+            branch
+            for key in ('pending_branches', 'active_branches', 'failed_branches')
+            for branch in late_fill.get(key) or []
+            if isinstance(branch, Mapping)
+        ]
+        # Public artifact selection may collapse a repair result into the
+        # canonical document. Keep its explicit execution identity for this
+        # bounded write; it does not become a second public artifact.
+        owned_records = [
+            *records,
+            *[
+                {**result, 'type': 'text', 'path': result['saved_text_path']}
+                for result in late_fill.get('fill_results') or []
+                if isinstance(result, Mapping)
+                and result.get('saved_text_path')
+                and not result.get('error')
+                and str(result.get('status') or '') not in {'failed', 'cancelled', 'superseded'}
+            ],
+        ]
+        owners: dict[str, dict[str, str]] = {}
+        for record in owned_records:
+            branch_id = str(record.get('branch_id') or '').strip()
+            phase_id = str(record.get('phase_id') or '').strip()
+            if (
+                not branch_id
+                or self._artifact_record_path(record) != target_path
+                or str(record.get('type') or record.get('kind') or '') != 'text'
+            ):
+                continue
+            matching = [branch for branch in branches if branch.get('branch_id') == branch_id]
+            if not matching:
+                continue
+            phases = {
+                str(item.get('phase_id')).strip()
+                for item in [*owned_records, *matching]
+                if item.get('branch_id') == branch_id
+                if item.get('phase_id')
+            }
+            if len(phases) > 1:
+                continue
+            phase_id = next(iter(phases), '')
+            # Every projection of this identity must describe the same bounded
+            # link repair; an unrelated edit cannot inherit its write proof.
+            if any(
+                branch.get('repair_action') != 'rebind_dependency_evidence'
+                or not self._artifact_gap_is_authoritative_bounded_text_artifact_repair(branch)
+                or self._text_artifact_revision_required(branch)
+                or not self._text_artifact_path_matches_target(
+                    target_path,
+                    self._text_artifact_target_path_from_mapping(branch)
+                    or self._text_artifact_target_path_from_mapping(branch.get('artifact_request') or {}),
+                )
+                for branch in matching
+            ):
+                continue
+            scoped_assets, _dependency_ids, _policy = self._link_rebind_asset_records_for_consumer(
+                payload, record, asset_records, identity_only=True,
+            )
+            if self._artifact_record_extension(record) == 'json':
+                candidate, changes = self._rebind_json_artifact_content(
+                    original, target_path=target_path, asset_records=scoped_assets,
+                )
+            else:
+                candidate, changes = self._rebind_text_artifact_content(
+                    original, target_path=target_path, target_record=record,
+                    asset_records=scoped_assets,
+                    fallback_asset_records=[],
+                    static_fetch_asset_records=scoped_assets,
+                )
+            if not changes or candidate != rebound:
+                continue
+            owners[branch_id] = {
+                'branch_id': branch_id,
+                **({'phase_id': phase_id} if phase_id else {}),
+            }
+        return list(owners.values())
+
+    @observe_state('late_fill.linked_artifact_rebind', 'saved_artifact_bindings', 'rebound_artifact_state', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
     def rebind_terminal_linked_artifacts(
         self,
         payload: dict[str, Any],
@@ -11242,14 +12761,19 @@ class LateFillRuntimeOwner:
                     and change.get('selection_policy') != 'exact_named_static_fetch_dependency'
                 ):
                     change['consumer_dependency_ids'] = list(dependency_ids)
+            write_owners = self._terminal_link_rebind_write_owners(
+                payload, records, target_path=target_path,
+                original=original, rebound=rebound,
+                asset_records=available_asset_records,
+            )
             try:
                 target.write_text(rebound, encoding='utf-8')
             except OSError as exc:
                 logging.warning('Could not rebind linked artifact paths in %s: %s', target_path, exc)
                 continue
             updated_content_by_path[target_path] = rebound
-            rebinds.append(
-                {
+            for owner in write_owners or [{}]:
+                rebinds.append({
                     'kind': 'ollmo.linked_artifact_rebind',
                     'target_path': target_path,
                     'target_extension': self._artifact_record_extension(record),
@@ -11258,8 +12782,8 @@ class LateFillRuntimeOwner:
                     'changes': changes,
                     'status': 'applied',
                     'source': 'terminal_late_fill_link_rebind',
-                }
-            )
+                    **owner,
+                })
 
         if not rebinds:
             return updated_payload
@@ -11303,6 +12827,7 @@ class LateFillRuntimeOwner:
         updated_payload['late_fill'] = late_fill
         return updated_payload
 
+    @observe_state('late_fill.graph_closure_refresh', 'terminal_materialization_state', 'closure_reviewed_response', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
     def refresh_terminal_graph_closure_review(
         self,
         payload: dict[str, Any],
@@ -12041,7 +13566,7 @@ class LateFillRuntimeOwner:
         runtime = payload.get('runtime') if isinstance(payload.get('runtime'), Mapping) else {}
         review = runtime.get('graph_closure_review') if isinstance(runtime.get('graph_closure_review'), Mapping) else {}
         checks = review.get('checks') if isinstance(review.get('checks'), list) else []
-        open_statuses = {'pending', 'planned', 'active', 'deferred', 'blocked'}
+        open_statuses = {'pending', 'planned', 'active', 'deferred', 'blocked', 'failed'}
         materialization_roles = {
             'text_artifact_output',
             'linked_artifact_binding_review',
@@ -12086,6 +13611,13 @@ class LateFillRuntimeOwner:
                 or evidence in materialization_evidence
                 or stage_direction == 'materialize_requested_text_artifact'
                 or raw_check.get('requires_artifact') is True
+                # Media obligations use final_output and may not repeat the
+                # text-artifact requires_artifact flag. An open canonical
+                # output obligation must not disappear from materialization.
+                or (
+                    str(raw_check.get('output_type') or '').strip() in {'image', 'audio'}
+                    and bool(str(raw_check.get('obligation_id') or '').strip())
+                )
             )
             if not materialization_relevant:
                 continue
@@ -12122,6 +13654,10 @@ class LateFillRuntimeOwner:
 
         for match in _LINK_REBIND_ATTR_RE.finditer(str(content or '')):
             url = str(match.group('url') or '').strip()
+            if cls._link_rebind_is_dynamic_template_url(
+                content, match.start('url'), url, target_path=target_path,
+            ):
+                continue
             if not url:
                 continue
             extension = Path(url.split('?', 1)[0].split('#', 1)[0]).suffix.lower().lstrip('.')
@@ -12141,6 +13677,10 @@ class LateFillRuntimeOwner:
 
         for match in _LINK_REBIND_URL_RE.finditer(str(content or '')):
             url = str(match.group('url') or '').strip()
+            if cls._link_rebind_is_dynamic_template_url(
+                content, match.start('url'), url, target_path=target_path,
+            ):
+                continue
             if not url:
                 continue
             extension = Path(url.split('?', 1)[0].split('#', 1)[0]).suffix.lower().lstrip('.')
@@ -12541,13 +14081,33 @@ class LateFillRuntimeOwner:
             for record in text_records
             if cls._artifact_record_extension(record) in {'html', 'htm'}
         }
+        referenced_html_names: set[str] = set()
+        if len(html_paths) >= 2:
+            for record in text_records:
+                if cls._artifact_record_extension(record) not in {'html', 'htm'}:
+                    continue
+                content = cls._terminal_materialization_text_record_content(record)
+                for match in _LINK_REBIND_ATTR_RE.finditer(content):
+                    url = str(match.group('url') or '').split('?', 1)[0].split('#', 1)[0].strip()
+                    if Path(url).suffix.lower().lstrip('.') in {'html', 'htm'}:
+                        referenced_html_names.add(Path(url).name.casefold())
         dependency_records: list[dict[str, Any]] = []
         for record in records:
             path = cls._artifact_record_path(record)
-            if not path or path in html_paths:
+            if not path:
                 continue
             artifact_type = str(record.get('type') or record.get('kind') or '').strip().lower()
             extension = cls._artifact_record_extension(record)
+            if path in html_paths:
+                source_name = cls._artifact_record_source_name(record)
+                html_aliases = {
+                    Path(path).name.casefold(),
+                    f'{Path(source_name).stem}.{extension}'.casefold()
+                    if source_name and extension
+                    else '',
+                }
+                if not referenced_html_names.intersection(html_aliases):
+                    continue
             if artifact_type == 'text' and extension not in _LINK_REBIND_HTML_TARGET_EXTENSIONS:
                 continue
             dependency_records.append(record)
@@ -12667,6 +14227,9 @@ class LateFillRuntimeOwner:
                 return
             seen.add(key)
             source_content = self._terminal_materialization_text_record_content(source_record)
+            source_content_sha256 = hashlib.sha256(
+                source_content.encode('utf-8')
+            ).hexdigest()
             if len(source_content) > 90_000:
                 source_content = f'{source_content[:90_000].rstrip()}\n\n[content truncated for repair prompt size]'
             source_name = Path(token).stem or ('styles' if extension == 'css' else f'generated-{extension}')
@@ -12677,13 +14240,10 @@ class LateFillRuntimeOwner:
                 target_path=target_path,
             )
             branch_id = str(
-                branch_hint.get('branch_id')
-                or source_record.get('branch_id')
-                or ''
+                branch_hint.get('branch_id') or ''
             ).strip()
             phase_id = str(
                 branch_hint.get('phase_id')
-                or source_record.get('phase_id')
                 or branch_id
                 or ''
             ).strip()
@@ -12706,10 +14266,10 @@ class LateFillRuntimeOwner:
                     f'Missing local dependency linked from: {source_path}',
                     f'Missing link token: {url}',
                     f'Dependency type: {extension}',
-                    'Current saved source file content:',
-                    '--- CURRENT SOURCE FILE START ---',
+                    'Dependency consumer file content (diagnostic context only; not target bytes):',
+                    '--- DEPENDENCY CONSUMER START ---',
                     source_content,
-                    '--- CURRENT SOURCE FILE END ---',
+                    '--- DEPENDENCY CONSUMER END ---',
                     repair_instruction,
                 ]
             ).strip()
@@ -12732,6 +14292,9 @@ class LateFillRuntimeOwner:
                     'content_payload_source': 'closure_local_dependency_link_review',
                     'stage_direction': 'materialize_requested_text_artifact',
                     'dependency_source_path': source_path,
+                    'dependency_consumer_path': source_path,
+                    'dependency_consumer_content_sha256': source_content_sha256,
+                    'target_artifact_path': target_path,
                     'missing_dependency_url': str(url or '').strip(),
                     'missing_dependency_target_path': target_path,
                     'text_artifact_extension': extension,
@@ -12753,8 +14316,16 @@ class LateFillRuntimeOwner:
             if not source_path or not content:
                 continue
             for match in _LINK_REBIND_ATTR_RE.finditer(content):
+                if self._link_rebind_is_dynamic_template_url(
+                    content, match.start('url'), match.group('url'), target_path=source_path,
+                ):
+                    continue
                 append_missing_link_check(record, str(match.group('url') or '').strip())
             for match in _LINK_REBIND_URL_RE.finditer(content):
+                if self._link_rebind_is_dynamic_template_url(
+                    content, match.start('url'), match.group('url'), target_path=source_path,
+                ):
+                    continue
                 append_missing_link_check(record, str(match.group('url') or '').strip())
             for match in _LINK_REBIND_FETCH_RE.finditer(content):
                 url = str(match.group('url') or '').strip()
@@ -13394,7 +14965,7 @@ class LateFillRuntimeOwner:
         updated_payload['late_fill'] = late_fill
         return updated_payload
 
-    def _terminal_composed_page_image_representation_open_check(
+    def _terminal_composed_page_image_representation_legacy_open_check(
         self,
         payload: Mapping[str, Any],
     ) -> Optional[dict[str, Any]]:
@@ -13564,6 +15135,489 @@ class LateFillRuntimeOwner:
                 'target_path': target_path,
             },
         }
+
+    @staticmethod
+    def _terminal_composed_site_role_label(
+        prompt: str,
+        *,
+        cohort_content: str,
+    ) -> str:
+        text = str(prompt or '').strip()
+        if not text:
+            return ''
+        candidates = [
+            str(match.group(1) or match.group(2) or '').strip()
+            for match in re.finditer(r'["“]([^"”]{2,80})["”]|\'([^\']{2,80})\'', text)
+        ]
+        for candidate in candidates:
+            if candidate and candidate.lower() in cohort_content.lower():
+                return candidate
+        role_match = re.search(
+            r'(?is)\b(?:interior|portrait|view|scene|image|photo)\s+(?:of|for)\s+(?:the\s+)?'
+            r'([^,.;:]{2,80})',
+            text,
+        )
+        if role_match:
+            candidate = re.sub(r'\s+', ' ', str(role_match.group(1) or '')).strip(' "\'')
+            if candidate and candidate.lower() in cohort_content.lower():
+                return candidate
+        return ''
+
+    @classmethod
+    def _terminal_composed_site_role_is_bound(
+        cls,
+        *,
+        role_label: str,
+        image_path: str,
+        content_by_path: Mapping[str, str],
+    ) -> bool:
+        label = str(role_label or '').strip().lower()
+        if not label or not image_path:
+            return True
+        normalized_label = re.sub(r'[^a-z0-9]+', ' ', label).strip()
+        for source_path, content in content_by_path.items():
+            source = str(content or '')
+            lowered = source.lower()
+            normalized_source = re.sub(r'[^a-z0-9]+', ' ', lowered)
+            for token in cls._terminal_exact_link_tokens_for_artifact(
+                source_path=source_path,
+                target_path=image_path,
+            ):
+                if not token:
+                    continue
+                start = 0
+                while True:
+                    position = source.find(token, start)
+                    if position < 0:
+                        break
+                    window = source[max(0, position - 1800):position + len(token) + 1800]
+                    if label in window.lower():
+                        return True
+                    normalized_window = re.sub(r'[^a-z0-9]+', ' ', window.lower())
+                    if normalized_label and normalized_label in normalized_window:
+                        return True
+                    start = position + len(token)
+            if normalized_label and normalized_label in normalized_source:
+                # A CSS nth-child or custom-property binding can keep the
+                # human label in a nearby comment while the exact path lives
+                # in the same target file.
+                if cls._terminal_exact_content_has_artifact_link(
+                    source,
+                    source_path=source_path,
+                    target_path=image_path,
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _terminal_composed_site_has_image_layout_css(
+        css_contents: list[str],
+        *,
+        generated_paths: list[str],
+        css_paths: list[str],
+    ) -> bool:
+        for css_path, content in zip(css_paths, css_contents):
+            text = str(content or '')
+            if not text.strip():
+                continue
+            for selector, declarations in re.findall(r'(?is)([^{}]+)\{([^{}]*)\}', text):
+                if not re.search(r'(?i)(?:img\b|image|photo|media|gallery|card)', selector):
+                    continue
+                if re.search(
+                    r'(?is)(?:object-fit|aspect-ratio|background(?:-image)?|grid-template|'
+                    r'display\s*:\s*(?:grid|flex)|max-width|height\s*:)',
+                    declarations,
+                ):
+                    return True
+            linked_image_count = sum(
+                1
+                for image_path in generated_paths
+                if LateFillRuntimeOwner._terminal_exact_content_has_artifact_link(
+                    text,
+                    source_path=css_path,
+                    target_path=image_path,
+                )
+            )
+            if linked_image_count > 1 and re.search(
+                r'(?is)(?:background(?:-image)?|object-fit|aspect-ratio|grid-template)',
+                text,
+            ):
+                return True
+        return False
+
+    def _terminal_composed_site_image_composition_open_checks(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Optional[list[dict[str, Any]]]:
+        records = self._collect_link_rebind_artifact_records(payload)
+        text_records = self._unique_artifact_records_by_path(
+            [
+                record
+                for record in records
+                if str(record.get('type') or record.get('kind') or '').strip().lower() == 'text'
+                and self._artifact_record_extension(record) in _LINK_REBIND_TEXT_EXTENSIONS
+                and self._artifact_record_path(record)
+            ]
+        )
+        html_records = [
+            record
+            for record in text_records
+            if self._artifact_record_extension(record) in {'html', 'htm'}
+        ]
+        css_records = [
+            record
+            for record in text_records
+            if self._artifact_record_extension(record) == 'css'
+        ]
+        script_records = [
+            record
+            for record in text_records
+            if self._artifact_record_extension(record) in {'js', 'mjs', 'cjs'}
+        ]
+        is_composed_site = bool(
+            len(html_records) >= 2
+            and css_records
+        )
+        if not is_composed_site:
+            return None
+
+        late_fill = payload.get('late_fill') if isinstance(payload.get('late_fill'), Mapping) else {}
+        image_branch_ids = {
+            self.branch_id(item)
+            for item in [
+                *(late_fill.get('completed_branches') or []),
+                *(late_fill.get('fill_results') or []),
+            ]
+            if isinstance(item, Mapping)
+            and (
+                self.normalize_capability(item.get('capability')) == self.capability_image_generation
+                or str(item.get('output_type') or '').strip().lower() == 'image'
+                or str(item.get('saved_image_path') or '').strip()
+            )
+            and self.branch_id(item)
+        }
+        if len(image_branch_ids) <= 1:
+            return None
+        image_records = self._unique_artifact_records_by_path(
+            [
+                record
+                for record in records
+                if (
+                    str(record.get('type') or record.get('kind') or '').strip().lower() == 'image'
+                    or self._artifact_record_extension(record) in _LINK_REBIND_IMAGE_EXTENSIONS
+                )
+                and self._artifact_record_path(record)
+            ]
+        )
+        generated_image_records: list[dict[str, Any]] = []
+        for record in image_records:
+            record_branch_id = self.branch_id(record)
+            if record_branch_id and record_branch_id in image_branch_ids:
+                generated_image_records.append(record)
+            elif not record_branch_id and len(image_records) == len(image_branch_ids):
+                generated_image_records.append(record)
+        if not generated_image_records:
+            generated_image_records = image_records
+        generated_image_records.sort(key=self._image_artifact_record_sort_key)
+        if len(generated_image_records) <= 1:
+            return None
+
+        content_by_path: dict[str, str] = {}
+        for record in text_records:
+            path = self._artifact_record_path(record)
+            content = self._terminal_materialization_text_record_content(record)
+            if path and content:
+                content_by_path[path] = content
+        if not content_by_path:
+            return None
+        generated_paths = [
+            self._artifact_record_path(record)
+            for record in generated_image_records
+            if self._artifact_record_path(record)
+        ]
+        represented_paths = {
+            image_path
+            for image_path in generated_paths
+            if any(
+                self._terminal_exact_content_has_artifact_link(
+                    content,
+                    source_path=source_path,
+                    target_path=image_path,
+                )
+                for source_path, content in content_by_path.items()
+            )
+        }
+        missing_paths = [path for path in generated_paths if path not in represented_paths]
+        detached_marker_present = any(
+            'data-ollmo-repair="composed-page-image-representation"' in content
+            or "data-ollmo-repair='composed-page-image-representation'" in content
+            or 'class="ollmo-generated-media"' in content
+            or "class='ollmo-generated-media'" in content
+            for record in html_records
+            for content in [content_by_path.get(self._artifact_record_path(record), '')]
+        )
+        cohort_content = '\n'.join(content_by_path.values())
+        batch_prompts = [
+            str(item or '').strip()
+            for item in (late_fill.get('batch_prompts') or [])
+            if str(item or '').strip()
+        ]
+        image_assignments: list[dict[str, Any]] = []
+        role_binding_defects: list[dict[str, str]] = []
+        for index, image_path in enumerate(generated_paths):
+            prompt = batch_prompts[index] if index < len(batch_prompts) else ''
+            role_label = self._terminal_composed_site_role_label(
+                prompt,
+                cohort_content=cohort_content,
+            )
+            assignment = {
+                'slot': index + 1,
+                'path': image_path,
+                'prompt': prompt,
+                'role_label': role_label,
+            }
+            image_assignments.append(assignment)
+            if role_label and not self._terminal_composed_site_role_is_bound(
+                role_label=role_label,
+                image_path=image_path,
+                content_by_path=content_by_path,
+            ):
+                role_binding_defects.append(
+                    {'path': image_path, 'role_label': role_label}
+                )
+        css_paths = [self._artifact_record_path(record) for record in css_records]
+        has_image_layout_css = self._terminal_composed_site_has_image_layout_css(
+            [content_by_path.get(path, '') for path in css_paths],
+            generated_paths=generated_paths,
+            css_paths=css_paths,
+        )
+        layout_binding_defect = bool(
+            len(generated_paths) > 1 and not has_image_layout_css
+        )
+        if not (
+            missing_paths
+            or detached_marker_present
+            or role_binding_defects
+            or layout_binding_defect
+        ):
+            return []
+
+        target_records = [*html_records, *css_records, *script_records]
+        cohort_snapshots: list[str] = []
+        remaining_snapshot_budget = 180_000
+        cohort_snapshot_truncated = False
+        for record in target_records:
+            path = self._artifact_record_path(record)
+            content = content_by_path.get(path, '')
+            allowance = min(60_000, max(0, remaining_snapshot_budget))
+            snapshot = content[:allowance]
+            if len(snapshot) < len(content):
+                cohort_snapshot_truncated = True
+                snapshot = f'{snapshot.rstrip()}\n[cohort snapshot truncated]'
+            remaining_snapshot_budget -= min(len(content), allowance)
+            cohort_snapshots.extend(
+                [
+                    f'--- COHORT FILE {path} START ---',
+                    snapshot,
+                    f'--- COHORT FILE {path} END ---',
+                ]
+            )
+        assignment_lines: list[str] = []
+        for assignment in image_assignments:
+            role_text = (
+                f'role label: {assignment["role_label"]}'
+                if assignment.get('role_label')
+                else 'role label: use the ordered prompt as role evidence'
+            )
+            assignment_lines.extend(
+                [
+                    f'- Image slot {assignment["slot"]}: {assignment["path"]}',
+                    f'  {role_text}',
+                    f'  generation prompt: {assignment["prompt"] or "unavailable"}',
+                ]
+            )
+        defect_lines = [
+            f'- Missing concrete image references: {len(missing_paths)}',
+            f'- Detached runtime repair section present: {str(detached_marker_present).lower()}',
+            f'- Unbound named image roles: {len(role_binding_defects)}',
+            f'- Shared image layout CSS missing: {str(layout_binding_defect).lower()}',
+        ]
+        image_phase_ids = list(
+            dict.fromkeys(
+                str(record.get('phase_id') or record.get('branch_id') or '').strip()
+                for record in generated_image_records
+                if str(record.get('phase_id') or record.get('branch_id') or '').strip()
+            )
+        )
+        input_refs = [
+            {
+                'kind': 'artifact',
+                'artifact_ref': record.get('artifact_ref') or record.get('ref'),
+                'path': self._artifact_record_path(record),
+                'role': 'generated_image_role_evidence',
+            }
+            for record in generated_image_records
+        ]
+        input_refs.extend(
+            {
+                'kind': 'artifact',
+                'artifact_ref': record.get('artifact_ref') or record.get('ref'),
+                'path': self._artifact_record_path(record),
+                'role': 'composed_site_cohort_snapshot',
+            }
+            for record in target_records
+        )
+        checks: list[dict[str, Any]] = []
+        for record in target_records:
+            target_path = self._artifact_record_path(record)
+            target_extension = self._artifact_record_extension(record)
+            target_name = self._artifact_record_source_name(record) or Path(target_path).stem
+            target_content = content_by_path.get(target_path, '')
+            bounded_target_content = target_content
+            if len(bounded_target_content) > 90_000:
+                bounded_target_content = (
+                    f'{bounded_target_content[:90_000].rstrip()}\n[target content truncated for repair prompt size]'
+                )
+            if target_extension in {'html', 'htm'}:
+                target_instruction = (
+                    'Keep this page in its existing role. Add or preserve semantic hooks and direct image markup '
+                    'only where this page owns it. Remove any Ollmo detached repair section from this target. '
+                    'If JavaScript owns repeated cards, keep the shell compatible with that renderer.'
+                )
+            elif target_extension == 'css':
+                target_instruction = (
+                    'Give the existing image-bearing hero, cards, galleries, or media regions a deliberate '
+                    'responsive layout. Style the exact hooks used by the cohort; include stable sizing and '
+                    'cropping such as aspect-ratio/object-fit where appropriate.'
+                )
+            else:
+                target_instruction = (
+                    'Bind the ordered image paths to the existing semantic data/items and rendered markup. '
+                    'Preserve interaction, selection, calculations, and unrelated behavior.'
+                )
+            content_payload = '\n'.join(
+                [
+                    f'Target text artifact: {target_path}',
+                    'Composed-site image-role and layout repair.',
+                    'Verified defects:',
+                    *defect_lines,
+                    'Ordered generated-image assignments:',
+                    *assignment_lines,
+                    'Read-only cohort snapshots for cross-file consistency:',
+                    *cohort_snapshots,
+                    'Current saved target file content:',
+                    '--- CURRENT SAVED TARGET START ---',
+                    bounded_target_content,
+                    '--- CURRENT SAVED TARGET END ---',
+                    f'Target-specific instruction: {target_instruction}',
+                    'Return the complete replacement content for this target file only.',
+                    'Do not create a new sibling file. Do not rewrite another cohort file from this branch.',
+                    'Do not append a catch-all image dump or an ollmo-generated-media detached repair section.',
+                    'Preserve existing valid local links and use concrete relative paths from this target when it references an image.',
+                ]
+            ).strip()
+            target_token = hashlib.sha256(target_path.encode('utf-8')).hexdigest()[:12]
+            branch_id = (
+                str(record.get('branch_id') or record.get('phase_id') or '').strip()
+                or f'branch-composed-site-image-repair-{target_token}'
+            )
+            phase_id = (
+                str(record.get('phase_id') or record.get('branch_id') or '').strip()
+                or branch_id
+            )
+            execution_contract = {
+                'kind': 'ollmo.composed_site_image_cohort_repair_contract',
+                'repair_mode': 'composed_site_image_cohort_target',
+                'execution_scope': 'target_artifact_snapshot_only',
+                'branch_id': branch_id,
+                'phase_id': phase_id,
+                'capability': 'chat',
+                'output_type': 'text',
+                'target_path': target_path,
+                'target_extension': target_extension,
+                'cohort_paths': [self._artifact_record_path(item) for item in target_records],
+                'generated_image_paths': generated_paths,
+                'image_assignments': image_assignments,
+                'cohort_snapshot_truncated': cohort_snapshot_truncated,
+                'root_prompt_replay_allowed': False,
+                'sibling_write_allowed': False,
+            }
+            checks.append(
+                {
+                    'check_kind': 'composed_page_image_representation',
+                    'status': 'pending',
+                    'evidence': 'composed_site_image_role_or_layout_unmet',
+                    'reason': 'composed site image roles and layout are not yet proven by final saved files',
+                    'capability': 'chat',
+                    'output_type': 'text',
+                    'role': 'linked_artifact_binding_review',
+                    'branch_id': branch_id,
+                    'phase_id': phase_id,
+                    'repair_owner_branch_id': str(record.get('branch_id') or '').strip() or None,
+                    'repair_owner_phase_id': str(record.get('phase_id') or '').strip() or None,
+                    'depends_on': image_phase_ids or None,
+                    'input_refs': input_refs,
+                    'execution_contract': execution_contract,
+                    'output_contract': {
+                        'output_type': 'text',
+                        'required': True,
+                        'target_path': target_path,
+                        'fulfillment_policy': 'target_bound_saved_artifact_replacement',
+                    },
+                    'review_criteria': [
+                        'uses_dependency_evidence',
+                        'does_not_restart_root_request',
+                    ],
+                    'requires_artifact': True,
+                    'repair_action': RECOVERY_ACTION_REBIND_DEPENDENCY_EVIDENCE,
+                    'recovery_action': RECOVERY_ACTION_REBIND_DEPENDENCY_EVIDENCE,
+                    'repair_action_reason': 'repair the existing composed-site file cohort against ordered image-role evidence',
+                    'content_payload': content_payload,
+                    'content_payload_source': 'closure_composed_site_image_composition',
+                    'stage_direction': 'materialize_requested_text_artifact',
+                    'generated_image_count': len(generated_paths),
+                    'represented_image_count': len(represented_paths),
+                    'missing_image_count': len(missing_paths),
+                    'generated_image_paths': generated_paths,
+                    'missing_image_paths': missing_paths,
+                    'represented_image_paths': sorted(represented_paths),
+                    'image_assignments': image_assignments,
+                    'role_binding_defects': role_binding_defects,
+                    'detached_repair_section_present': detached_marker_present,
+                    'layout_binding_defect': layout_binding_defect,
+                    'text_artifact_extension': target_extension,
+                    'text_artifact_source_name': target_name,
+                    'text_artifact_source': 'closure_composed_site_image_composition',
+                    'text_artifact_target_path': target_path,
+                    'repair_scope': 'composed_site_cohort_target',
+                    'resource_class': 'local_text_io',
+                    'dependency_policy': 'target_artifact_snapshot_only',
+                    'artifact_request': {
+                        'extension': target_extension,
+                        'source_name': target_name,
+                        'source': 'closure_composed_site_image_composition',
+                        'target_path': target_path,
+                    },
+                }
+            )
+        return checks
+
+    def _terminal_composed_page_image_representation_open_checks(
+        self,
+        payload: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        cohort_checks = self._terminal_composed_site_image_composition_open_checks(payload)
+        if cohort_checks is not None:
+            return cohort_checks
+        legacy_check = self._terminal_composed_page_image_representation_legacy_open_check(payload)
+        return [legacy_check] if legacy_check else []
+
+    def _terminal_composed_page_image_representation_open_check(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        checks = self._terminal_composed_page_image_representation_open_checks(payload)
+        return checks[0] if checks else None
 
     @staticmethod
     def _html_attribute_escape(value: str) -> str:
@@ -13943,6 +15997,17 @@ class LateFillRuntimeOwner:
             return payload
         check = self._terminal_composed_page_image_representation_open_check(payload)
         if not check:
+            return payload
+        execution_contract = (
+            check.get('execution_contract')
+            if isinstance(check.get('execution_contract'), Mapping)
+            else {}
+        )
+        if str(execution_contract.get('repair_mode') or '').strip() == 'composed_site_image_cohort_target':
+            # A composed site must be repaired through the target-bound cohort
+            # branches projected by Closure. Appending all missing images to
+            # the first HTML file would destroy their semantic roles while
+            # creating misleading path-only evidence of completion.
             return payload
         target_path = str(check.get('text_artifact_target_path') or '').strip()
         if not target_path:
@@ -14530,11 +16595,22 @@ class LateFillRuntimeOwner:
                 'text_artifact_target_path',
                 'artifact_request',
                 'review_criteria',
+                'input_refs',
+                'execution_contract',
+                'output_contract',
+                'repair_scope',
+                'resource_class',
+                'dependency_policy',
                 'generated_image_count',
                 'represented_image_count',
                 'missing_image_count',
+                'generated_image_paths',
                 'missing_image_paths',
                 'represented_image_paths',
+                'image_assignments',
+                'role_binding_defects',
+                'detached_repair_section_present',
+                'layout_binding_defect',
             ):
                 value = preferred.get(key)
                 if value not in (None, '', [], {}):
@@ -14577,6 +16653,51 @@ class LateFillRuntimeOwner:
             if branch_id and branch_id not in pending_ids:
                 pending_records.append(demoted)
                 pending_ids.add(branch_id)
+        # A newly discovered dependency has no completed branch to demote.
+        # Give it an exact target identity and use the same bounded projection.
+        # Existing work/history must win so repeated checks cannot reset retries.
+        known_branches = [
+            *completed_records, *pending_records,
+            *self.normalize_late_fill_branches(updated.get('active_branches')),
+            *self.normalize_late_fill_branches(updated.get('failed_branches')),
+            *self.normalize_late_fill_branches(updated.get('cancelled_branches')),
+            *self.normalize_late_fill_branches(
+                updated.get('materialization_contract_demoted_branches')
+            ),
+        ]
+        for check in open_checks:
+            if not isinstance(check, Mapping):
+                continue
+            if (
+                check.get('evidence') != 'unresolved_local_dependency_link'
+                or check.get('content_payload_source') != 'closure_local_dependency_link_review'
+                or not str(check.get('content_payload') or '').strip()
+                or not self._artifact_gap_is_authoritative_bounded_text_artifact_repair(check)
+                or check.get('materialization_blocked') is True
+                or check.get('needs_external_input') is True
+            ):
+                continue
+            if any(check_matches_branch(check, branch) for branch in known_branches):
+                continue
+            target_path = str(check.get('text_artifact_target_path') or '').strip()
+            if not target_path:
+                continue
+            owner_id = 'missing-local-dependency-' + hashlib.sha256(
+                target_path.encode('utf-8')
+            ).hexdigest()[:16]
+            missing_branch = {
+                **dict(check),
+                **repair_fields_for_branch(check),
+                'branch_id': owner_id,
+                'phase_id': owner_id,
+                'status': 'repair_needed',
+                'evidence': 'terminal_materialization_contract_unmet',
+                'materialization_contract_unmet': True,
+            }
+            pending_records.append(missing_branch)
+            pending_ids.add(owner_id)
+            demoted_records.append(missing_branch)
+            known_branches.append(missing_branch)
         if not demoted_records:
             updated.pop('materialization_contract_current_demoted_branches', None)
             return updated
@@ -14617,6 +16738,7 @@ class LateFillRuntimeOwner:
         return reviewed if isinstance(reviewed, dict) else payload
 
     @staticmethod
+    @observe_state('late_fill.reconcile', 'terminal_response_state', 'reconciled_response_state', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
     def _reconcile_terminal_satisfied_repair_loop(
         late_fill: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -14626,7 +16748,7 @@ class LateFillRuntimeOwner:
             if isinstance(updated.get('repair_loop'), Mapping)
             else {}
         )
-        if not repair_loop or not terminal_repair_loop_is_fully_satisfied(updated, repair_loop):
+        if not repair_loop:
             return updated
 
         promoted_contracts = [
@@ -14634,6 +16756,31 @@ class LateFillRuntimeOwner:
             for item in (repair_loop.get('promoted_contracts') or [])
             if isinstance(item, Mapping)
         ]
+        completed_branches = [
+            dict(item)
+            for item in (updated.get('completed_branches') or [])
+            if isinstance(item, Mapping)
+        ]
+        available_branches = list(completed_branches)
+        satisfied_contracts: list[dict[str, Any]] = []
+        unresolved_contracts: list[dict[str, Any]] = []
+        for contract in promoted_contracts:
+            match_index = next(
+                (
+                    index
+                    for index, branch in enumerate(available_branches)
+                    if repair_contract_matches_completion(contract, branch)
+                ),
+                None,
+            )
+            if match_index is None:
+                unresolved_contracts.append(contract)
+                continue
+            satisfied_contracts.append(contract)
+            available_branches.pop(match_index)
+        if not satisfied_contracts:
+            return updated
+
         resolved_contracts = [
             {
                 key: value
@@ -14644,11 +16791,98 @@ class LateFillRuntimeOwner:
                     'obligation_id': contract.get('obligation_id'),
                     'task_id': contract.get('task_id'),
                     'artifact_request': contract.get('artifact_request'),
+                    'execution_binding': contract.get('execution_binding'),
                 }.items()
                 if value not in (None, '', [], {})
             }
-            for contract in promoted_contracts
+            for contract in satisfied_contracts
         ]
+        prior_resolved = [
+            dict(item)
+            for item in (repair_loop.get('resolved_contracts') or [])
+            if isinstance(item, Mapping)
+        ]
+        resolved_contracts = [*prior_resolved, *resolved_contracts]
+        repair_loop['resolved_contract_count'] = len(resolved_contracts)
+        repair_loop['resolved_contracts'] = resolved_contracts
+        repair_loop['promoted_contracts'] = unresolved_contracts
+        repair_loop['promoted_contract_count'] = len(unresolved_contracts)
+
+        executable_contract_count = sum(
+            1 for contract in unresolved_contracts if contract.get('auto_execute') is True
+        )
+        blocked_contract_count = len(unresolved_contracts) - executable_contract_count
+        repair_work_available_count = sum(
+            1 for contract in unresolved_contracts if contract.get('repair_work_available') is True
+        )
+        needs_external_input_count = sum(
+            1 for contract in unresolved_contracts if contract.get('needs_external_input') is True
+        )
+        repair_loop.update(
+            {
+                'auto_execute': bool(executable_contract_count),
+                'repair_work_available': bool(repair_work_available_count),
+                'repair_work_available_count': repair_work_available_count,
+                'executable_contract_count': executable_contract_count,
+                'blocked_contract_count': blocked_contract_count,
+                'materialization_blocked_contract_count': blocked_contract_count,
+                'needs_external_input_count': needs_external_input_count,
+                'next_actions': list(
+                    dict.fromkeys(
+                        str(contract.get('repair_action') or contract.get('recovery_action') or '').strip()
+                        for contract in unresolved_contracts
+                        if str(contract.get('repair_action') or contract.get('recovery_action') or '').strip()
+                    )
+                ),
+            }
+        )
+        updated['repair_rebuild_contracts'] = unresolved_contracts
+
+        feedback = (
+            dict(updated.get('ghost_repair_feedback') or {})
+            if isinstance(updated.get('ghost_repair_feedback'), Mapping)
+            else {}
+        )
+        if feedback:
+            feedback_items = [
+                dict(item)
+                for item in (feedback.get('items') or [])
+                if isinstance(item, Mapping)
+                and not any(
+                    repair_contract_matches_completion(item, branch)
+                    for branch in completed_branches
+                )
+            ]
+            feedback['items'] = feedback_items
+            feedback['repair_rebuild_contracts'] = unresolved_contracts
+            feedback['repair_loop'] = dict(repair_loop)
+
+        if unresolved_contracts:
+            updated['repair_loop'] = repair_loop
+            if feedback:
+                updated['ghost_repair_feedback'] = feedback
+            unresolved_actions = repair_loop.get('next_actions') or []
+            if unresolved_actions:
+                updated['repair_actions'] = list(unresolved_actions)
+                updated['repair_action'] = unresolved_actions[0]
+            else:
+                updated.pop('repair_action', None)
+                updated.pop('repair_actions', None)
+            return updated
+
+        fully_satisfied = terminal_repair_loop_is_fully_satisfied(
+            {
+                **updated,
+                'repair_loop': {
+                    **repair_loop,
+                    'promoted_contracts': satisfied_contracts,
+                },
+            },
+            {
+                **repair_loop,
+                'promoted_contracts': satisfied_contracts,
+            },
+        )
         repair_loop.update(
             {
                 'status': 'completed',
@@ -14661,10 +16895,8 @@ class LateFillRuntimeOwner:
                 'needs_external_input_count': 0,
                 'next_actions': [],
                 'requires_promotion': False,
-                'resolved_contract_count': len(resolved_contracts),
-                'resolved_contracts': resolved_contracts,
                 'resolution': {
-                    'status': 'completed',
+                    'status': 'completed' if fully_satisfied else 'resolved_from_exact_branch_evidence',
                     'authority': 'terminal_exact_repair_contract_evidence',
                 },
             }
@@ -14683,18 +16915,71 @@ class LateFillRuntimeOwner:
         updated.pop('repair_action', None)
         updated.pop('repair_actions', None)
 
-        feedback = (
-            dict(updated.get('ghost_repair_feedback') or {})
-            if isinstance(updated.get('ghost_repair_feedback'), Mapping)
-            else {}
-        )
         if feedback:
             feedback['status'] = 'resolved'
             feedback['repair_loop'] = dict(repair_loop)
-            feedback['resolution_status'] = 'completed'
+            feedback['resolution_status'] = repair_loop['resolution']['status']
             updated['ghost_repair_feedback'] = feedback
         return updated
 
+    def _supersede_resolved_composition_repairs(
+        self, payload: Mapping[str, Any], late_fill: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Retire failed cohort repairs only after a fresh applicable review."""
+        updated = dict(late_fill)
+        failed = self.normalize_late_fill_branches(updated.get('failed_branches'))
+        candidates = [
+            branch for branch in failed
+            if branch.get('content_payload_source') == 'closure_composed_site_image_composition'
+            and branch.get('status') == 'failed'
+            and not self._text_artifact_revision_required(branch)
+        ]
+        if not candidates:
+            return updated
+        # None means the review is inapplicable, not that the defect is closed.
+        if self._terminal_composed_site_image_composition_open_checks(payload) != []:
+            return updated
+        completed = self.normalize_late_fill_branches(updated.get('completed_branches'))
+        superseded_ids: set[str] = set()
+        for branch in candidates:
+            target = self._text_artifact_target_path_from_mapping(branch)
+            extension = str(branch.get('text_artifact_extension') or Path(target).suffix).lstrip('.')
+            if not target or self._text_artifact_saved_payload_error(target, extension=extension):
+                continue
+            try:
+                digest = hashlib.sha256(Path(target).read_bytes()).hexdigest()
+            except OSError:
+                continue
+            branch_id = self.branch_id(branch)
+            if not branch_id:
+                continue
+            superseded = dict(branch)
+            superseded.update({
+                'status': 'superseded',
+                'evidence': 'fresh_composed_site_review_resolved_repair_defect',
+                'non_blocking_after_final_contract_fulfilled': True,
+                'supersession_evidence': {
+                    'review': 'composed_site_image_composition',
+                    'open_check_count': 0, 'target_path': target,
+                    'target_sha256': digest,
+                },
+            })
+            # Keep the failed attempt as audit evidence, not live retry state.
+            superseded['superseded_failure'] = {
+                key: superseded.pop(key) for key in
+                ('error', 'attempt', 'recovery_context', 'recovery_state')
+                if key in superseded
+            }
+            completed.append(superseded)
+            superseded_ids.add(branch_id)
+        if superseded_ids:
+            updated['failed_branches'] = [b for b in failed if self.branch_id(b) not in superseded_ids]
+            updated['failed_branch_count'] = len(updated['failed_branches'])
+            updated['completed_branches'] = completed
+            updated['completed_branch_count'] = len(completed)
+        return updated
+
+    @observe_state('late_fill.terminal_materialization', 'branch_artifact_response_state', 'terminal_materialization_state', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
     def finalize_terminal_materialization_contract(
         self,
         payload: dict[str, Any],
@@ -14756,17 +17041,31 @@ class LateFillRuntimeOwner:
             updated_payload,
             late_fill,
         )
-        composed_image_check = self._terminal_composed_page_image_representation_open_check(updated_payload)
-        if (
-            composed_image_check
-            and not any(
-                str(check.get('check_kind') or '').strip() == 'composed_page_image_representation'
+        composed_image_checks = self._terminal_composed_page_image_representation_open_checks(
+            updated_payload
+        )
+        if composed_image_checks:
+            existing_composed_identities = {
+                (
+                    str(check.get('branch_id') or check.get('phase_id') or '').strip(),
+                    str(check.get('text_artifact_target_path') or '').strip(),
+                )
                 for check in open_checks
                 if isinstance(check, Mapping)
-            )
-        ):
+                and str(check.get('check_kind') or '').strip()
+                == 'composed_page_image_representation'
+            }
+            new_composed_checks = [
+                check
+                for check in composed_image_checks
+                if (
+                    str(check.get('branch_id') or check.get('phase_id') or '').strip(),
+                    str(check.get('text_artifact_target_path') or '').strip(),
+                )
+                not in existing_composed_identities
+            ]
             open_checks = self._filter_terminal_materialization_open_checks(
-                [*open_checks, composed_image_check],
+                [*open_checks, *new_composed_checks],
                 updated_payload,
                 late_fill,
             )
@@ -14902,6 +17201,7 @@ class LateFillRuntimeOwner:
             )
             return updated_payload, effective_status
 
+        late_fill = self._supersede_resolved_composition_repairs(updated_payload, late_fill)
         late_fill['final_materialization_contract_status'] = 'fulfilled'
         late_fill['materialization_contract_unmet'] = False
         for key in (
@@ -15329,6 +17629,12 @@ class LateFillRuntimeOwner:
             or artifact_request.get('target_path')
             or ''
         ).strip()
+        saved_contract = saved_file_dependency_contract(gap)
+        if saved_contract:
+            read = gap.get('saved_file_read_evidence') or (gap.get('execution_contract') or {}).get('saved_file_read_evidence')
+            if not read:
+                raise ValueError('saved_file_read_evidence_missing')
+            return saved_file_consumer_prompt(saved_contract, read)
         if content_payload and cls._text_artifact_revision_required(gap):
             # Revision packets are constructed only from a complete, bounded
             # canonical source snapshot. The selected reply itself is not
@@ -16211,12 +18517,56 @@ class LateFillRuntimeOwner:
             'selected_reference_evidence_bound': True,
         }
 
+    def _saved_file_dependency_payload(self, branch, current_payload):
+        contract = saved_file_dependency_contract(branch)
+        try:
+            if (any(branch.get(key) != contract.get('consumer_' + key)
+                    for key in ('branch_id', 'phase_id'))
+                    or branch.get('depends_on') != [contract.get('producer_phase_id')]):
+                raise ValueError('saved_file_read_consumer_contract_mismatch')
+            results = (current_payload.get('late_fill') or {}).get('fill_results') or []
+            producers = [r for r in results if isinstance(r, Mapping)
+                and r.get('branch_id') == contract['producer_branch_id']
+                and r.get('phase_id') == contract['producer_phase_id']]
+            if len(producers) != 1:
+                raise ValueError('saved_file_read_producer_missing_or_ambiguous')
+            snapshot = producers[0].get('saved_file_output_snapshot') or {}
+            if not snapshot.get('sha256'):
+                raise ValueError('saved_file_read_saved_version_missing')
+            read = read_saved_file_snapshot(snapshot['path'], self.resolve_saved_file_input_path)
+            read.update({key: snapshot.get(key) for key in
+                ('artifact_ref', 'artifact_id', 'source_response_id', 'branch_id', 'phase_id')})
+            read.update({key: contract[key] for key in
+                ('producer_branch_id', 'producer_phase_id', 'consumer_branch_id', 'consumer_phase_id')})
+            read['response_id'] = current_payload.get('id')
+            issue = saved_file_read_issue(contract, read, current_payload)
+            if issue:
+                raise ValueError(issue)
+            return {'saved_file_read_evidence': read,
+                    'content_payload': saved_file_read_text(read), 'content_payload_source': 'saved_file_read',
+                    'input_refs': [{'kind': 'saved_file_read', **{key: value for key, value in read.items() if key != 'utf8_base64'}}],
+                    'suppress_reference_file_context': True}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError) as exc:
+            return {'branch_contract_error': str(exc), 'materialization_blocked': True,
+                    'repair_action': RECOVERY_ACTION_REPAIR_DEPENDENCY_CHAIN}
+
+    def saved_file_consumption_error(self, branch, infer_result, *, current_payload):
+        issue = saved_file_consumption_issue(branch, infer_result, current_payload or {})
+        if issue:
+            return {'code': 'DEPENDENCY_CHAIN_REPAIR_REQUIRED', 'reason_code': issue,
+                    'message': issue, 'stage': 'saved_file_evidence_gate', 'retryable': False,
+                    'materialization_blocked': True}
+        return None
+
+    @observe_state('late_fill.dependency_binding', 'saved_dependency_evidence', 'bound_branch_dependency', labels=('NEW_AUTHORITY_BOUNDARY',), new_authority_boundary=True)
     def branch_dependency_payload(
         self,
         branch: Mapping[str, Any],
         *,
         current_payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if saved_file_dependency_contract(branch):
+            return self._saved_file_dependency_payload(branch, current_payload)
         depends_on = [
             str(item or '').strip()
             for item in (branch.get('depends_on') or [])
@@ -16496,6 +18846,14 @@ class LateFillRuntimeOwner:
             'cache_id',
             'result',
             'image_artifact_persisted_from_raw_late_fill',
+            'retained_input_alias_required',
+            'retained_input_binding_state',
+            'retained_input_source_path',
+            'retained_input_source_name',
+            'retained_input_target_name',
+            'retained_input_source_sha256',
+            'retained_input_target_sha256',
+            'retained_input_byte_identical',
             'provenance_id',
             'derived_from',
         ):
@@ -16675,6 +19033,13 @@ class LateFillRuntimeOwner:
         )
         if primary_artifact is None and len(updated['artifacts']) == 1:
             primary_artifact = updated['artifacts'][0]
+        snapshot = updated.get('saved_file_output_snapshot')
+        if isinstance(snapshot, Mapping) and primary_artifact is not None:
+            if primary_artifact.get('path') != snapshot.get('path'):
+                raise ValueError('saved_file_output_identity_mismatch')
+            updated['saved_file_output_snapshot'] = {**dict(snapshot), **{
+                key: primary_artifact.get(key) for key in
+                ('artifact_ref', 'artifact_id', 'source_response_id', 'branch_id', 'phase_id')}}
         if primary_artifact is not None:
             for key in (
                 'artifact_id',
@@ -16837,6 +19202,16 @@ class LateFillRuntimeOwner:
             late_fill_request_payload.get('branch_contract_error') or ''
         ).strip()
         if (
+            self.normalize_capability(expected_capability)
+            == self.capability_image_generation
+            and branch_contract_error == 'incomplete_image_prompt_batch'
+            and late_fill_request_payload.get('materialization_blocked') is True
+        ):
+            raise RuntimeError(
+                'Counted image prompt batch is incomplete; late-fill '
+                'preparation failed closed without a fallback prompt carrier.'
+            )
+        if (
             str(active_gap.get('trigger') or '').strip().lower()
             in {'graph_patch_successor_reopen', 'graph_rebase_partial_successor'}
             and branch_contract_error
@@ -16871,11 +19246,88 @@ class LateFillRuntimeOwner:
             'text_revision_source_unavailable',
             'text_revision_source_exceeds_prompt_bound',
             'ambiguous_text_artifact_revision_source',
+            'retained_input_alias_unavailable',
+            'retained_input_alias_ambiguous',
         }:
             raise RuntimeError(
                 'Preserved selected-reference or text-revision contract is invalid; '
                 'late-fill preparation failed closed instead of regenerating or guessing source evidence.'
             )
+        retained_alias_required = bool(
+            str(
+                active_gap.get('stage_direction')
+                or late_fill_request_payload.get('stage_direction')
+                or ''
+            ).strip()
+            == 'materialize_retained_input_alias'
+            or active_gap.get('retained_input_alias_required') is True
+            or late_fill_request_payload.get('retained_input_alias_required') is True
+        )
+        if retained_alias_required:
+            effective_data = dict(late_fill_request_payload)
+            retained_keys = (
+                'stage_direction',
+                'requires_artifact',
+                'text_artifact_extension',
+                'text_artifact_source_name',
+                'text_artifact_source',
+                'retained_input_alias_required',
+                'retained_input_binding_state',
+                'retained_input_source_path',
+                'retained_input_source_name',
+                'retained_input_target_name',
+                'retained_input_candidate_count',
+                'artifact_request',
+            )
+            for key in retained_keys:
+                value = active_gap.get(key)
+                if value not in (None, '', [], {}):
+                    effective_data[key] = value
+            execution_contract = (
+                effective_data.get('execution_contract')
+                if isinstance(effective_data.get('execution_contract'), Mapping)
+                else active_gap.get('execution_contract')
+                if isinstance(active_gap.get('execution_contract'), Mapping)
+                else {}
+            )
+            if execution_contract:
+                effective_data['execution_contract'] = dict(execution_contract)
+            deterministic_instance = {
+                'target_kind': 'deterministic_local',
+                'instance_id': 'ollmo-retained-input-alias',
+                'id': 'ollmo-retained-input-alias',
+                'backend': 'ollmo',
+            }
+            deterministic_route = {
+                'route_source': 'deterministic_retained_input_alias',
+                'capability': 'chat',
+                'instance_id': 'ollmo-retained-input-alias',
+                'instance': dict(deterministic_instance),
+            }
+            return {
+                'response_id': current_payload.get('id'),
+                'capability': 'chat',
+                'branch_id': str(
+                    execution_contract.get('branch_id')
+                    or effective_data.get('branch_id')
+                    or active_gap.get('branch_id')
+                    or ''
+                ).strip()
+                or None,
+                'phase_id': str(
+                    execution_contract.get('phase_id')
+                    or effective_data.get('phase_id')
+                    or active_gap.get('phase_id')
+                    or ''
+                ).strip()
+                or None,
+                'execution_contract': dict(execution_contract),
+                'route_info': deterministic_route,
+                'instance': deterministic_instance,
+                'effective_data': effective_data,
+                'infer_payload': {},
+                'expose_input_artifacts': False,
+            }
         late_fill_request_payload = self.merge_late_fill_payload_artifacts(
             late_fill_request_payload,
             current_payload,
@@ -16998,6 +19450,7 @@ class LateFillRuntimeOwner:
                 'execution_contract': dict(execution_contract),
             }
             return {
+                'response_id': current_payload.get('id'),
                 'capability': 'chat',
                 'branch_id': str(
                     execution_contract.get('branch_id')
@@ -17064,6 +19517,7 @@ class LateFillRuntimeOwner:
             )
         )
         return {
+            'response_id': current_payload.get('id'),
             'capability': expected_capability,
             'branch_id': str((execution_contract or {}).get('branch_id') or effective_data.get('branch_id') or '').strip() or None,
             'phase_id': str((execution_contract or {}).get('phase_id') or effective_data.get('phase_id') or '').strip() or None,
@@ -17275,26 +19729,26 @@ class LateFillRuntimeOwner:
         ).strip()
         runtime_bundle_dir: Optional[Path] = None
         if any(not target_path for _, _, _, target_path, _ in prepared_outputs):
+            response_identity = str(
+                effective_data.get('response_id')
+                or plan.get('response_id')
+                or plan.get('branch_id')
+                or ''
+            ).strip()
             bundle_identity = '|'.join(
                 [
-                    str(plan.get('branch_id') or ''),
-                    str(effective_data.get('response_id') or ''),
-                    ','.join(
+                    response_identity,
+                    ','.join(sorted(
                         f'{source_name}.{extension}'
                         for _, extension, source_name, _, _ in prepared_outputs
-                    ),
-                    str(time.time_ns()),
+                    )),
                 ]
             )
             bundle_suffix = hashlib.sha256(
                 bundle_identity.encode('utf-8')
             ).hexdigest()[:12]
-            bundle_timestamp = time.strftime(
-                '%Y%m%dT%H%M%SZ',
-                time.gmtime(),
-            )
             runtime_bundle_dir = ARTIFACT_OUTPUTS_DOCUMENTS_DIR / (
-                f'{bundle_timestamp}_external_chat_bundle_{bundle_suffix}'
+                f'external_chat_bundle_{bundle_suffix}'
             )
         runtime_allocated_target_paths: dict[int, Path] = {}
         allocated_filename_owners: dict[str, str] = {}
@@ -17474,8 +19928,61 @@ class LateFillRuntimeOwner:
             ).strip()
         return updated
 
+    @observe_call('late_fill.execute_prepared_late_fill_branch',
+                  record_kind='materialization_invocation', target=lambda a: exact_target(a['plan']),
+                  inputs=lambda a: {'contract': select_fields(a['plan'], ('branch_id', 'phase_id', 'capability', 'depends_on'))},
+                  context=lambda a: {
+                      source: select_fields(a['plan'].get(source), (
+                          'semantic_review_lens', 'semantic_role_id', 'review_type',
+                          'semantic_depth', 'structural_granularity', 'scope',
+                          'attention_target', 'controlled_attention_frame_id',
+                      )) for source in ('branch', 'infer_payload', 'effective_data')
+                  }, result=judgment_summary)
     def execute_prepared_late_fill_branch(self, plan: dict[str, Any]) -> dict[str, Any]:
         infer_payload = plan.get('infer_payload') if isinstance(plan.get('infer_payload'), dict) else {}
+        saved_execution = copy.deepcopy(plan.get('execution_contract') or {})
+        saved_contract = saved_file_dependency_contract(saved_execution)
+        saved_read = copy.deepcopy(saved_execution.get('saved_file_read_evidence') or {})
+        if saved_contract:
+            if (plan.get('instance') or {}).get('target_kind') == 'external':
+                raise ValueError('saved_file_read_external_transport_unsupported')
+            if (any(saved_execution.get(key) != saved_contract.get('consumer_' + key)
+                    or plan.get(key) != saved_execution.get(key) for key in ('branch_id', 'phase_id'))
+                    or saved_execution.get('depends_on') != [saved_contract.get('producer_phase_id')]):
+                raise ValueError('saved_file_read_consumer_contract_mismatch')
+            expected_ref = {'kind': 'saved_file_read', **{key: value for key, value in saved_read.items() if key != 'utf8_base64'}}
+            if (saved_execution.get('input_refs') != [expected_ref]
+                    or not plan.get('response_id') or plan['response_id'] != saved_read.get('response_id')):
+                raise ValueError('saved_file_read_input_binding_mismatch')
+            fresh = read_saved_file_snapshot(saved_read.get('path', ''), self.resolve_saved_file_input_path)
+            if any(fresh.get(key) != saved_read.get(key) for key in ('path', 'utf8_base64', 'sha256', 'size_bytes')):
+                raise ValueError('saved_file_read_version_changed_before_consumption')
+            if any(saved_read.get(key) != saved_contract.get(key) for key in
+                   ('producer_branch_id', 'producer_phase_id', 'consumer_branch_id', 'consumer_phase_id')):
+                raise ValueError('saved_file_read_packet_misbound')
+            # Feed the exact reverified packet. No root/history/selected file
+            # context may replace or augment this explicitly bounded input.
+            infer_payload = dict(infer_payload)
+            for key in ('messages', 'context_messages', 'history', 'file_path', 'file_paths',
+                        'selected_reference_artifacts', 'reference_artifacts', 'input_artifacts'):
+                infer_payload.pop(key, None)
+            expected_prompt = saved_file_consumer_prompt(saved_contract, saved_read)
+            submitted_input_sha256 = hashlib.sha256(expected_prompt.encode('utf-8')).hexdigest()
+            if infer_payload.get('prompt') != expected_prompt:
+                raise ValueError('saved_file_read_prepared_input_changed')
+            requested_outputs = infer_payload.get('text_artifact_requests') or []
+            if requested_outputs and (len(requested_outputs) != 1 or any(
+                    requested_outputs[0].get(key) != saved_contract['consumer_request'].get(key)
+                    for key in ('extension', 'source_name', 'target_path'))):
+                raise ValueError('saved_file_read_consumer_output_scope_changed')
+            infer_payload['_prompt_hint'] = saved_contract['consumer_instruction']
+            infer_payload['text_artifact_requests'] = [dict(saved_contract['consumer_request'])]
+            infer_payload['artifact_request'] = dict(saved_execution['artifact_request'])
+            infer_payload['suppress_reference_file_context'] = True
+            infer_payload['content_payload'] = saved_file_read_text(saved_read)
+            infer_payload['content_payload_source'] = 'saved_file_read'
+            infer_payload['input_refs'] = [{'kind': 'saved_file_read', **{
+                key: value for key, value in saved_read.items() if key != 'utf8_base64'}}]
         semantic_review_execution = self._is_semantic_review_branch(
             plan,
             infer_payload,
@@ -17513,7 +20020,19 @@ class LateFillRuntimeOwner:
             if isinstance(plan.get('route_info'), Mapping)
             else {}
         )
-        if str(
+        retained_alias_contract = self._retained_input_alias_contract_from_plan(plan)
+        if retained_alias_contract:
+            infer_result = self._materialize_retained_input_alias(
+                plan,
+                retained_alias_contract,
+            )
+            route_info = {
+                **route_info,
+                'route_source': 'deterministic_retained_input_alias',
+                'capability': 'chat',
+                'instance_id': 'ollmo-retained-input-alias',
+            }
+        elif str(
             late_fill_instance.get('target_kind') or ''
         ).strip().lower() == 'external':
             if (
@@ -17671,6 +20190,29 @@ class LateFillRuntimeOwner:
             if obligation_id not in (None, '', [], {}):
                 infer_result.setdefault('obligation_id', obligation_id)
                 infer_result.setdefault('output_obligation_ref', dict(output_obligation_ref))
+        saved_request = saved_execution.get('artifact_request') or {}
+        if saved_contract or saved_request.get('saved_file_producer'):
+            path = str(infer_result.get('saved_text_path') or '')
+            if (not path or Path(path).suffix.lower() != '.' + saved_request.get('extension', '')
+                    or (saved_request.get('target_path') and Path(path).resolve() != Path(saved_request['target_path']).resolve())):
+                raise ValueError('saved_file_output_target_mismatch')
+            saved_outputs = infer_result.get('saved_text_artifacts') or []
+            if len(saved_outputs) > 1 or any(item.get('path') != path for item in saved_outputs):
+                raise ValueError('saved_file_output_ambiguous')
+            output_record = saved_outputs[0] if saved_outputs else {'path': path}
+            if not self._saved_text_artifact_matches_request(output_record, saved_request):
+                raise ValueError('saved_file_output_request_mismatch')
+            snapshot = read_saved_file_snapshot(path, self.resolve_saved_file_input_path)
+            infer_result = dict(infer_result)
+            infer_result['execution_contract'] = saved_execution
+            infer_result['artifact_request'] = copy.deepcopy(saved_request)
+            infer_result['saved_file_output_snapshot'] = {key: snapshot[key] for key in ('path', 'sha256', 'size_bytes')}
+            if saved_contract:
+                infer_result['saved_file_consumption_evidence'] = {
+                    'status': 'consumed', 'contract': saved_contract, 'read': saved_read,
+                    'input_sha256': submitted_input_sha256,
+                    'output': dict(infer_result['saved_file_output_snapshot']),
+                }
         if (
             self._is_semantic_review_branch(
                 plan,
@@ -17804,7 +20346,10 @@ class LateFillRuntimeOwner:
             or failed_instance_id
             or ''
         ).strip() or None
-        if capability == self.capability_text_to_speech:
+        if capability in {
+            self.capability_text_to_speech,
+            self.capability_image_generation,
+        }:
             # A retry-wave envelope carries the anchor's recovery markers.
             # TTS branch markers remain authoritative so sibling retries do
             # not inherit the anchor identity during the narrow reuse policy.
@@ -17833,6 +20378,9 @@ class LateFillRuntimeOwner:
             'batch_prompts_source',
             'batch_prompt_source_phase_id',
             'batch_prompt_expected_count',
+            'batch_prompt_expected_count_invalid',
+            'batch_prompt_actual_count',
+            'counted_batch_prompt_carriers_blocked',
             'requires_artifact',
             'text_artifact_extension',
             'text_artifact_source_name',
@@ -17846,6 +20394,12 @@ class LateFillRuntimeOwner:
             'text_artifact_revision_preservation_policy',
             'text_artifact_requests',
             'artifact_request',
+            'retained_input_alias_required',
+            'retained_input_binding_state',
+            'retained_input_source_path',
+            'retained_input_source_name',
+            'retained_input_target_name',
+            'retained_input_candidate_count',
             'lang_code',
             'voice',
             'instruct',
@@ -17871,6 +20425,9 @@ class LateFillRuntimeOwner:
             'auto_executable_repair_max_attempts',
             'repair_auto_execute_max_attempts',
             'max_auto_execute_attempts',
+            'excluded_instance_ids',
+            'excluded_reuse_policy_id',
+            'automatic_follow_up_allowed',
         ):
             value = branch.get(key)
             if value not in (None, '', [], {}):
@@ -17956,9 +20513,6 @@ class LateFillRuntimeOwner:
             and str(item.get('kind') or '').strip().startswith('selected_reference')
             for item in selected_reference_dependency_refs
         )
-        branch_local_image_prompt_source = str(
-            branch_gap.get('artifact_prompt_source') or ''
-        ).strip()
         branch_local_image_prompt_sources = {
             'semantic_batch_prompt',
             'semantic_batch_prompts',
@@ -17973,28 +20527,34 @@ class LateFillRuntimeOwner:
             'request_prompt_image_slots',
             'current_turn_explicit_image_manifest',
         }
-        if (
-            capability == self.capability_image_generation
-            and str(branch_gap.get('artifact_prompt') or '').strip()
-            and branch_local_image_prompt_source in branch_local_image_prompt_sources
-            and not has_explicit_selected_reference_dependency
-        ):
-            # Ambient selected-reply context is not execution authority for an
-            # already focused branch-local prompt. Image edits that truly need
-            # a selected reference opt in through an explicit dependency edge.
-            branch_gap['suppress_reference_file_context'] = True
-            branch_gap['selected_reference_prompt_policy'] = (
-                'suppressed_for_current_turn_branch_prompt'
-                if branch_local_image_prompt_source
-                in {
-                    'current_turn_direct_image_clause',
-                    'current_turn_explicit_image_manifest',
-                }
-                else 'suppressed_for_branch_local_image_prompt'
+        counted_image_prompt_authority_sources = (
+            branch_local_image_prompt_sources
+            - {'focused_image_prompt_slot', 'focused_content_payload'}
+        )
+        expected_image_prompt_count = (
+            self._image_prompt_batch_expected_count(
+                branch=branch,
+                branch_gap=branch_gap,
+                current_payload=current_payload,
             )
-        image_prompt_allows_batch_override = (
+            if capability == self.capability_image_generation
+            else 0
+        )
+        current_image_prompt_source = str(
+            branch.get('artifact_prompt_source')
+            or branch_gap.get('artifact_prompt_source')
+            or ''
+        ).strip()
+        image_prompt_allows_batch_override = bool(
             capability == self.capability_image_generation
-            and self._image_branch_prompt_allows_batch_prompt_override(branch, branch_gap)
+            and (
+                self._image_branch_prompt_allows_batch_prompt_override(branch, branch_gap)
+                or (
+                    expected_image_prompt_count >= 2
+                    and current_image_prompt_source
+                    not in counted_image_prompt_authority_sources
+                )
+            )
         )
         if (
             capability == self.capability_image_generation
@@ -18008,6 +20568,77 @@ class LateFillRuntimeOwner:
             if len(request_prompt_units) >= 2:
                 branch_gap['batch_prompts'] = request_prompt_units
                 branch_gap['batch_prompts_source'] = 'request_prompt_image_slots'
+        if capability == self.capability_image_generation and image_prompt_allows_batch_override:
+            expected_prompt_count = expected_image_prompt_count
+            batch_prompts: list[str] = []
+            if isinstance(branch_gap.get('batch_prompts'), list):
+                batch_prompts = self._normalize_late_fill_image_batch_prompts(
+                    branch_gap.get('batch_prompts'),
+                    expected_count=expected_prompt_count,
+                    assistant_message='' if successor_branch_execution else assistant_message,
+                    content_payload=branch_gap.get('content_payload'),
+                    request_payload={} if successor_branch_execution else request_payload,
+                    artifact_prompt=branch_gap.get('artifact_prompt'),
+                )
+            if batch_prompts and batch_prompts != branch_gap.get('batch_prompts'):
+                branch_gap['batch_prompts'] = batch_prompts
+                branch_gap['batch_prompts_normalized'] = True
+            non_empty_prompt_count = len(
+                [item for item in batch_prompts if str(item or '').strip()]
+            )
+            if expected_prompt_count >= 2:
+                branch_gap['batch_prompt_expected_count'] = expected_prompt_count
+                branch_gap['batch_prompt_actual_count'] = non_empty_prompt_count
+            exact_counted_batch = bool(
+                expected_prompt_count < 2
+                or (
+                    len(batch_prompts) == expected_prompt_count
+                    and non_empty_prompt_count == expected_prompt_count
+                )
+            )
+            selection_index = self._branch_prompt_selection_index(
+                branch,
+                len(batch_prompts),
+            )
+            if exact_counted_batch and 1 <= selection_index <= len(batch_prompts):
+                branch_gap['artifact_prompt'] = batch_prompts[selection_index - 1]
+                branch_gap['artifact_prompt_source'] = (
+                    str(branch_gap.get('batch_prompts_source') or '').strip()
+                    or 'semantic_batch_prompt'
+                )
+                branch_gap['image_prompt_selection_index'] = selection_index
+            elif expected_prompt_count >= 2 or batch_prompts:
+                branch_gap.pop('artifact_prompt', None)
+                branch_gap.pop('artifact_prompt_source', None)
+                branch_gap['branch_contract_error'] = 'incomplete_image_prompt_batch'
+                branch_gap['candidate_extraction_issue'] = (
+                    'missing_exact_branch_local_image_prompt_batch'
+                    if not exact_counted_batch
+                    else 'missing_branch_local_image_prompt_slot'
+                )
+                branch_gap['materialization_blocked'] = True
+                branch_gap['repair_action'] = RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT
+        branch_local_image_prompt_source = str(
+            branch_gap.get('artifact_prompt_source') or ''
+        ).strip()
+        if (
+            capability == self.capability_image_generation
+            and str(branch_gap.get('artifact_prompt') or '').strip()
+            and branch_local_image_prompt_source in branch_local_image_prompt_sources
+            and not has_explicit_selected_reference_dependency
+        ):
+            # Apply attachment policy only after the final branch prompt has
+            # been selected. Explicit image-edit dependencies remain admitted.
+            branch_gap['suppress_reference_file_context'] = True
+            branch_gap['selected_reference_prompt_policy'] = (
+                'suppressed_for_current_turn_branch_prompt'
+                if branch_local_image_prompt_source
+                in {
+                    'current_turn_direct_image_clause',
+                    'current_turn_explicit_image_manifest',
+                }
+                else 'suppressed_for_branch_local_image_prompt'
+            )
         branch_gap = self.attach_execution_contract_to_gap(
             branch,
             branch_gap,
@@ -18039,41 +20670,6 @@ class LateFillRuntimeOwner:
             branch_gap['suppress_image_state_enrichment'] = True
             branch_gap['suppress_generated_image_enrichment'] = True
             branch_gap.setdefault('image_state_enrichment_suppression_reason', 'required_artifact_closure_priority')
-        if (
-            capability == self.capability_image_generation
-            and image_prompt_allows_batch_override
-            and isinstance(branch_gap.get('batch_prompts'), list)
-        ):
-            expected_prompt_count = self._image_prompt_batch_expected_count(
-                branch=branch,
-                branch_gap=branch_gap,
-                current_payload=current_payload,
-            )
-            batch_prompts = self._normalize_late_fill_image_batch_prompts(
-                branch_gap.get('batch_prompts'),
-                expected_count=expected_prompt_count,
-                assistant_message='' if successor_branch_execution else assistant_message,
-                content_payload=branch_gap.get('content_payload'),
-                request_payload={} if successor_branch_execution else request_payload,
-                artifact_prompt=branch_gap.get('artifact_prompt'),
-            )
-            if batch_prompts and batch_prompts != branch_gap.get('batch_prompts'):
-                branch_gap['batch_prompts'] = batch_prompts
-                branch_gap['batch_prompts_normalized'] = True
-            selection_index = self._branch_prompt_selection_index(branch, len(batch_prompts))
-            if 1 <= selection_index <= len(batch_prompts):
-                branch_gap['artifact_prompt'] = batch_prompts[selection_index - 1]
-                branch_gap['artifact_prompt_source'] = (
-                    str(branch_gap.get('batch_prompts_source') or '').strip()
-                    or 'semantic_batch_prompt'
-                )
-                branch_gap['image_prompt_selection_index'] = selection_index
-            elif batch_prompts:
-                branch_gap.pop('artifact_prompt', None)
-                branch_gap['branch_contract_error'] = 'incomplete_image_prompt_batch'
-                branch_gap['candidate_extraction_issue'] = 'missing_branch_local_image_prompt_slot'
-                branch_gap['materialization_blocked'] = True
-                branch_gap['repair_action'] = RECOVERY_ACTION_REPAIR_BRANCH_CONTRACT
         return {
             'branch_id': branch_id,
             'phase_id': str(branch.get('phase_id') or branch_id).strip() or branch_id,
@@ -19225,6 +21821,11 @@ class LateFillRuntimeOwner:
                 return True
         return False
 
+    @observe_request
+    @observe_call('late_fill.complete_response_late_fill',
+                  target=lambda a: {'response_id': a['response_payload'].get('id')},
+                  inputs=lambda a: {'trigger': a['artifact_gap'].get('trigger')})
+    @observe_transition('late_fill.worker', target=lambda a: {'response_id': a['response_payload'].get('id')})
     def complete_response_late_fill(
         self,
         *,
@@ -19253,7 +21854,8 @@ class LateFillRuntimeOwner:
         failed_branches: list[str] = []
         cancelled_branches: list[str] = []
         try:
-            existing_record = self.get_response_lookup_record(response_id) or {}
+            with transition_span('late_fill.initial_lookup', target={'response_id': response_id}):
+                existing_record = self.get_response_lookup_record(response_id) or {}
             recovered_payload = (
                 existing_record.get('response_payload')
                 if isinstance(existing_record.get('response_payload'), Mapping)
@@ -19372,6 +21974,12 @@ class LateFillRuntimeOwner:
                 if not branch_id or not capability:
                     return
                 normalized_branch = dict(branch)
+                removed_wait = normalized_branch.pop('availability_wait', None)
+                if isinstance(removed_wait, Mapping):
+                    causal_event('late_fill.availability', 'wait_settled',
+                        target=exact_target(branch), status=status,
+                        wait_id=(removed_wait.get('causal') or {}).get('wait_id'),
+                        predicate='availability_poll_due', gates_complete=False)
                 normalized_branch['branch_id'] = branch_id
                 normalized_branch['phase_id'] = str(branch.get('phase_id') or branch_id).strip() or branch_id
                 normalized_branch['capability'] = capability
@@ -19394,6 +22002,12 @@ class LateFillRuntimeOwner:
                     records.append(normalized_branch)
                 if branch_id not in record_ids:
                     record_ids.append(branch_id)
+                causal_event('late_fill.branch_state', 'state_transition',
+                    target=exact_target(branch), status=status,
+                    runtime_state_delta={'status_before': branch.get('status'),
+                                         'status_after': normalized_branch.get('status')},
+                    attempt=select_fields(attempt, ('attempt', 'attempt_count', 'instance_id', 'code')),
+                    outcome_ref=exact_target(normalized_branch))
 
             def _final_lookup_status_for_late_fill(final_status: str) -> str:
                 normalized = str(final_status or '').strip().lower()
@@ -19737,6 +22351,28 @@ class LateFillRuntimeOwner:
                     active_branches,
                     artifact_gap=artifact_gap,
                 )
+                eligible_branches = [
+                    branch for branch in active_branches
+                    if self.availability_wait_delay(branch) <= 0
+                ]
+                if not eligible_branches and active_branches:
+                    # This response worker holds no backend/device lock here.
+                    # Re-enter the execution gate frequently for cancellation;
+                    # route preparation is retried only when its poll is due.
+                    time.sleep(min(1.0, min(self.availability_wait_delay(branch) for branch in active_branches)))
+                    continue
+                for eligible in eligible_branches:
+                    retained_wait = eligible.get('availability_wait') or {}
+                    wait_identity = retained_wait.get('causal') or {}
+                    if wait_identity.get('wait_id'):
+                        causal_event('late_fill.availability', 'wait_wake',
+                            target=exact_target(eligible), wait_id=wait_identity['wait_id'],
+                            predicate='availability_poll_due', predicate_satisfied=True,
+                            next_check_epoch=retained_wait.get('next_check_epoch'),
+                            required_rule='late_fill_availability_poll', gates_complete=False,
+                            wake_reason='existing_poll_clock_recheck',
+                            route_eligibility='not_yet_revalidated')
+                active_branches = eligible_branches
                 active_capabilities = self.normalize_capability_list(
                     [self.branch_capability(branch) for branch in active_branches if self.branch_capability(branch)]
                 )
@@ -19770,12 +22406,13 @@ class LateFillRuntimeOwner:
                     value = current_late_fill.get(key) if isinstance(current_late_fill, Mapping) else None
                     if value not in (None, '', [], {}):
                         running_state_extra[key] = value
-                running_late_fill = self.build_late_fill_state(
-                    active_gap,
-                    status='running',
-                    prior_state=current_late_fill,
-                    extra=running_state_extra,
-                )
+                with transition_span('late_fill.running_state_build', target={'response_id': response_id}):
+                    running_late_fill = self.build_late_fill_state(
+                        active_gap,
+                        status='running',
+                        prior_state=current_late_fill,
+                        extra=running_state_extra,
+                    )
                 current_payload = self.attach_late_fill_state(current_payload, running_late_fill)
                 self.touch_response_lookup(
                     response_id,
@@ -19790,77 +22427,84 @@ class LateFillRuntimeOwner:
                     branch_id = self.branch_id(event)
                     if not branch_id:
                         return
-                    status = str(event.get('status') or '').strip().lower()
-                    progress_record: dict[str, Any] = {
-                        'branch_id': branch_id,
-                        'phase_id': str(event.get('phase_id') or branch_id).strip() or branch_id,
-                        'capability': self.normalize_capability(event.get('capability')),
-                        'status': status or 'running',
-                        'progress_stage': str(event.get('progress_stage') or 'branch_execution').strip(),
-                        'updated_at': self.response_registry_now_iso(),
-                    }
-                    instance_id = str(event.get('instance_id') or '').strip()
-                    if instance_id:
-                        progress_record['instance_id'] = instance_id
-                    timing = event.get('timing') if isinstance(event.get('timing'), Mapping) else {}
-                    if timing:
-                        progress_record['timing'] = {
-                            key: value
-                            for key, value in dict(timing).items()
-                            if value not in (None, '', [], {})
+                    callback_target = {'response_id': response_id, **exact_target(event)}
+                    with transition_span('late_fill.callback.progress_record', target=callback_target):
+                        status = str(event.get('status') or '').strip().lower()
+                        progress_record: dict[str, Any] = {
+                            'branch_id': branch_id,
+                            'phase_id': str(event.get('phase_id') or branch_id).strip() or branch_id,
+                            'capability': self.normalize_capability(event.get('capability')),
+                            'status': status or 'running',
+                            'progress_stage': str(event.get('progress_stage') or 'branch_execution').strip(),
+                            'updated_at': self.response_registry_now_iso(),
                         }
-                    error = event.get('error') if isinstance(event.get('error'), Mapping) else {}
-                    if error:
-                        progress_record['error'] = {
-                            key: value
-                            for key, value in dict(error).items()
-                            if value not in (None, '', [], {})
+                        instance_id = str(event.get('instance_id') or '').strip()
+                        if instance_id:
+                            progress_record['instance_id'] = instance_id
+                        timing = event.get('timing') if isinstance(event.get('timing'), Mapping) else {}
+                        if timing:
+                            progress_record['timing'] = {
+                                key: value
+                                for key, value in dict(timing).items()
+                                if value not in (None, '', [], {})
+                            }
+                        error = event.get('error') if isinstance(event.get('error'), Mapping) else {}
+                        if error:
+                            progress_record['error'] = {
+                                key: value
+                                for key, value in dict(error).items()
+                                if value not in (None, '', [], {})
+                            }
+                    with transition_span('late_fill.callback.lookup',
+                                         target=callback_target,
+                                         hydration_scope='included_if_existing_lookup_hydrates'):
+                        latest_record = self.get_response_lookup_record(response_id) or {}
+                    with transition_span('late_fill.callback.state_build', target=callback_target):
+                        latest_payload = (
+                            latest_record.get('response_payload')
+                            if isinstance(latest_record.get('response_payload'), dict)
+                            else current_payload
+                        )
+                        latest_late_fill = (
+                            dict(latest_payload.get('late_fill'))
+                            if isinstance(latest_payload.get('late_fill'), dict)
+                            else dict(running_late_fill)
+                        )
+                        branch_progress = [
+                            dict(item)
+                            for item in (latest_late_fill.get('branch_progress') or [])
+                            if isinstance(item, Mapping) and self.branch_id(item) and self.branch_id(item) != branch_id
+                        ]
+                        branch_progress.append(
+                            {
+                                key: value
+                                for key, value in progress_record.items()
+                                if value not in (None, '', [], {})
+                            }
+                        )
+                        terminal_progress_ids = {
+                            self.branch_id(item)
+                            for item in branch_progress
+                            if str(item.get('status') or '').strip().lower()
+                            in {'completed', 'fulfilled', 'failed', 'blocked', 'cancelled', 'waived', 'superseded'}
+                            and self.branch_id(item)
                         }
-                    latest_record = self.get_response_lookup_record(response_id) or {}
-                    latest_payload = (
-                        latest_record.get('response_payload')
-                        if isinstance(latest_record.get('response_payload'), dict)
-                        else current_payload
-                    )
-                    latest_late_fill = (
-                        dict(latest_payload.get('late_fill'))
-                        if isinstance(latest_payload.get('late_fill'), dict)
-                        else dict(running_late_fill)
-                    )
-                    branch_progress = [
-                        dict(item)
-                        for item in (latest_late_fill.get('branch_progress') or [])
-                        if isinstance(item, Mapping) and self.branch_id(item) and self.branch_id(item) != branch_id
-                    ]
-                    branch_progress.append(
-                        {
-                            key: value
-                            for key, value in progress_record.items()
-                            if value not in (None, '', [], {})
-                        }
-                    )
-                    terminal_progress_ids = {
-                        self.branch_id(item)
-                        for item in branch_progress
-                        if str(item.get('status') or '').strip().lower()
-                        in {'completed', 'fulfilled', 'failed', 'blocked', 'cancelled', 'waived', 'superseded'}
-                        and self.branch_id(item)
-                    }
-                    if terminal_progress_ids:
-                        for key in ('active_branches', 'pending_branches'):
-                            latest_late_fill[key] = [
-                                dict(branch)
-                                for branch in self.normalize_late_fill_branches(latest_late_fill.get(key))
-                                if self.branch_id(branch) not in terminal_progress_ids
-                            ]
-                    latest_late_fill['branch_progress'] = branch_progress
-                    updated_payload = dict(latest_payload)
-                    updated_payload = self.attach_late_fill_state(updated_payload, latest_late_fill)
-                    self.touch_response_lookup(
-                        response_id,
-                        output_text=str(updated_payload.get('output_text') or ''),
-                        response_payload=updated_payload,
-                    )
+                        if terminal_progress_ids:
+                            for key in ('active_branches', 'pending_branches'):
+                                latest_late_fill[key] = [
+                                    dict(branch)
+                                    for branch in self.normalize_late_fill_branches(latest_late_fill.get(key))
+                                    if self.branch_id(branch) not in terminal_progress_ids
+                                ]
+                        latest_late_fill['branch_progress'] = branch_progress
+                        updated_payload = dict(latest_payload)
+                        updated_payload = self.attach_late_fill_state(updated_payload, latest_late_fill)
+                    with transition_span('late_fill.callback.publication', target=callback_target):
+                        self.touch_response_lookup(
+                            response_id,
+                            output_text=str(updated_payload.get('output_text') or ''),
+                            response_payload=updated_payload,
+                        )
 
                 branch_results: dict[str, dict[str, Any]] = {}
                 preblocked_branch_errors: dict[str, dict[str, Any]] = {}
@@ -20148,6 +22792,10 @@ class LateFillRuntimeOwner:
                         cancelled_branches = [self.branch_id(item) for item in cancelled_branch_records if self.branch_id(item)]
                     post_execution_decision = self.semantic_execution_gate_decision(branch, gate_payload)
                     if str(post_execution_decision.get('action') or '').strip().lower() == 'skip':
+                        causal_event('late_fill.result_gate', 'result_disposition',
+                            target=exact_target(branch), stale_result_disposition='ignored',
+                            judgment=judgment_summary(post_execution_decision),
+                            required_rule='semantic_execution_gate_current_branch_v1')
                         gated_branch = self.branch_record_with_execution_gate(branch, post_execution_decision)
                         _remember_branch(
                             cancelled_branch_records,
@@ -20285,6 +22933,16 @@ class LateFillRuntimeOwner:
                             error=error_payload,
                             attempt=attempt_payload,
                         )
+                        waiting_branch = self.build_availability_wait_branch(branch, error=error_payload)
+                        if waiting_branch:
+                            retry_branch_replacements[branch_id] = waiting_branch
+                            branch_errors.pop(branch_id, None)
+                            self.log_unified_event(
+                                category='responses', action='late_fill', status='waiting',
+                                response_id=response_id, capability=capability,
+                                message='Artifact work is waiting for a compatible live instance to leave cooldown.',
+                            )
+                            continue
                         recovery_state = self.late_fill_recovery_state(
                             branch,
                             recovery_context=recovery_context,
@@ -20307,6 +22965,8 @@ class LateFillRuntimeOwner:
                                 status='queued',
                                 response_id=response_id,
                                 capability=capability,
+                                branch_id=branch_id, phase_id=branch.get('phase_id'),
+                                attempt=select_fields(attempt_payload, ('attempt', 'attempt_count', 'instance_id', 'code')),
                                 message='Retryable auto-executable repair branch requeued after failed materialization attempt.',
                             )
                             continue
@@ -20562,6 +23222,8 @@ class LateFillRuntimeOwner:
                                 status='queued',
                                 response_id=response_id,
                                 capability=capability,
+                                branch_id=branch_id, phase_id=branch.get('phase_id'),
+                                attempt=select_fields(attempt_payload, ('attempt', 'attempt_count', 'instance_id', 'code')),
                                 message='Retryable auto-executable text artifact repair requeued after saved-truth failure.',
                             )
                             continue
@@ -20625,6 +23287,7 @@ class LateFillRuntimeOwner:
                         'excluded_instance_reuse_reason',
                         'excluded_instance_reuse_instance_id',
                         'excluded_instance_reuse_recovery_trigger',
+                        'excluded_reuse_policy_id',
                         'external_execution',
                     ):
                         value = late_fill_route_runtime.get(key)
@@ -20710,6 +23373,8 @@ class LateFillRuntimeOwner:
                             fill_record['content_payload'] = result_text
                             fill_record['content_payload_source'] = 'late_fill_infer_result'
                     for key in (
+                        'saved_file_output_snapshot',
+                        'saved_file_consumption_evidence',
                         'saved_text_path',
                         'saved_text_artifacts',
                         'text_artifact_requests',
@@ -20827,6 +23492,10 @@ class LateFillRuntimeOwner:
                         next_pending_branch_by_id.get(self.branch_id(branch)),
                     )
                     for branch in next_active_branches
+                ]
+                next_active_branches = [
+                    branch for branch in next_active_branches
+                    if self.availability_wait_delay(branch) <= 0
                 ]
                 next_active_capabilities = self.normalize_capability_list(
                     [self.branch_capability(branch) for branch in next_active_branches if self.branch_capability(branch)]
@@ -21205,6 +23874,11 @@ class LateFillRuntimeOwner:
         except Exception:  # noqa: BLE001
             logging.exception('Could not schedule post-response substrate hygiene.')
 
+    @observe_call('late_fill.schedule_response_late_fill',
+                  target=lambda a: {'response_id': a['response_payload'].get('id')},
+                  result=lambda value: {'scheduled': value})
+    @observe_transition('late_fill.schedule', target=lambda a: {'response_id': a['response_payload'].get('id')},
+                        result=lambda value: {'schedule_return_value': value})
     def schedule_response_late_fill(
         self,
         *,
@@ -21223,16 +23897,18 @@ class LateFillRuntimeOwner:
             self.release_response_late_fill(response_id)
             return True
         target = complete_response_late_fill or self.complete_response_late_fill
-        worker = threading.Thread(
-            target=target,
-            kwargs={
-                'response_payload': dict(response_payload or {}),
-                'request_payload': dict(request_payload or {}),
-                'assistant_message': str(assistant_message or '').strip(),
-                'artifact_gap': dict(artifact_gap or {}),
-                'source_route_payload': dict(source_route_payload or {}) if isinstance(source_route_payload, dict) else None,
-            },
-            daemon=True,
-        )
-        worker.start()
+        with transition_binding(transition_attempt({'response_id': response_id})):
+            worker = threading.Thread(
+                target=traced_thread_target(target),
+                kwargs={
+                    'response_payload': dict(response_payload or {}),
+                    'request_payload': dict(request_payload or {}),
+                    'assistant_message': str(assistant_message or '').strip(),
+                    'artifact_gap': dict(artifact_gap or {}),
+                    'source_route_payload': dict(source_route_payload or {}) if isinstance(source_route_payload, dict) else None,
+                },
+                daemon=True,
+            )
+            with transition_span('late_fill.worker_submission', target={'response_id': response_id}):
+                worker.start()
         return True

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.events import observe_call, exact_target, judgment_summary
+
 from collections.abc import Mapping, Sequence
 import copy
 import hashlib
@@ -1300,6 +1302,12 @@ def build_graph_repair_proposals_from_runtime_evidence(
     return unique
 
 
+@observe_call('graph_repair.validate_graph_repair_proposal',
+              target=lambda a: exact_target(a['proposal']),
+              inputs=lambda a: {'proposal_identity': exact_target(a['proposal']),
+                                'evidence_refs': a['proposal'].get('evidence_refs')},
+              evidence=lambda a: a['proposal'].get('evidence_refs'),
+              result=judgment_summary)
 def validate_graph_repair_proposal(
     proposal: Mapping[str, Any],
     *,

@@ -366,6 +366,12 @@ def compact_lookup_branch(item: Any) -> dict[str, Any]:
     depends_on = item.get('depends_on')
     if isinstance(depends_on, list) and depends_on:
         compact['depends_on_count'] = len(depends_on)
+    wait = item.get('availability_wait')
+    if isinstance(wait, Mapping) and wait.get('status') == 'waiting':
+        compact['progress_stage'] = 'availability_wait'
+        compact['wait_reason'] = str(wait.get('reason') or '')[:128]
+        if isinstance(wait.get('next_check_epoch'), (int, float)):
+            compact['next_check_epoch'] = wait['next_check_epoch']
     return compact
 
 

@@ -6,9 +6,12 @@ from collections.abc import Mapping, Sequence
 import copy
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 REDRAW_SCOPE_REVIEW_KIND = 'ollmo.redraw_scope_ladder_review'
+_ARTIFACT_PATH_ROOT = Path(__file__).resolve().parent.parent
 
 SCOPE_LADDER = [
     'observe',
@@ -192,6 +195,44 @@ def _artifact_type(record: Mapping[str, Any]) -> str:
     return _status(record.get('type') or record.get('kind') or record.get('output_type'))
 
 
+def _existing_local_artifact_path(path: str) -> str:
+    """Prove a file path relative to Ollmo, without guessing from cwd or hashes."""
+    if not path:
+        return ''
+    try:
+        if urlsplit(path).scheme or path.startswith('//'):
+            return ''
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = _ARTIFACT_PATH_ROOT / candidate
+        resolved = candidate.resolve(strict=True)
+        return str(resolved) if resolved.is_file() else ''
+    except (OSError, ValueError, RuntimeError):
+        return ''
+
+
+def _artifact_path_alias_metadata(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    aliases: list[dict[str, Any]] = []
+    for record in records:
+        existing = _nested_mapping(record, 'alias_metadata').get('path_aliases') or []
+        if not isinstance(existing, list):
+            existing = []
+        alias = _compact_payload({
+            key: record.get(key)
+            for key in (
+                'artifact_ref', 'ref', 'artifact_id', 'type', 'kind',
+                'path', 'saved_path', 'artifact_path', 'file_path', 'src',
+                'branch_id', 'phase_id', 'output_slot_id', 'slot_id',
+                'source_response_id', 'source_message_id', 'provenance_id',
+                'origin', 'source', 'evidence', 'file_sha256', 'content_sha256',
+            )
+        })
+        for item in [*existing, alias]:
+            if isinstance(item, Mapping) and item and item not in aliases:
+                aliases.append(_json_safe(item))
+    return aliases
+
+
 def _document_text_identity_alias_is_proven(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -298,15 +339,31 @@ def canonicalize_duplicate_artifact_refs(artifacts: Sequence[Any]) -> dict[str, 
         duplicate_refs.append(ref)
         canonicalization_required = True
         paths = {_artifact_path(record) for record in records if _artifact_path(record)}
+        identity_records = records
+        identity_paths = paths
+        proven_path_alias = False
+        if len(paths) > 1:
+            resolved_paths = [
+                _existing_local_artifact_path(_artifact_path(record))
+                for record in records
+            ]
+            if all(resolved_paths) and len(set(resolved_paths)) == 1:
+                # Compare physical path identity, but keep original paths and
+                # their ownership/provenance in the returned artifact records.
+                identity_paths = set(resolved_paths)
+                identity_records = [
+                    dict(record, path=resolved_paths[0]) for record in records
+                ]
+                proven_path_alias = True
         raw_types = {_artifact_type(record) for record in records if _artifact_type(record)}
         identity_types = set(raw_types)
         if _document_text_identity_alias_is_proven(
-            records,
-            paths=paths,
+            identity_records,
+            paths=identity_paths,
             raw_types=raw_types,
         ):
             identity_types = {'text'}
-        if len(paths) > 1 or len(identity_types) > 1:
+        if len(identity_paths) > 1 or len(identity_types) > 1:
             conflicts.append(
                 {
                     'artifact_ref': ref,
@@ -320,6 +377,11 @@ def canonicalize_duplicate_artifact_refs(artifacts: Sequence[Any]) -> dict[str, 
         canonical = copy.deepcopy(records[0])
         canonical['alias_artifact_refs'] = [ref]
         alias_metadata = _merge_alias_metadata(records)
+        if proven_path_alias or any(
+            _nested_mapping(record, 'alias_metadata').get('path_aliases')
+            for record in records
+        ):
+            alias_metadata['path_aliases'] = _artifact_path_alias_metadata(records)
         if alias_metadata:
             canonical['alias_metadata'] = alias_metadata
         canonical_records.append(_json_safe(canonical))
@@ -333,6 +395,97 @@ def canonicalize_duplicate_artifact_refs(artifacts: Sequence[Any]) -> dict[str, 
             'conflicts': conflicts,
         }
     )
+
+
+def _artifact_projection_ref(item: Mapping[str, Any]) -> str:
+    direct = str(item.get('artifact_ref') or item.get('ref') or item.get('artifact_id') or '').strip()
+    if direct:
+        return direct
+    artifacts = item.get('artifacts')
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                continue
+            token = str(
+                artifact.get('artifact_ref')
+                or artifact.get('ref')
+                or artifact.get('artifact_id')
+                or ''
+            ).strip()
+            if token:
+                return token
+    artifact = item.get('artifact') if isinstance(item.get('artifact'), Mapping) else {}
+    return str(
+        artifact.get('artifact_ref')
+        or artifact.get('ref')
+        or artifact.get('artifact_id')
+        or ''
+    ).strip()
+
+
+def _canonical_artifact_aliases(artifacts: Any) -> dict[str, dict[str, Any]]:
+    aliases: dict[str, dict[str, Any]] = {}
+    if not isinstance(artifacts, list):
+        return aliases
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        artifact_ref = _artifact_projection_ref(artifact)
+        if not artifact_ref:
+            continue
+        payload = {}
+        if artifact.get('alias_artifact_refs') not in (None, '', [], {}):
+            payload['alias_artifact_refs'] = artifact.get('alias_artifact_refs')
+        if artifact.get('alias_metadata') not in (None, '', [], {}):
+            payload['alias_metadata'] = artifact.get('alias_metadata')
+        if payload:
+            aliases[artifact_ref] = _json_safe(payload)
+    return aliases
+
+
+def apply_artifact_identity_to_outputs(
+    outputs: Any,
+    *,
+    artifact_identity: Mapping[str, Any],
+    canonical_artifacts: Any,
+) -> list[dict[str, Any]]:
+    """Project one identity adjudication consistently onto public outputs."""
+    if not isinstance(outputs, list):
+        return []
+    identity = artifact_identity if isinstance(artifact_identity, Mapping) else {}
+    if not identity.get('canonicalization_required'):
+        return _json_safe(outputs)
+    alias_by_ref = _canonical_artifact_aliases(canonical_artifacts)
+    conflict_refs = {
+        str(item.get('artifact_ref') or '').strip()
+        for item in (identity.get('conflicts') or [])
+        if isinstance(item, Mapping) and str(item.get('artifact_ref') or '').strip()
+    }
+    projected: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for item in outputs:
+        if not isinstance(item, Mapping):
+            continue
+        payload = dict(item)
+        artifact_ref = _artifact_projection_ref(payload)
+        if artifact_ref in conflict_refs:
+            if artifact_ref in seen_refs:
+                continue
+            seen_refs.add(artifact_ref)
+            payload['artifact_ref'] = artifact_ref
+            payload['status'] = 'repair_needed'
+            payload['blocked_reason'] = 'conflicting_duplicate_artifact_ref'
+            payload['final_projection_blocked'] = True
+            projected.append(_json_safe(payload))
+            continue
+        if artifact_ref:
+            if artifact_ref in seen_refs:
+                continue
+            seen_refs.add(artifact_ref)
+            if artifact_ref in alias_by_ref:
+                payload.update(alias_by_ref[artifact_ref])
+        projected.append(_json_safe(payload))
+    return projected
 
 
 def _intent_contract_digest(graph: Mapping[str, Any], response_payload: Mapping[str, Any]) -> str:

@@ -154,6 +154,16 @@ Batch image note:
 - the canonical response returns `results`, flattened `artifacts`, and `batch_count`
 - the Responses tab also accepts an explicit JSON array of prompt strings in the prompt box for this first safe version
 
+Typed artifact requests retain their current-turn scope before candidate and
+obligation construction. An affirmative PNG/JPEG generation request supplies a
+binary-image intent; an affirmative SVG construction request supplies a text
+artifact intent. A wrapped exclusion list such as "do not use Base64 images or
+an SVG/HTML substitute" supplies neither. A ban on additional images does not
+cancel a separately requested image. Independent positive actions after a
+constraint retain their own polarity. These input distinctions do not prove
+execution: capability availability, an HTML image path, or provider prose cannot
+fulfill an image obligation without the normal artifact and materialization gates.
+
 Current preview flow for model-specific requirements:
 
 - `POST /api/ghost_route_preview`

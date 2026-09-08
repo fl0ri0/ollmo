@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
 import threading
 import time
 import uuid
@@ -134,6 +136,18 @@ def _repair_contract_matches_completion(
         for key in identity_keys
         if str(contract.get(key) or '').strip()
     }
+    execution_binding = contract.get('execution_binding')
+    if isinstance(execution_binding, Mapping):
+        contract_id = str(contract.get('contract_id') or '').strip()
+        if (not contract_id
+                or execution_binding.get('contract_id') != contract_id
+                or branch.get('repair_contract_id') != contract_id):
+            return False
+        for key in ('branch_id', 'phase_id'):
+            identity = str(execution_binding.get(key) or '').strip()
+            if not identity:
+                return False
+            contract_identities[key] = identity
     contract_artifact_identity = _repair_contract_artifact_identity(contract)
     artifact_identity_fields = {
         index: value
@@ -157,6 +171,15 @@ def _repair_contract_matches_completion(
             for index, value in artifact_identity_fields.items()
         )
     return True
+
+
+def repair_contract_matches_completion(
+    contract: Mapping[str, Any],
+    branch: Mapping[str, Any],
+) -> bool:
+    """Return whether one exact completed branch satisfies one repair contract."""
+
+    return _repair_contract_matches_completion(contract, branch)
 
 
 def terminal_repair_loop_is_fully_satisfied(
@@ -361,6 +384,19 @@ def _graph_closure_requires_repair(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+def _artifact_output_identity_requires_repair(payload: Mapping[str, Any]) -> bool:
+    outputs = payload.get('outputs')
+    if not isinstance(outputs, list):
+        return False
+    return any(
+        isinstance(output, Mapping)
+        and output.get('final_projection_blocked') is True
+        and output.get('blocked_reason') == 'conflicting_duplicate_artifact_ref'
+        and output.get('status') == 'repair_needed'
+        for output in outputs
+    )
+
+
 def derive_response_lifecycle_state(
     response_payload: Optional[Mapping[str, Any]],
     *,
@@ -442,7 +478,10 @@ def derive_response_lifecycle_state(
     has_current_closure_review = bool(
         _runtime_graph_closure_reviews(payload.get('runtime'))
     )
-    unresolved_closure = _graph_closure_requires_repair(payload)
+    unresolved_closure = (
+        _graph_closure_requires_repair(payload)
+        or _artifact_output_identity_requires_repair(payload)
+    )
     if not live_late_fill_is_active and (
         (
             not has_current_closure_review
@@ -538,6 +577,7 @@ class ResponsesRuntimeOwner:
         for response_id in expired_ids:
             self.response_lookup.pop(response_id, None)
 
+    @observe_state('live_response.register', 'request_or_response', 'live_response_record', labels=('NEW_REPRESENTATION',))
     def register_response_lookup(
         self,
         *,
@@ -574,6 +614,7 @@ class ResponsesRuntimeOwner:
             self.response_lookup[record['id']] = record
             return dict(record)
 
+    @observe_state('live_response.update', 'response_state', 'live_response_record', labels=('NEW_REPRESENTATION',))
     def touch_response_lookup(
         self,
         response_id: str,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ollmo_services.state_flow import observe_state, note as state_flow_note
+
 import datetime as dt
 import hashlib
 import json
@@ -766,6 +768,7 @@ def persist_input_artifact_registry_records(
     return persisted
 
 
+@observe_state('artifact_registry.persist_outputs', 'output_artifact_state', 'artifact_registry_representation', labels=('NEW_AUTHORITY_BOUNDARY', 'NEW_REPRESENTATION'), new_authority_boundary=True)
 def persist_output_artifact_registry_records(
     response_payload: Mapping[str, Any],
     *,
