@@ -138,7 +138,10 @@ def test_regular_spec_and_plan_preserve_saved_input(tmp_path, monkeypatch):
     import ollmo_webserver
     from tests.fake_backends import FakeBackendHarness
     owner, graph, producer, consumer, payload = setup_producer(tmp_path)
-    with FakeBackendHarness():
+    with FakeBackendHarness() as harness:
+        # This test routes through Late Fill to an injected fake transport.
+        # Supply positive fake liveness so the real start gate can admit it.
+        harness.instances['chat']['runtime_status'].update(process_alive=True, port_listening=True)
         runtime = ollmo_webserver._LATE_FILL_RUNTIME
         monkeypatch.setattr(runtime, 'resolve_saved_file_input_path', owner.resolve_saved_file_input_path)
         spec = runtime.build_late_fill_materialization_branch_spec(
@@ -347,6 +350,9 @@ def test_complete_late_fill_executes_save_then_read_consumer(tmp_path, monkeypat
         'late_fill':{'status':'pending', 'pending_branches':branches, 'pending_capabilities':['chat']}}
     calls = []
     with FakeBackendHarness() as harness:
+        # This test routes through Late Fill to an injected fake transport.
+        # Supply positive fake liveness so the real start gate can admit it.
+        harness.instances['chat']['runtime_status'].update(process_alive=True, port_listening=True)
         runtime = ollmo_webserver._LATE_FILL_RUNTIME
         resolver = owner_for(tmp_path).resolve_saved_file_input_path
         monkeypatch.setattr(runtime, 'resolve_saved_file_input_path', resolver)

@@ -1,6 +1,6 @@
 # Known Limitations in Ollmo 0.1.0
 
-This list records current, non-blocking limits of the first release candidate.
+This list records current limits of the first release candidate.
 It is not a roadmap or a general backlog.
 
 ## Platform and Packaging
@@ -33,6 +33,12 @@ It is not a roadmap or a general backlog.
   acceptable only when status and recovery evidence remain truthful.
 - Model output quality and latency are provider-dependent and are not
   deterministic.
+- Ordinary finalizer Artifact Registry/frame-persistence errors are currently
+  logged and swallowed. A successful HTTP response, completed lifecycle or
+  in-memory frame alone does not prove durable commit. Inspect matching durable
+  frame/CAS and saved artifact evidence; Readiness retention is secondary and
+  cannot repair this guarantee. See the
+  [finalization boundary](RESPONSES_CONTRACT.md#finalization-and-durable-completion).
 
 ## Optional ChatGPT Route
 

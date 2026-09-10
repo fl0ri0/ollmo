@@ -1,6 +1,6 @@
 # Ghost Self-Alignment
 
-Status: architecture note plus runtime-visible offline substrate, enabled accepted-learning soft hints, and runtime-evidence graph-repair proposal bridge.
+Status: architecture note covering the offline substrate, explicitly enableable accepted-learning soft hints, and runtime-evidence graph-repair proposal bridge. Actual enablement is runtime state, not a documentation default.
 
 ## Boundary
 
@@ -170,7 +170,7 @@ eval cases
   -> bounded runtime hint, default authority: soft_hint
 ```
 
-Before that explicit enable step is used, accepted learnings are diagnostic state only. In the current enabled checkout, they are readable bounded hints, not hidden live authority.
+Before that explicit enable step is used, accepted learnings are diagnostic state only. When the current snapshot is explicitly enabled, they are readable bounded hints, not hidden live authority. Inspect current snapshot evidence rather than inferring enablement from this document.
 
 The learner now also watches semantic decision, controlled-attention, and surface-state traces:
 

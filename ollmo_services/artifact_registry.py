@@ -441,11 +441,31 @@ def build_generated_image_artifact_registry_record(
 
 
 def _artifact_records_from_response_payload(response_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    frame = response_payload.get('response_frame')
+    if isinstance(frame, Mapping) and frame.get('kind') == 'ollmo.response_frame':
+        response_id = clean_text(response_payload.get('id') or response_payload.get('response_id'))
+        frame_response_id = clean_text(frame.get('response_id'))
+        if response_id and frame_response_id != response_id:
+            raise ValueError('Output artifact registry requires the current response frame')
+        frame_artifacts = frame.get('artifacts')
+        if isinstance(frame_artifacts, Mapping) and isinstance(frame_artifacts.get('output'), list):
+            # Frame construction has already adjudicated public identities. The
+            # top-level projection and last-saved-path shortcuts may predate it.
+            # An empty accepted set is authoritative too; do not resurrect a file.
+            return sanitize_artifact_records(
+                frame_artifacts['output'], include_content=True,
+                content_limit=ARTIFACT_REGISTRY_CONTENT_LIMIT,
+            )
     artifacts = sanitize_artifact_records(
         response_payload.get('artifacts') if isinstance(response_payload.get('artifacts'), list) else [],
         include_content=True,
         content_limit=ARTIFACT_REGISTRY_CONTENT_LIMIT,
     )
+    explicit_paths = {
+        (clean_text(artifact.get('type')), _normalize_path(artifact.get('path')))
+        for artifact in artifacts if artifact.get('path')
+    }
+    explicit_count = len(artifacts)
     saved_text_artifacts = response_payload.get('saved_text_artifacts')
     if isinstance(saved_text_artifacts, list):
         for item in saved_text_artifacts:
@@ -516,7 +536,11 @@ def _artifact_records_from_response_payload(response_payload: Mapping[str, Any])
             artifacts.append(artifact)
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for artifact in artifacts:
+    for index, artifact in enumerate(artifacts):
+        if index >= explicit_count and (
+            clean_text(artifact.get('type')), _normalize_path(artifact.get('path')),
+        ) in explicit_paths:
+            continue
         ref = clean_text(artifact.get('artifact_ref'))
         path = clean_text(artifact.get('path'))
         key = ref or path

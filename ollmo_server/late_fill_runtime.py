@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-from ollmo_services.state_flow import observe_state, note as state_flow_note
+from ollmo_services.state_flow import observe_state
 
 from ollmo_services.artifact_contracts import (
     read_saved_file_snapshot, saved_file_dependency_contract,
     saved_file_consumer_prompt, saved_file_read_text, saved_file_read_issue, saved_file_consumption_issue,
     saved_file_consumption_artifact_issue,
 )
-from ollmo_services.events import (
-    observe_call,
-    observe_transition, transition_span, transition_attempt, transition_binding,
-    observe_request,
-    exact_target,
-    select_fields,
-    judgment_summary,
-    causal_event,
-    traced_thread_target,
+from ollmo_services.events import select_fields, traced_thread_target
+from ollmo_services.late_fill_telemetry import (
+    LateFillTrace,
+    observe_execution_gate,
+    observe_prepared_branch,
+    observe_worker,
+    observe_schedule,
 )
 
 import copy
@@ -3899,21 +3897,11 @@ class LateFillRuntimeOwner:
             'next_check_epoch': now + cls._late_fill_availability_poll_seconds(),
             'check_count': int(previous.get('check_count') or 0) + 1,
         }
-        wait_event = causal_event('late_fill.availability', 'wait_started',
-            target=exact_target(branch), predicate='availability_poll_due',
-            unresolved_state='compatible_route_recheck_due',
-            next_check_epoch=waiting['availability_wait']['next_check_epoch'],
-            producer_instance_ids=evidence.get('candidate_instance_ids'),
-            producer_version=None, gates_complete=False,
-            required_rule='late_fill_availability_poll',
-            previous_wait_id=(previous.get('causal') or {}).get('wait_id'))
-        if wait_event:
-            waiting['availability_wait']['causal'] = {
-                'wait_id': wait_event['event_id'],
-                'next_check_epoch': waiting['availability_wait']['next_check_epoch'],
-                'process_boot_id': wait_event['process_boot_id'],
-                'start_monotonic_ns': wait_event['monotonic_ns'],
-            }
+        wait_causal = LateFillTrace.availability_wait_started(
+            branch, waiting['availability_wait'], previous, evidence,
+        )
+        if wait_causal:
+            waiting['availability_wait']['causal'] = wait_causal
         return waiting
 
     @staticmethod
@@ -4355,23 +4343,7 @@ class LateFillRuntimeOwner:
                 selected['cancel_reason'] = str(branch.get('cancel_reason') or '').strip()
         return selected
 
-    @observe_transition('late_fill.start_check', target=lambda a: exact_target(
-                        a['branch'], 'response_id', 'branch_id', 'phase_id',
-                        'attempt_id', 'attempt_count', 'attempt_number',
-                        'retry_count', 'auto_executable_repair_retry_count'),
-                        result=lambda value: {
-                            'gate_scope': 'semantic_execution_gate_current_branch_v1',
-                            'gate_check_complete': True,
-                            'gate_status': value.get('status'),
-                            'gate_action': value.get('action'),
-                            'aggregate_start_authority': 'not_established_by_this_gate',
-                        })
-    @observe_call('late_fill.semantic_execution_gate_decision',
-                  target=lambda a: exact_target(a['branch']),
-                  inputs=lambda a: a['self']._causal_execution_gate_inputs(a['branch'], a['current_payload']),
-                  authority=lambda a: {'rule': 'semantic_execution_gate_current_branch_v1'},
-                  evidence=lambda a: [], complete=True,
-                  required_rule='semantic_execution_gate_current_branch_v1', result=judgment_summary)
+    @observe_execution_gate
     def semantic_execution_gate_decision(
         self,
         branch: Mapping[str, Any],
@@ -19928,16 +19900,7 @@ class LateFillRuntimeOwner:
             ).strip()
         return updated
 
-    @observe_call('late_fill.execute_prepared_late_fill_branch',
-                  record_kind='materialization_invocation', target=lambda a: exact_target(a['plan']),
-                  inputs=lambda a: {'contract': select_fields(a['plan'], ('branch_id', 'phase_id', 'capability', 'depends_on'))},
-                  context=lambda a: {
-                      source: select_fields(a['plan'].get(source), (
-                          'semantic_review_lens', 'semantic_role_id', 'review_type',
-                          'semantic_depth', 'structural_granularity', 'scope',
-                          'attention_target', 'controlled_attention_frame_id',
-                      )) for source in ('branch', 'infer_payload', 'effective_data')
-                  }, result=judgment_summary)
+    @observe_prepared_branch
     def execute_prepared_late_fill_branch(self, plan: dict[str, Any]) -> dict[str, Any]:
         infer_payload = plan.get('infer_payload') if isinstance(plan.get('infer_payload'), dict) else {}
         saved_execution = copy.deepcopy(plan.get('execution_contract') or {})
@@ -21821,11 +21784,7 @@ class LateFillRuntimeOwner:
                 return True
         return False
 
-    @observe_request
-    @observe_call('late_fill.complete_response_late_fill',
-                  target=lambda a: {'response_id': a['response_payload'].get('id')},
-                  inputs=lambda a: {'trigger': a['artifact_gap'].get('trigger')})
-    @observe_transition('late_fill.worker', target=lambda a: {'response_id': a['response_payload'].get('id')})
+    @observe_worker
     def complete_response_late_fill(
         self,
         *,
@@ -21846,6 +21805,7 @@ class LateFillRuntimeOwner:
         response_id = str((response_payload or {}).get('id') or '').strip()
         if not response_id:
             return
+        trace = LateFillTrace(response_id)
         successor_handoff: Optional[dict[str, Any]] = None
         completed_capabilities: list[str] = []
         failed_capabilities: list[str] = []
@@ -21854,7 +21814,7 @@ class LateFillRuntimeOwner:
         failed_branches: list[str] = []
         cancelled_branches: list[str] = []
         try:
-            with transition_span('late_fill.initial_lookup', target={'response_id': response_id}):
+            with trace.span('initial_lookup'):
                 existing_record = self.get_response_lookup_record(response_id) or {}
             recovered_payload = (
                 existing_record.get('response_payload')
@@ -21975,11 +21935,7 @@ class LateFillRuntimeOwner:
                     return
                 normalized_branch = dict(branch)
                 removed_wait = normalized_branch.pop('availability_wait', None)
-                if isinstance(removed_wait, Mapping):
-                    causal_event('late_fill.availability', 'wait_settled',
-                        target=exact_target(branch), status=status,
-                        wait_id=(removed_wait.get('causal') or {}).get('wait_id'),
-                        predicate='availability_poll_due', gates_complete=False)
+                trace.wait_settled(branch, removed_wait, status)
                 normalized_branch['branch_id'] = branch_id
                 normalized_branch['phase_id'] = str(branch.get('phase_id') or branch_id).strip() or branch_id
                 normalized_branch['capability'] = capability
@@ -22002,12 +21958,7 @@ class LateFillRuntimeOwner:
                     records.append(normalized_branch)
                 if branch_id not in record_ids:
                     record_ids.append(branch_id)
-                causal_event('late_fill.branch_state', 'state_transition',
-                    target=exact_target(branch), status=status,
-                    runtime_state_delta={'status_before': branch.get('status'),
-                                         'status_after': normalized_branch.get('status')},
-                    attempt=select_fields(attempt, ('attempt', 'attempt_count', 'instance_id', 'code')),
-                    outcome_ref=exact_target(normalized_branch))
+                trace.branch_settled(branch, normalized_branch, status, attempt)
 
             def _final_lookup_status_for_late_fill(final_status: str) -> str:
                 normalized = str(final_status or '').strip().lower()
@@ -22362,16 +22313,7 @@ class LateFillRuntimeOwner:
                     time.sleep(min(1.0, min(self.availability_wait_delay(branch) for branch in active_branches)))
                     continue
                 for eligible in eligible_branches:
-                    retained_wait = eligible.get('availability_wait') or {}
-                    wait_identity = retained_wait.get('causal') or {}
-                    if wait_identity.get('wait_id'):
-                        causal_event('late_fill.availability', 'wait_wake',
-                            target=exact_target(eligible), wait_id=wait_identity['wait_id'],
-                            predicate='availability_poll_due', predicate_satisfied=True,
-                            next_check_epoch=retained_wait.get('next_check_epoch'),
-                            required_rule='late_fill_availability_poll', gates_complete=False,
-                            wake_reason='existing_poll_clock_recheck',
-                            route_eligibility='not_yet_revalidated')
+                    trace.availability_wake(eligible)
                 active_branches = eligible_branches
                 active_capabilities = self.normalize_capability_list(
                     [self.branch_capability(branch) for branch in active_branches if self.branch_capability(branch)]
@@ -22406,7 +22348,7 @@ class LateFillRuntimeOwner:
                     value = current_late_fill.get(key) if isinstance(current_late_fill, Mapping) else None
                     if value not in (None, '', [], {}):
                         running_state_extra[key] = value
-                with transition_span('late_fill.running_state_build', target={'response_id': response_id}):
+                with trace.span('running_state_build'):
                     running_late_fill = self.build_late_fill_state(
                         active_gap,
                         status='running',
@@ -22427,8 +22369,8 @@ class LateFillRuntimeOwner:
                     branch_id = self.branch_id(event)
                     if not branch_id:
                         return
-                    callback_target = {'response_id': response_id, **exact_target(event)}
-                    with transition_span('late_fill.callback.progress_record', target=callback_target):
+                    callback_trace = trace.callback(event)
+                    with callback_trace.span('callback.progress_record'):
                         status = str(event.get('status') or '').strip().lower()
                         progress_record: dict[str, Any] = {
                             'branch_id': branch_id,
@@ -22455,11 +22397,9 @@ class LateFillRuntimeOwner:
                                 for key, value in dict(error).items()
                                 if value not in (None, '', [], {})
                             }
-                    with transition_span('late_fill.callback.lookup',
-                                         target=callback_target,
-                                         hydration_scope='included_if_existing_lookup_hydrates'):
+                    with callback_trace.span('callback.lookup'):
                         latest_record = self.get_response_lookup_record(response_id) or {}
-                    with transition_span('late_fill.callback.state_build', target=callback_target):
+                    with callback_trace.span('callback.state_build'):
                         latest_payload = (
                             latest_record.get('response_payload')
                             if isinstance(latest_record.get('response_payload'), dict)
@@ -22499,7 +22439,7 @@ class LateFillRuntimeOwner:
                         latest_late_fill['branch_progress'] = branch_progress
                         updated_payload = dict(latest_payload)
                         updated_payload = self.attach_late_fill_state(updated_payload, latest_late_fill)
-                    with transition_span('late_fill.callback.publication', target=callback_target):
+                    with callback_trace.span('callback.publication'):
                         self.touch_response_lookup(
                             response_id,
                             output_text=str(updated_payload.get('output_text') or ''),
@@ -22792,10 +22732,7 @@ class LateFillRuntimeOwner:
                         cancelled_branches = [self.branch_id(item) for item in cancelled_branch_records if self.branch_id(item)]
                     post_execution_decision = self.semantic_execution_gate_decision(branch, gate_payload)
                     if str(post_execution_decision.get('action') or '').strip().lower() == 'skip':
-                        causal_event('late_fill.result_gate', 'result_disposition',
-                            target=exact_target(branch), stale_result_disposition='ignored',
-                            judgment=judgment_summary(post_execution_decision),
-                            required_rule='semantic_execution_gate_current_branch_v1')
+                        trace.result_ignored(branch, post_execution_decision)
                         gated_branch = self.branch_record_with_execution_gate(branch, post_execution_decision)
                         _remember_branch(
                             cancelled_branch_records,
@@ -22959,15 +22896,9 @@ class LateFillRuntimeOwner:
                         if retry_branch:
                             retry_branch_replacements[branch_id] = retry_branch
                             branch_errors.pop(branch_id, None)
-                            self.log_unified_event(
-                                category='responses',
-                                action='late_fill',
-                                status='queued',
-                                response_id=response_id,
-                                capability=capability,
-                                branch_id=branch_id, phase_id=branch.get('phase_id'),
-                                attempt=select_fields(attempt_payload, ('attempt', 'attempt_count', 'instance_id', 'code')),
-                                message='Retryable auto-executable repair branch requeued after failed materialization attempt.',
+                            trace.repair_requeued(
+                                self.log_unified_event, branch_id, branch.get('phase_id'),
+                                capability, attempt_payload, reason='failed_materialization',
                             )
                             continue
                         _remember_branch(
@@ -23216,15 +23147,9 @@ class LateFillRuntimeOwner:
                         if retry_branch:
                             retry_branch_replacements[branch_id] = retry_branch
                             branch_errors.pop(branch_id, None)
-                            self.log_unified_event(
-                                category='responses',
-                                action='late_fill',
-                                status='queued',
-                                response_id=response_id,
-                                capability=capability,
-                                branch_id=branch_id, phase_id=branch.get('phase_id'),
-                                attempt=select_fields(attempt_payload, ('attempt', 'attempt_count', 'instance_id', 'code')),
-                                message='Retryable auto-executable text artifact repair requeued after saved-truth failure.',
+                            trace.repair_requeued(
+                                self.log_unified_event, branch_id, branch.get('phase_id'),
+                                capability, attempt_payload, reason='saved_truth_failure',
                             )
                             continue
                         _remember_branch(
@@ -23602,65 +23527,43 @@ class LateFillRuntimeOwner:
                     else 'lightweight_nonterminal'
                 )
                 if terminal_without_pending:
-                    finalize_started_at = time.perf_counter()
+                    finalize_started_at = trace.clock()
                     current_payload = self.finalize_response_frame_payload(
                         payload_for_finalize,
                         request_payload=request_payload,
                         persist=True,
                     )
-                    finalize_elapsed_ms = round((time.perf_counter() - finalize_started_at) * 1000, 3)
-                    runtime = current_payload.get('runtime') if isinstance(current_payload.get('runtime'), Mapping) else {}
-                    diagnostics = (
-                        runtime.get('developer_diagnostics')
-                        if isinstance(runtime.get('developer_diagnostics'), Mapping)
-                        else {}
-                    )
-                    response_frame_finalize_timing = (
-                        diagnostics.get('response_frame_finalize_timing')
-                        if isinstance(diagnostics.get('response_frame_finalize_timing'), Mapping)
-                        else {}
-                    )
+                    finalize_elapsed_ms = trace.elapsed_ms(finalize_started_at)
+                    response_frame_finalize_timing = trace.finalizer_timing(current_payload)
                 else:
-                    finalize_started_at = time.perf_counter()
+                    finalize_started_at = trace.clock()
                     current_payload = dict(payload_for_finalize)
-                    finalize_elapsed_ms = round((time.perf_counter() - finalize_started_at) * 1000, 3)
-                    response_frame_finalize_timing = {
-                        'kind': 'ollmo.response_frame_finalize_timing',
-                        'phase': 'nonterminal_late_fill',
-                        'skipped': True,
-                        'reason': 'lightweight_nonterminal_checkpoint',
-                        'checkpoint_mode': checkpoint_mode,
-                        'persist_requested': False,
-                        'total_elapsed_ms': finalize_elapsed_ms,
-                        'pending_branch_count': len(pending_branches),
-                        'active_branch_count': len(next_active_branches),
-                        'completed_branch_count': len(completed_branch_records),
-                        'failed_branch_count': len(failed_branch_records),
-                    }
+                    finalize_elapsed_ms = trace.elapsed_ms(finalize_started_at)
+                    response_frame_finalize_timing = trace.checkpoint_timing(
+                        finalize_elapsed_ms, checkpoint_mode,
+                        pending_branch_count=len(pending_branches),
+                        active_branch_count=len(next_active_branches),
+                        completed_branch_count=len(completed_branch_records),
+                        failed_branch_count=len(failed_branch_records),
+                    )
                 current_late_fill = (
                     current_payload.get('late_fill')
                     if isinstance(current_payload.get('late_fill'), dict)
                     else next_state
                 )
-                post_wave_backend_timing = {
-                    'kind': 'ollmo.late_fill_post_wave_backend_timing',
-                    'phase': 'terminal' if terminal_without_pending else 'nonterminal',
-                    'status': effective_next_status,
-                    'checkpoint_mode': checkpoint_mode,
-                    'finalize_skipped': not terminal_without_pending,
-                    'finalize_elapsed_ms': finalize_elapsed_ms,
-                    'pending_branch_count': len(pending_branches),
-                    'active_branch_count': len(next_active_branches),
-                    'completed_branch_count': len(completed_branch_records),
-                    'failed_branch_count': len(failed_branch_records),
-                }
-                if response_frame_finalize_timing:
-                    post_wave_backend_timing['response_frame_finalize_timing'] = dict(response_frame_finalize_timing)
+                post_wave_backend_timing = trace.post_wave_timing(
+                    effective_next_status, terminal_without_pending, checkpoint_mode,
+                    finalize_elapsed_ms, response_frame_finalize_timing,
+                    pending_branch_count=len(pending_branches),
+                    active_branch_count=len(next_active_branches),
+                    completed_branch_count=len(completed_branch_records),
+                    failed_branch_count=len(failed_branch_records),
+                )
                 if isinstance(current_late_fill, dict):
                     current_late_fill = dict(current_late_fill)
                     current_late_fill['post_wave_backend_timing'] = dict(post_wave_backend_timing)
                     current_payload = self.attach_late_fill_state(current_payload, current_late_fill)
-                lookup_touch_started_at = time.perf_counter()
+                lookup_touch_started_at = trace.clock()
                 self.touch_response_lookup(
                     response_id,
                     status=_final_lookup_status_for_late_fill(effective_next_status),
@@ -23668,37 +23571,19 @@ class LateFillRuntimeOwner:
                     response_payload=current_payload,
                     stream_view='ui' if terminal_without_pending else 'status',
                 )
-                lookup_touch_elapsed_ms = round((time.perf_counter() - lookup_touch_started_at) * 1000, 3)
+                lookup_touch_elapsed_ms = trace.elapsed_ms(lookup_touch_started_at)
                 post_wave_backend_timing['touch_response_lookup_elapsed_ms'] = lookup_touch_elapsed_ms
                 if isinstance(current_late_fill, dict):
                     current_late_fill = dict(current_late_fill)
                     current_late_fill['post_wave_backend_timing'] = dict(post_wave_backend_timing)
                     current_payload = self.attach_late_fill_state(current_payload, current_late_fill)
-                self.log_unified_event(
-                    category='responses',
-                    action='late_fill_post_wave_backend_timing',
-                    status='ok',
-                    response_id=response_id,
-                    phase=post_wave_backend_timing['phase'],
-                    late_fill_status=effective_next_status,
-                    checkpoint_mode=checkpoint_mode,
-                    finalize_skipped=not terminal_without_pending,
-                    finalize_elapsed_ms=finalize_elapsed_ms,
-                    touch_response_lookup_elapsed_ms=lookup_touch_elapsed_ms,
-                    response_frame_finalize_timing=(
-                        dict(response_frame_finalize_timing)
-                        if response_frame_finalize_timing
-                        else None
-                    ),
+                trace.log_post_wave_timing(
+                    self.log_unified_event, post_wave_backend_timing,
+                    response_frame_finalize_timing,
                     pending_branch_count=len(pending_branches),
                     active_branch_count=len(next_active_branches),
                     completed_branch_count=len(completed_branch_records),
                     failed_branch_count=len(failed_branch_records),
-                    message=(
-                        'Late-fill post-wave backend timing '
-                        f"{post_wave_backend_timing['phase']} finalize="
-                        f'{finalize_elapsed_ms}ms lookup={lookup_touch_elapsed_ms}ms'
-                    ),
                 )
                 if terminal_without_pending:
                     successor_handoff = self._terminal_closure_repair_handoff(
@@ -23874,11 +23759,7 @@ class LateFillRuntimeOwner:
         except Exception:  # noqa: BLE001
             logging.exception('Could not schedule post-response substrate hygiene.')
 
-    @observe_call('late_fill.schedule_response_late_fill',
-                  target=lambda a: {'response_id': a['response_payload'].get('id')},
-                  result=lambda value: {'scheduled': value})
-    @observe_transition('late_fill.schedule', target=lambda a: {'response_id': a['response_payload'].get('id')},
-                        result=lambda value: {'schedule_return_value': value})
+    @observe_schedule
     def schedule_response_late_fill(
         self,
         *,
@@ -23897,7 +23778,8 @@ class LateFillRuntimeOwner:
             self.release_response_late_fill(response_id)
             return True
         target = complete_response_late_fill or self.complete_response_late_fill
-        with transition_binding(transition_attempt({'response_id': response_id})):
+        trace = LateFillTrace(response_id)
+        with trace.handoff():
             worker = threading.Thread(
                 target=traced_thread_target(target),
                 kwargs={
@@ -23909,6 +23791,6 @@ class LateFillRuntimeOwner:
                 },
                 daemon=True,
             )
-            with transition_span('late_fill.worker_submission', target={'response_id': response_id}):
+            with trace.span('worker_submission'):
                 worker.start()
         return True

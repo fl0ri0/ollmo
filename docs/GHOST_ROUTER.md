@@ -23,7 +23,7 @@ Ghost should decide the next truthful phase, not pretend the whole request is on
 
 Ghost is not the whole of Ollmo. Ghost is the semantic/current-turn interpretation layer inside Ollmo; Ollmo is the larger runtime/control-plane substrate that records phase truth, executes branches, persists artifacts, and preserves replayable outputs.
 
-The current request rule is: intent is anchored by Ghost, graph state is refined by runtime evidence, and final freeze is allowed only after one bounded graph closure review.
+The current request rule is: intent is anchored by Ghost, graph state is refined by runtime evidence, and each freeze records the current graph closure review. Closure may repeat after new evidence, reconciliation, repair or continuation; a frozen moment may truthfully remain blocked or incomplete.
 
 The current contract lifecycle is: possibility -> relevance -> promoted contract -> runtime work -> review -> freeze. Ghost proposes semantic possibility; runtime graph truth, promotion review, output slots, artifacts, and closure review decide what becomes executable work.
 
@@ -113,7 +113,7 @@ Current flow:
 - the backend validates bounded helper output and resolves the final instance for the current phase, but the normal path no longer depends on heuristic or secondary semantic route authority
 - once `/api/responses` has returned a `response_id`, clients observe that same response instead of reposting the root prompt; while late fill work is open, use `GET /api/responses/<response_id>?view=status` for compact lifecycle/branch state and fetch the default response view only when `state_version` changes or artifact detail handles are needed
 - bounded rollout/debug evidence is opt-in via `GET /api/responses/<response_id>?view=debug`; fully hydrated response-frame/runtime truth is opt-in via `view=full`, `view=raw`, or `view=truth`; normal UI rendering and reconciliation must use `view=status`, the default UI projection, artifact entries, and targeted artifact endpoints
-- normal POST/default/UI/status/debug results never hydrate sidecars and are byte-budgeted to at most 8 MiB for the final serialized outer envelope; retry/control/status wrappers and each serialized Responses-style SSE event are included in that ceiling
+- normal POST/default/UI/status/debug results are byte-budgeted to at most 8 MiB for the final serialized outer envelope; the normal indexed POST/default/UI/status path avoids hydration, debug may hydrate selected Closure/rebase observations, and exceptional ledger recovery may reconstruct canonical state before projection; retry/control/status wrappers and each serialized Responses-style SSE event are included in that ceiling
 - public compaction is byte-based rather than a fixed character/item cut: ordinary 5,000-character text and 65 tiny records remain intact when they fit, while strings from 256 KiB and collections from 1 MiB may become a preview plus exact count/length, byte size, SHA-256, and an adjacent content-addressed `*_snapshot_ref`
 - exact `full`/`raw`/`truth` reads recursively hydrate and validate authoritative CAS refs; missing, malformed, or corrupt refs fail closed with HTTP 409 instead of producing partial canonical truth
 - response artifact bundles do not infer a complete artifact set from truncated or emergency wire handles; they hydrate exact CAS truth and fail closed if the complete inputs cannot be validated
@@ -223,7 +223,7 @@ Current execution safeguard:
 - the UI keeps watching that response and updates the original assistant turn in place when late fill completes or fails
 - the UI should read `surface_state` and late fill branch arrays before stale output slots when rendering queued, blocked, review-pending, waived, superseded, or completed branch status
 - immediately before final response freeze, `/api/responses` runs a graph closure review over the frozen request phase graph, work tree, output slots, runtime outputs, artifacts, and late fill state
-- before that freeze, `/api/responses` may attach a refined `runtime.request_phase_graph` when strong same-turn evidence shows the initial graph missed an obligation; for example, assistant text that explicitly claims `text_to_speech` is pending can create the missing TTS branch instead of allowing a false text-only completion
+- before that freeze, `/api/responses` may attach a refined `runtime.request_phase_graph` when strong same-turn evidence shows the initial graph missed an obligation; for example, an explicit pending-TTS claim can expose a missing branch for an already-promoted audio obligation. The claim cannot independently promote reserved, negated or merely inferred audio work
 - the closure review writes `runtime.graph_closure_review`; developer builds may also mirror the same review under diagnostics
 - the closure review can allow freeze, mark a branch pending for late fill, record blocked/failed obligations, or explain why a partial result is truthful, but it must not create a new semantic user intent
 - closure repair may promote repair candidates grounded in the existing graph/runtime state, but it must not turn stale history or a fresh guess into new owed work

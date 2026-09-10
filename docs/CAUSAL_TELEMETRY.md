@@ -6,8 +6,9 @@ is `unknown`, never an inferred model call, unnecessary retry or false wait.
 
 ## Existing owners and new observations
 
-`state/ollmo_run_monitor/monitor_once.py` remains the compatibility entry point
-for `scripts/ollmo_run_monitor.py`. The monitor is an observer, not execution
+`scripts/ollmo_run_monitor.py` is the canonical monitor. A development checkout
+may also retain `state/ollmo_run_monitor/monitor_once.py` as a compatibility
+entry point; the mutable `state/` tree is not shipped or required. The monitor is an observer, not execution
 authority. There is no new profiler, scheduler, log store or dependency.
 
 `ollmo_services/events.py` extends the existing unified event path. A scoped
@@ -37,7 +38,30 @@ this does not change worker counts, scheduling or lock policy.
 | Late Fill | exact defensive execution-gate inputs/rule; availability-poll identities; branch settlement deltas; stale-result disposition; branch/phase/attempt on two automatic repair requeue events | Availability poll expiry is not route readiness. Stale disposition records do not yet bind every provider result ID. |
 | Repair/rebase validators and structural/global Closure | actual validator/review calls and bounded judgment references | Full changed-input provenance and application/consumption lineage remain partial. Existing authoritative proposal/review/graph identities remain canonical. |
 | Semantic verdict freeze gate | relevant verdict/schema/criteria/evidence identity and mandatory validation rule | A repeat under the same exact target and inputs may be classified as defensive. No waiver of this gate is implied. |
-| Finalizer/frame persistence | existing inclusive step timers enriched with invocation/process identity and nested operation totals | No work moved, skipped, deferred or made less durable. |
+| Finalizer/frame persistence | existing inclusive step timers enriched with invocation/process identity and nested operation totals | These timers observe the current owner path; they do not control work or durability. |
+
+## Late Fill instrumentation ownership
+
+`ollmo_server/late_fill_runtime.py` retains semantic decisions and the exact
+start-check, worker/submission, lookup, callback, publication, branch-settlement,
+retry and availability anchors. `ollmo_services/late_fill_telemetry.py` supplies
+an explicitly bound `LateFillTrace` for event metadata, wait identities,
+callback targets and post-wave timing schemas. It returns diagnostic values;
+Late Fill still attaches them and owns every runtime mutation and publication.
+The import-time observation adapters configure the same existing wrappers in
+the same order; they add no interception, scheduler, store or authority.
+
+IDs, parent links, process-boot identity, clocks, budgets/reservations, redaction,
+drop accounting and persistence remain in the existing events/state-flow services.
+The exact execution-gate input selector stays beside its semantic owner to retain
+control precedence and reader evaluation. State-flow hooks and the sibling
+executor's preparation/lock/result/callback-drain anchors are unchanged.
+
+Failure behavior retains its existing boundaries: causal/transition/state-flow
+sinks fail open; inline metadata preparation and the legacy post-wave timing log
+are not universally guarded. In particular, a legacy timing-log exception still
+enters the existing Late Fill worker error handler. This structural extraction
+does not silently broaden fail-open guarantees or change runtime errors.
 
 ## Identity, input coverage and bounds
 
@@ -101,7 +125,14 @@ Invocation duration includes nested observation overhead; it is not a CPU
 profile. Canonical SHA sidecars are durable runtime truth, not secondary
 non-authoritative copies. The recovery index is derived acceleration;
 readiness retention is secondary evidence, not primary frame-append authority.
-All still run on their existing synchronous path.
+Readiness still runs synchronously after successful CAS/Ledger/Index persistence
+and before finalizer return. It is outside the canonical durable-completion
+boundary and its failure does not roll back the frame. A finalizer invocation,
+a durable append and response delivery are separate observations; see
+[Finalization](RESPONSES_CONTRACT.md#finalization-and-durable-completion).
+Private preparation reuse can reduce transformation counts while all current
+authority/integrity gates remain active; neither repeated checks nor unchanged
+output hashes prove redundancy.
 
 ## Consumers and conservative classification
 
@@ -144,8 +175,9 @@ unchanged canonical persistence bytes. Run it with the affected monitor,
 convergence, frame, semantic, API and fake-backend E2E suites. Tests use temporary
 roots and must not write or scan the production ledger.
 
-Loading the changes into the running webserver requires a restart. No restart
-or fresh live turn was performed for this task.
+The running webserver uses its loaded code; checkout instrumentation changes
+require an authorized restart to take effect. Dated implementation evidence is
+not proof of the code or observations in a current process.
 
 After explicit authorization, three small turns can provide initial evidence:
 

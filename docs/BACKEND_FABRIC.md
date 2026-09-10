@@ -7,7 +7,7 @@ This note describes the normalized backend discovery and lifecycle contract that
 Ollmo already had two strong truth layers:
 
 - `model_ports.json` for stable instance registry truth
-- `state/runtime_status.json` for live readiness and backend runtime truth
+- `state/runtime_status.json` for cached readiness and backend observations, subordinate to current process/port/backend facts
 
 The backend fabric supplies one shared summary that answers:
 

@@ -73,6 +73,13 @@ Before final response freeze, Ollmo checks graph requirements against runtime tr
 
 The closure review can continue existing obligations through resolver or late fill, but it cannot invent a new request.
 
+Closure proves the preserved original obligation contract. A smaller downstream
+artifact-request list or rebuilt graph cannot silently release accepted user
+promises; exact file identities and explicit waiver/supersession records remain
+visible. Closure and reviews may repeat after evidence, reconciliation or repair.
+Freeze records a truthful moment, including incomplete or blocked work, and is
+not itself a claim of successful completion.
+
 When Closure proves that the basic current-turn intent was not represented in the graph, the remedy is a bounded graph repair proposal and validation review, not prose completion. Accepted learning can make that pattern easier to notice, but it cannot supply executable truth by itself.
 
 ---
@@ -215,6 +222,11 @@ An artifact is not only a path.
 Durable artifact truth includes identity, provenance, metadata, enrichments, linked response/message ids, and availability. `artifact_dossiers` are the read-side shape for that truth.
 
 When artifact evidence already exists, Ollmo should reuse it as evidence before rerunning expensive or noisy analysis. If the evidence is missing, stale, or insufficient for the current branch contract, a new evidence branch may be promoted.
+
+Durability optimizations may reuse private prepared representations within their
+validated owner scope. They must preserve exact recoverable state, fresh source
+and integrity checks, append-only lineage and current authority gates. Indexes,
+Readiness reports and telemetry cannot turn an unproven result into completion.
 
 ---
 

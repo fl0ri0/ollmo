@@ -3857,6 +3857,9 @@ _RESPONSE_SEMANTICS_RUNTIME = ResponseSemanticsRuntimeOwner(
         'normalize_late_fill_branches': lambda values: _normalize_late_fill_branches(values),
         'extract_request_meta': lambda payload: extract_request_meta(payload),
         'build_canonical_response_artifacts': lambda payload: _build_canonical_response_artifacts(payload),
+        'text_artifact_branch_has_canonical_evidence': lambda branch, payload: (
+            _LATE_FILL_RUNTIME._text_artifact_branch_has_canonical_evidence(branch, payload)
+        ),
         'resolve_semantic_review_artifact_path': lambda path: _resolve_saved_viewable_artifact_path(
             str(path or '')
         ),

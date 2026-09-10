@@ -1,6 +1,6 @@
 # Self-Attack status — 2026-09-06
 
-This is the compact public evidence summary for the current Self-Attack harness.
+This is the dated compact public evidence summary for the September 6 Self-Attack harness and selected runs. It is historical validation, not a fresh conformance verdict for later source changes.
 It deliberately excludes retained captures, response ledgers, worker runtimes,
 logs, and other local forensic material.
 

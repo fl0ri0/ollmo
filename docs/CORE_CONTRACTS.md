@@ -111,7 +111,7 @@ Ghost routes from:
 Fresh turns normally use a `current_turn_only` context strategy. Older history, old tool calls, and prior artifacts may explain references, but they must not become the next turn's intent by recency alone.
 Ghost does not treat retired orchestration vocabulary as canonical routing truth.
 Live Ghost routing does not carry a separate derived `memory` block. Compiled memory remains archival/runtime-diagnostic state and must not act as competing fresh-intent route authority.
-Every Ghost-owned request freezes into a request phase graph. The graph is frozen in intent and fluid in state: Ghost anchors the user's request, while runtime evidence marks graph obligations fulfilled, pending, blocked, waived, superseded, failed, or clarified. Plain chat may end at phase 1; image/audio materialization defaults to prepare-first plus downstream branches unless the caller supplied an explicit low-level direct contract. If an initial graph is too thin, pre-freeze graph refinement may add a missing downstream branch only from strong same-turn evidence such as an explicit pending/queued assistant output claim; this is continuation of an anchored obligation, not new intent creation.
+Every Ghost-owned request freezes into a request phase graph. The graph is frozen in intent and fluid in state: Ghost anchors the user's request, while runtime evidence marks graph obligations fulfilled, pending, blocked, waived, superseded, failed, or clarified. Plain chat may end at phase 1; image/audio materialization defaults to prepare-first plus downstream branches unless the caller supplied an explicit low-level direct contract. If an initial graph is too thin, pre-freeze graph refinement may add a missing downstream branch only from strong same-turn evidence for an already-promoted obligation. A pending/queued assistant claim is diagnostic evidence, not independent promotion authority; reserved, negated or merely inferred modalities remain non-executable.
 
 `request_phase_graph.intent_obligations` is the normalized current-turn promise ledger. It decomposes coarse asks into text artifacts, media artifacts, evidence branches, dependency bindings, navigation promises, and other structural checks before they are surfaced back through runtime truth. The ledger is not a separate executor: only promoted graph branches/phases and validated runtime patches create owed work. Strong current-turn dependency obligations such as local generated image assets before HTML consumers may shape branch dependencies before execution; binding-only relations such as shared CSS or page navigation remain visible structural promises unless runtime evidence requires an executable repair.
 
@@ -133,7 +133,7 @@ Semantic role orientation is the compatibility bridge for old Ghost modes. `repa
 
 Semantic review lenses sharpen that brain loop without becoming a new authority surface. A lens tells a model whether the branch should be judged as planning coverage, worker execution, materialization, evidence verification, dependency integration, quality review, repair, transition commitment, or whole-turn fit. The lens travels with semantic quality contracts, controlled attention frames, Closure checks, branch semantic review prompts, and repair feedback so the model asks the right question at the right scope.
 
-Global semantic closure is the whole-turn review layer. It does not replace structural `intent_graph_adequacy`: structural adequacy asks whether the graph has enough promoted obligations and whether the normalized intent obligation ledger is represented by the graph shape and executable dependencies. Global semantic closure asks whether fulfilled branches fit the current intent together. When semantic fit is unproven after local obligations are complete, Closure can promote a bounded `global_semantic_closure` check and a `semantic_review` branch. The resulting review must normalize into `semantic_review_verdict`. Closure can freeze only when that verdict passes; failed, uncertain, or unparseable verdicts stay visible as repair/manual-review/reconsideration work.
+Global semantic closure is the whole-turn review layer. It does not replace structural `intent_graph_adequacy`: structural adequacy asks whether the graph has enough promoted obligations and whether the normalized intent obligation ledger is represented by the graph shape and executable dependencies. Global semantic closure asks whether fulfilled branches fit the current intent together. When semantic fit is unproven after local obligations are complete, Closure can promote a bounded `global_semantic_closure` check and a `semantic_review` branch. The resulting review must normalize into `semantic_review_verdict`. Closure can certify semantic completion only when that required verdict passes; failed, uncertain, or unparseable verdicts stay visible as repair/manual-review/reconsideration work and may be frozen honestly in that state.
 
 Branch execution is local to the promoted branch contract. Later branches should consume their own `content_payload`, `artifact_prompt`, `stage_direction`, dependencies, input artifacts, reference artifacts, and prior branch outputs instead of treating the full root prompt as the task again.
 
@@ -166,10 +166,17 @@ Lifecycle:
 4. preview or resolve the current phase route
 5. build/update `working_frame`
 6. execute the selected backend path or promoted branch-local task
-7. run a bounded pre-freeze closure review against frozen graph/branch/artifact truth
-8. continue through resolver transformation, self-heal, dependency-chain repair, or late fill only when existing frozen obligations still need completion
-9. freeze `response_frame`
-10. persist history, artifacts, provenance, and lookup state
+7. materialize and validate saved artifacts, then review the preserved original obligations against current graph/branch/artifact evidence
+8. continue existing obligations through the resolver, bounded repair or Late Fill; repeat Closure when evidence or graph state changes
+9. construct the frozen response frame and reconcile its accepted artifact/output identities; attempt Artifact Registry persistence, then durable CAS/Ledger append and derived Index publication
+10. retain relevant settled Readiness evidence after successful frame persistence, then finish the response/lookup/history projections
+
+This is a logical lifecycle, not a cross-store transaction. Artifact bytes exist
+before fulfillment review. Readiness is secondary evidence and remains synchronous
+after canonical persistence; it does not grant completion or operator authority.
+Ordinary finalizer persistence failures are currently logged rather than propagated.
+See [Finalization and durable completion](RESPONSES_CONTRACT.md#finalization-and-durable-completion)
+for the actual persistence and failure boundary.
 
 Current frame truth:
 
@@ -197,7 +204,7 @@ Current request-shape truth:
 - image/audio requests normally keep the current phase on `chat` and materialize the final artifact through downstream branches
 - text/file artifact requests are output materialization obligations only when the source payload is clear; ambiguous source language such as "this" without a selected source should clarify instead of persisting a guessed artifact
 - structured text/file artifact wrappers such as `output_obligations[].content` are payload envelopes; persistence saves the declared `content`, not the router JSON or control-plane metadata around it
-- immediately before freeze, Ollmo should run one bounded closure review that can continue only already-anchored obligations; it may refine graph state from strong runtime/output evidence, but it must not reinterpret user intent or invent new capability goals
+- before each freeze, Ollmo reviews already-anchored obligations; Closure may repeat after materialization, reconciliation or validated repair, and it may refine graph state from strong runtime/output evidence, but it must not reinterpret user intent or invent new capability goals
 - that review is surfaced as `runtime.graph_closure_review` and may also appear under developer diagnostics
 - local model calls execute selected phases or materialize branches; graph, slot, output, artifact, status, and late fill state decide fulfillment
 - branch-local model calls should carry `execution_contract`, `workload_task_ref`, and `output_obligation_ref` through late fill and infer payloads so completion can be matched to the planned branch without relying on model wording

@@ -16641,6 +16641,13 @@ class ResponseSemanticsRuntimeOwner:
             request_payload,
             request_phase_graph,
         )
+        accepted_file_identities = {
+            (str(item.get('target_name') or '').strip().lower(),
+             str(item.get('target_extension') or '').strip().lower())
+            for item in required_intent_obligations(request_phase_graph.get('intent_obligations') or [])
+            if item.get('kind') == 'text_artifact' and item.get('source') == 'current_user_intent'
+        }
+        file_evidence_check = self.hooks.get('text_artifact_branch_has_canonical_evidence')
         for raw_source in check_sources:
             if not isinstance(raw_source, Mapping):
                 continue
@@ -16877,6 +16884,20 @@ class ResponseSemanticsRuntimeOwner:
                 evidence = 'explicit_obligation_waiver'
             elif status not in {'fulfilled', 'blocked', 'pending', 'deferred', 'planned', 'active', 'waived', 'superseded'}:
                 status = 'pending'
+
+            # A type count cannot discharge an accepted named file obligation.
+            # Reuse the terminal owner's read-only identity/dependency/write
+            # evidence check; do not reinterpret the prompt or artifact content.
+            if (
+                status == 'fulfilled'
+                and requires_text_artifact
+                and (_expected_text_artifact_source_name(raw_source),
+                     _expected_text_artifact_extension(raw_source)) in accepted_file_identities
+                and callable(file_evidence_check)
+                and not file_evidence_check(raw_source, artifact_info)
+            ):
+                status = 'pending'
+                evidence = 'requested_text_artifact_missing'
 
             if (
                 status == 'fulfilled'

@@ -11,6 +11,7 @@ from ollmo_services.events import measure_operation, timed_operation, observe_tr
 import base64
 import binascii
 import json
+import marshal
 import hashlib
 import os
 import tempfile
@@ -92,6 +93,8 @@ _NESTED_SNAPSHOT_LIMIT_BYTES = 65536
 _SIDECAR_SPLIT_LIMIT_BYTES = 32768
 _SIDECAR_SPLIT_MAX_DEPTH = 8
 _SIDECAR_SPLIT_MAX_REFS = 64
+# Retained encoded preparation per compaction; exhaustion only disables reuse.
+_SNAPSHOT_SERIALIZATION_REUSE_MAX_BYTES = 8 * 1024 * 1024
 _ADVISORY_SIDECAR_SPLIT_LIMIT_BYTES = 512
 _LEDGER_TEXT_SUMMARY_LIMIT = 1200
 _MEDIA_PAYLOAD_MIN_CHARS = 1024
@@ -2188,7 +2191,10 @@ def _sidecar_split_limit_for_key(key: str, *, json_path: str = '') -> int:
     return _SIDECAR_SPLIT_LIMIT_BYTES
 
 
-def _should_split_sidecar_child(key: str, value: Any, *, depth: int, json_path: str) -> bool:
+def _should_split_sidecar_child(
+    key: str, value: Any, *, depth: int, json_path: str,
+    _size_preparation: Any = None, _frame: Any = None, _frames_dir: Any = None,
+) -> bool:
     if depth >= _SIDECAR_SPLIT_MAX_DEPTH:
         return False
     if not isinstance(value, (dict, list)):
@@ -2207,7 +2213,12 @@ def _should_split_sidecar_child(key: str, value: Any, *, depth: int, json_path: 
         return False
     if not _sidecar_split_key_is_worthwhile(key, json_path=json_path):
         return False
-    return _json_size_bytes(value) >= _sidecar_split_limit_for_key(key, json_path=json_path)
+    size = (
+        _size_preparation.size(value, frame=_frame, frames_dir=_frames_dir)
+        if isinstance(_size_preparation, _SnapshotSizePreparation)
+        else _json_size_bytes(value)
+    )
+    return size >= _sidecar_split_limit_for_key(key, json_path=json_path)
 
 
 def _split_sidecar_payload_for_cas(
@@ -2218,6 +2229,8 @@ def _split_sidecar_payload_for_cas(
     json_path: str,
     depth: int,
     split_counter: list[int],
+    serialization_reuse: Any = None,
+    size_preparation: Any = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     if depth >= _SIDECAR_SPLIT_MAX_DEPTH:
         return _json_safe(value), []
@@ -2239,6 +2252,7 @@ def _split_sidecar_payload_for_cas(
                 child,
                 depth=depth,
                 json_path=child_json_path,
+                _size_preparation=size_preparation, _frame=frame, _frames_dir=frames_dir,
             ):
                 reserved_split_keys.add(key)
         # Reserve direct siblings before descending into the first child's
@@ -2260,6 +2274,8 @@ def _split_sidecar_payload_for_cas(
                     _sidecar_parent_json_path=json_path,
                     _sidecar_split_counter=split_counter,
                     _media_normalized=True,
+                    _serialization_reuse=serialization_reuse,
+                    _size_preparation=size_preparation,
                 )
                 payload[f'{key}_snapshot_ref'] = _json_safe(ref)
                 child_refs.append(
@@ -2289,6 +2305,8 @@ def _split_sidecar_payload_for_cas(
                 json_path=child_json_path,
                 depth=depth + 1,
                 split_counter=split_counter,
+                serialization_reuse=serialization_reuse,
+                size_preparation=size_preparation,
             )
             if not _is_empty(split_child):
                 payload[key] = split_child
@@ -2306,6 +2324,8 @@ def _split_sidecar_payload_for_cas(
                 json_path=child_json_path,
                 depth=depth + 1,
                 split_counter=split_counter,
+                serialization_reuse=serialization_reuse,
+                size_preparation=size_preparation,
             )
             if not _is_empty(split_child):
                 items.append(split_child)
@@ -2327,8 +2347,14 @@ def _coerce_frame_sequence(value: Any, fallback: int | None = None) -> int | Non
 def _response_map_digest(responses: Mapping[str, Any]) -> str:
     """Return a stable digest binding the complete response-index mapping."""
 
+    return _prepared_response_map_digest(_json_safe(dict(responses)))
+
+
+def _prepared_response_map_digest(responses: dict[str, Any]) -> str:
+    """Hash an already normalized, privately owned map without normalizing twice."""
+
     canonical = json.dumps(
-        _json_safe(dict(responses)),
+        responses,
         ensure_ascii=False,
         sort_keys=True,
         separators=(',', ':'),
@@ -2639,6 +2665,161 @@ def enrich_response_frame_for_ledger_append(
     )
 
 
+def _serialize_snapshot_content(value: Any, *, json_path: str) -> tuple[bytes, dict[str, Any]]:
+    """The full preparation path; also used on every private reuse miss."""
+    with measure_operation('snapshot_timestamp_normalization', role='canonical_truth'):
+        safe_value, normalization = _normalize_snapshot_content(value, json_path=json_path)
+    with measure_operation('snapshot_serialization', role='canonical_truth'):
+        encoded = json.dumps(safe_value, ensure_ascii=False, sort_keys=True, indent=2).encode('utf-8')
+    state_flow_note(snapshot_normalizations=1, snapshot_serializations=1, snapshot_serialized_bytes=len(encoded))
+    return encoded, normalization
+
+
+class _SnapshotSerializationReuse:
+    """Private encoded preparation, never verification, for one compaction.
+
+    The input is the newly split JSON tree, including all freshly constructed
+    child refs. Exact input bytes and the complete normalization policy prove
+    the pure transformation is identical. No decoded mutable tree is retained.
+    CAS verification and occurrence-specific ref construction stay in the writer.
+    """
+
+    def __init__(self, frame: Mapping[str, Any], frames_dir: Path):
+        self._frame = frame
+        self._frames_dir = frames_dir
+        self._binding = self._current_binding(frame, frames_dir)
+        self._entries: dict[tuple[bool, bytes], tuple[bytes, bytes]] = {}
+        self._retained_bytes = 0
+
+    def _current_binding(self, frame: Mapping[str, Any], frames_dir: Path) -> Any:
+        if frame is not self._frame or frames_dir != self._frames_dir:
+            return None
+        try:
+            root = frames_dir.stat()
+            files = []
+            for name in (DEFAULT_RESPONSE_FRAME_LEDGER, DEFAULT_RESPONSE_FRAME_INDEX):
+                try:
+                    stat = (frames_dir / name).stat()
+                except FileNotFoundError:
+                    files.append(None)
+                else:
+                    files.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        except OSError:
+            return None
+        return (
+            str(frames_dir.absolute()), root.st_dev, root.st_ino, tuple(files),
+            json.dumps(_json_safe([
+                _frame_response_id(frame), frame.get('frame_id'),
+                frame.get('frame_sequence'), frame.get('frame_relation'),
+            ]), ensure_ascii=False, sort_keys=True),
+        )
+
+    def serialize(self, value: Any, *, json_path: str, frame: Mapping[str, Any], frames_dir: Path) -> tuple[bytes, dict[str, Any]]:
+        state_flow_note(snapshot_reuse_binding_checks=1)
+        if self._binding is None or self._current_binding(frame, frames_dir) != self._binding:
+            state_flow_note(snapshot_reuse_rejected_binding=1)
+            return _serialize_snapshot_content(value, json_path=json_path)
+        # Compact encoding is an exact comparison, not a content hash or an
+        # object address. It includes pre-normalization timestamps and ref
+        # provenance; equal CAS bodies alone cannot make this match.
+        prepared = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        state_flow_note(snapshot_reuse_input_serializations=1, snapshot_reuse_input_bytes=len(prepared))
+        key = (_snapshot_path_allows_timestamp_normalization(json_path), prepared)
+        previous = self._entries.get(key)
+        if previous is not None:
+            state_flow_note(snapshot_reuse_accepted=1)
+            return previous[0], json.loads(previous[1])
+        state_flow_note(snapshot_reuse_misses=1)
+        encoded, normalization = _serialize_snapshot_content(value, json_path=json_path)
+        metadata = json.dumps(normalization, ensure_ascii=False, sort_keys=True).encode('utf-8')
+        retained_bytes = len(prepared) + len(encoded) + len(metadata)
+        if self._retained_bytes + retained_bytes <= _SNAPSHOT_SERIALIZATION_REUSE_MAX_BYTES:
+            self._entries[key] = encoded, metadata
+            self._retained_bytes += retained_bytes
+            state_flow_note(snapshot_reuse_retained_bytes=retained_bytes)
+        else:
+            state_flow_note(snapshot_reuse_budget_fallbacks=1)
+        return encoded, normalization
+
+
+_SNAPSHOT_SIZE_PREPARATION_MAX_BYTES = 8 * 1024 * 1024
+
+
+class _SnapshotSizePreparation:
+    """One compaction's exact size preparation, never a split decision.
+
+    Only post-media JSON trees enter through the split predicate. Retain typed,
+    ordered input bytes and an immutable integer, not a mutable subtree or ref.
+    Path, depth, sibling reservations and remaining refs still govern every
+    predicate/reservation independently; none affects the pure byte-size helper.
+    """
+
+    def __init__(self, frame: Mapping[str, Any], frames_dir: Path):
+        # Reuse the established binding calculation, not its cached decisions
+        # or serialization table. Candidate #1 remains independently unchanged.
+        self._guard = _SnapshotSerializationReuse(frame, frames_dir)
+        self._thread = threading.get_ident()
+        self._policy = (_json_size_bytes, _json_safe, _is_empty, json.dumps)
+        self._entries: dict[bytes, int] = {}
+        self._retained_bytes = 0
+
+    @staticmethod
+    def _plain_json_tree(value: Any) -> bool:
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if type(item) is dict:
+                if any(type(key) is not str for key in item):
+                    return False
+                pending.extend(item.values())
+            elif type(item) is list:
+                pending.extend(item)
+            elif type(item) not in (str, int, float, bool, type(None)):
+                return False
+        return True
+
+    def size(self, value: Any, *, frame: Mapping[str, Any], frames_dir: Path) -> int:
+        state_flow_note(prepared_size_context_checks=1)
+        if (
+            threading.get_ident() != self._thread
+            or self._guard._binding is None
+            or self._guard._current_binding(frame, frames_dir) != self._guard._binding
+        ):
+            state_flow_note(prepared_size_binding_fallbacks=1)
+            return _json_size_bytes(value)
+        if self._policy != (_json_size_bytes, _json_safe, _is_empty, json.dumps):
+            state_flow_note(prepared_size_policy_fallbacks=1)
+            return _json_size_bytes(value)
+        try:
+            # Private comparison bytes only: never persisted or unmarshalled.
+            # Type tags preserve distinctions such as 0 versus '0' mapping keys;
+            # version 2 preserves order without object-alias/interning flags.
+            prepared = marshal.dumps(value, 2)
+        except (ValueError, TypeError, RecursionError):
+            state_flow_note(prepared_size_unknown_fallbacks=1)
+            return _json_size_bytes(value)
+        state_flow_note(prepared_size_input_encodings=1, prepared_size_input_bytes=len(prepared))
+        previous = self._entries.get(prepared)
+        if previous is not None:
+            state_flow_note(prepared_size_hits=1)
+            return previous
+        result = _json_size_bytes(value)
+        state_flow_note(prepared_size_misses=1)
+        # Admission is checked on misses only. Exact typed bytes cannot make an
+        # unsupported object hit an admitted plain-JSON input.
+        if not self._plain_json_tree(value):
+            state_flow_note(prepared_size_unknown_fallbacks=1)
+            return result
+        retained_bytes = len(prepared) + 8
+        if self._retained_bytes + retained_bytes <= _SNAPSHOT_SIZE_PREPARATION_MAX_BYTES:
+            self._entries[prepared] = result
+            self._retained_bytes += retained_bytes
+            state_flow_note(prepared_size_retained_bytes=retained_bytes)
+        else:
+            state_flow_note(prepared_size_budget_fallbacks=1)
+        return result
+
+
 def _write_snapshot_ref(
     value: Any,
     *,
@@ -2651,6 +2832,8 @@ def _write_snapshot_ref(
     _sidecar_parent_json_path: str | None = None,
     _sidecar_split_counter: Optional[list[int]] = None,
     _media_normalized: bool = False,
+    _serialization_reuse: Any = None,
+    _size_preparation: Any = None,
 ) -> dict[str, Any]:
     state_flow_note(snapshot_root_calls=int(not _sidecar_child_ref), snapshot_child_calls=int(_sidecar_child_ref), recursive_split_operations=int(_sidecar_child_ref), snapshot_preparations=int(not _media_normalized))
     response_id = _safe_path_token(_frame_response_id(frame) or 'unknown_response')
@@ -2681,14 +2864,18 @@ def _write_snapshot_ref(
             json_path=json_path,
             depth=_sidecar_depth,
             split_counter=split_counter,
+            serialization_reuse=_serialization_reuse,
+            size_preparation=_size_preparation,
         )
-    with measure_operation('snapshot_timestamp_normalization', role='canonical_truth'):
-        safe_value, normalization = _normalize_snapshot_content(safe_value, json_path=json_path)
-    with measure_operation('snapshot_serialization', role='canonical_truth'):
-        encoded = json.dumps(safe_value, ensure_ascii=False, sort_keys=True, indent=2).encode('utf-8')
+    if _sidecar_child_ref and isinstance(_serialization_reuse, _SnapshotSerializationReuse):
+        encoded, normalization = _serialization_reuse.serialize(
+            safe_value, json_path=json_path, frame=frame, frames_dir=frames_dir,
+        )
+    else:
+        encoded, normalization = _serialize_snapshot_content(safe_value, json_path=json_path)
     with measure_operation('snapshot_content_addressing', role='canonical_identity'):
         digest = hashlib.sha256(encoded).hexdigest()
-    state_flow_note(snapshot_serializations=1, snapshot_serialized_bytes=len(encoded), snapshot_hashed_bytes=len(encoded), identity_kind='produced_cas', identity=digest)
+    state_flow_note(snapshot_hashed_bytes=len(encoded), identity_kind='produced_cas', identity=digest)
     relative_path = (
         Path(DEFAULT_RESPONSE_FRAME_SNAPSHOT_DIR)
         / DEFAULT_RESPONSE_FRAME_SNAPSHOT_CONTENT_DIR
@@ -4943,9 +5130,15 @@ def compact_response_frame_for_ledger(
     frame.pop('public_body_compaction', None)
     target_dir = Path(frames_dir)
     snapshot_refs: dict[str, dict[str, Any]] = {}
+    serialization_reuse = _SnapshotSerializationReuse(frame, target_dir)
+    size_preparation = _SnapshotSizePreparation(frame, target_dir)
 
     def snapshot(value: Any, json_path: str) -> dict[str, Any]:
-        ref = _write_snapshot_ref(value, frame=frame, frames_dir=target_dir, json_path=json_path)
+        ref = _write_snapshot_ref(
+            value, frame=frame, frames_dir=target_dir, json_path=json_path,
+            _serialization_reuse=serialization_reuse,
+            _size_preparation=size_preparation,
+        )
         snapshot_refs[json_path] = ref
         return ref
 
@@ -5206,8 +5399,28 @@ def _write_response_frame_index(
         and prior_verified_size == pre_append_size
         and prior_verified_count == len(responses)
         and prior_verified_digest
-        and prior_verified_digest == _response_map_digest(responses)
     )
+    prepared_responses: Optional[dict[str, Any]] = None
+    if prior_response_map_verified:
+        prepared_prior = _json_safe(dict(responses))
+        prior_response_map_verified = (
+            prior_verified_digest == _prepared_response_map_digest(prepared_prior)
+        )
+        # Reuse representation only within this freshly read publication. The
+        # old digest still proves coverage; the updated map gets its own digest.
+        # Key normalization can merge/reorder replacements, so ambiguous maps
+        # and metadata use the original full-transformation path.
+        if (
+            prior_response_map_verified
+            and response_id not in {'response_frame', 'image_data_url', 'imageDataUrl'}
+            and all(
+                key and key == key.strip()
+                and key not in {'response_frame', 'image_data_url', 'imageDataUrl'}
+                for key in (*responses, *index_payload)
+            )
+        ):
+            prepared_responses = dict(prepared_prior)
+        del prepared_prior
     response_map_can_advance = pre_append_size == 0 or prior_response_map_verified
     responses[response_id] = {
         'response_id': response_id,
@@ -5233,6 +5446,10 @@ def _write_response_frame_index(
     }
     if effective_snapshot_manifest:
         responses[response_id]['effective_snapshot_manifest'] = _json_safe(effective_snapshot_manifest)
+    if prepared_responses is not None:
+        # Sibling values remain untouched. Normalize the replacement exactly
+        # once, at the same depth as both original full-map transformations.
+        prepared_responses[response_id] = _json_safe(responses[response_id])
     index_payload['kind'] = 'ollmo.response_frame_current_index'
     index_payload['version'] = 2
     index_payload['ledger_path'] = str(ledger_path)
@@ -5248,14 +5465,27 @@ def _write_response_frame_index(
     if response_map_can_advance and ledger_size_bytes is not None:
         index_payload['response_map_verified_size_bytes'] = ledger_size_bytes
         index_payload['response_map_entry_count'] = len(responses)
-        index_payload['response_map_digest'] = _response_map_digest(responses)
+        index_payload['response_map_digest'] = (
+            _prepared_response_map_digest(prepared_responses)
+            if prepared_responses is not None
+            else _response_map_digest(responses)
+        )
     else:
         index_payload.pop('response_map_verified_size_bytes', None)
         index_payload.pop('response_map_entry_count', None)
         index_payload.pop('response_map_digest', None)
+    if prepared_responses is None:
+        publication_payload = _json_safe(index_payload)
+    else:
+        publication_payload = _json_safe({
+            key: value for key, value in index_payload.items() if key != 'responses'
+        })
+        # Do not normalize the prepared map again: nested-empty normalization
+        # is not idempotent. No map value is mutated between hashing and encode.
+        publication_payload['responses'] = prepared_responses
     encoded_index = (
         json.dumps(
-            _json_safe(index_payload),
+            publication_payload,
             ensure_ascii=False,
             sort_keys=True,
             indent=2,

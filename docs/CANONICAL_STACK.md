@@ -22,7 +22,7 @@ Authoritative local runtime substrate.
 - `state/llama_cpp_catalog.json` as the durable source catalog for pulled/registered llama.cpp models
 - `ollmo_core/backend_fabric.py` as the normalized backend discovery/lifecycle contract layer above backend-specific runtime managers
 - `state/chat_history/` as the canonical durable history store for active UI conversations, including the Responses workbench, lineage rotation state, and the persisted message/request payloads that rebuild the frontend timeline
-- `artifacts/` as the canonical user-visible artifact tree, with generated outputs stored directly under `artifacts/`, saved request inputs under `artifacts/inputs/`, and audit/report outputs under `artifacts/audits/`
+- `artifacts/` as the canonical user-visible artifact tree, with generated outputs stored in typed buckets under `artifacts/`, saved request inputs under `artifacts/inputs/`, and audit/report outputs under `artifacts/audits/`
 - Ollama + MLX + llama.cpp runtime handling
 - Capability-aware startup/stop
 - Backend-native runtime defaults surfaced in registry/status metadata where supported
@@ -73,6 +73,15 @@ Runtime-adjacent product services built on top of the substrate.
   - Ghost-owned image/audio requests now default to prepare-first on chat with downstream materialization branches; plain chat may still end at phase 1
   - local backend model calls execute selected phases or materialize branches; graph/runtime truth decides fulfillment
   - visible file/artifact claims are truth-gated against runtime outputs before freeze
+
+Durable completion and secondary observation have separate boundaries. The
+finalizer constructs accepted frame/output truth, attempts Artifact Registry
+persistence, then writes verified CAS, the Ledger and the derived Index. Relevant
+settled Readiness retention follows synchronously and cannot roll back the frame
+or authorize execution. Ordinary persistence errors are currently logged and may
+leave a live result, so completion/delivery alone is not a durability receipt.
+See [Responses Contract](RESPONSES_CONTRACT.md#finalization-and-durable-completion)
+and the [current owner map](ARCHITECTURE_MAP.md#durable-state-continuation-and-observer-owners).
 
 Primary package surface:
 

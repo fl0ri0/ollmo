@@ -44,6 +44,41 @@ Existing capabilities remain available unless they would make installation,
 security, or response truth materially unsafe. Optional backends and
 modalities remain experimental.
 
+## Source selection and checksums
+
+`scripts/build_release_archive.py` owns the current source allowlist and verifier.
+`PUBLIC_DOCS` includes the normative contracts, `SELF_ATTACK.md`, its dated
+September 6 status summary, causal telemetry and state-flow diagnostics.
+`PUBLIC_CONFIG_PATHS` includes exactly `config/self_attack_corpus.json` and
+`config/graph_rebase_shadow_corpus.json` as compact reproducible inputs. Harness
+and test code are included through the normal source-tree rules. Raw captures,
+production ledgers, local forensic corpora and generated `state/` are excluded;
+running conformance creates new local evidence.
+
+The four exact companion-skill files are `skills/ollmo/SKILL.md`,
+`skills/ollmo/NOTICE`, `skills/ollmo/agents/openai.yaml` and
+`skills/ollmo/references/ollmo-contract.md`. Other skills are excluded. Some skill
+engineering/monitoring references describe development-checkout resources:
+`AGENTS.md`, `plans/` and `skills/ollmo-run-monitor/` are not shipped. Public
+operation uses the bundled contracts and `OLLMO_FOR_AGENTS.md`; missing optional
+development resources are not a reason to infer runtime authority.
+
+Development-only benchmark/idea/direction notes, legacy/framework decisions,
+implementation reports and the release acceptance journal are excluded. The
+allowlist, rather than an old journal's file count, determines current packaging.
+The canonical `scripts/ollmo_run_monitor.py` ships; any compatibility wrapper
+under `state/` does not.
+
+`MANIFEST.sha256` covers every staged regular release file except itself,
+including the generated empty `model_ports.json`. The verifier checks the exact
+file set and every digest, as well as archive-path/type/size and public-scope
+constraints. The manifest cannot contain the final archive's own digest; the
+builder reports that SHA-256 separately. Deterministic staging/archive metadata
+makes unchanged selected inputs reproducible. This is content-integrity and
+packaging evidence, not a signed release or proof of runtime conformance. The
+builder performs no upload; publication gates and external publication remain
+separate actions.
+
 ## Supported Environment
 
 The primary tested environment is a recent macOS release on Apple Silicon

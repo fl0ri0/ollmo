@@ -6,9 +6,12 @@ risk, and run release validation when preparing a release. Once relevant checks
 pass, repeat or broaden only for new changes, failures or unresolved concerns.
 Prose-only edits ordinarily need static contract/link checks, not live inference.
 
-For an explicitly authorized live adversarial sweep of the five intent/truth boundaries, run
-`./ollmo self-attack`. See [SELF_ATTACK.md](SELF_ATTACK.md) for deterministic
-oracles, discovered profiles, full truth capture, reduction and regression replay.
+For deterministic/fake conformance across the five intent/truth boundaries, run
+`./ollmo self-attack`. This does not run live models. An explicitly authorized
+live sweep uses `--mode live --fake-evidence <matching-results.json>` or
+`--live-after-fake`; it writes actual responses/artifacts through an already
+running control plane. See [SELF_ATTACK.md](SELF_ATTACK.md) for oracles, discovered
+profiles, full truth capture, budgets, reduction and regression replay.
 
 Do not overthink. Just map the issue.
 
@@ -190,6 +193,17 @@ When touching intent-aligned repair/redraw scope selection, include:
 
 The expected current shape is that Runtime exposes `redraw_scope_ladder_review`, reserved/additive/binding/identity scopes are considered before partial or full rebase, graph repair proposals only consume the scope as orientation, rebase proposals preserve bounded scope fields, duplicate refs are canonicalized only when proven aliases, and conflicting duplicate refs stay repair-needed.
 
+For canonical artifact registration, run:
+
+    .venv/bin/python -m pytest tests/test_canonical_artifact_registry.py tests/test_artifact_registry.py tests/test_artifact_dossiers.py tests/test_artifact_authority.py -q
+
+Cover reconciled multi-artifact frames, exact refs and producer bindings,
+successor recovery, stale top-level projections, alias promotion, equal-content
+distinct files, idempotent refresh and existing missing/invalid-file behavior.
+Then include response-frame/lookup, readiness-registry consumers and affected
+API/fake-backend checks in a disposable checkout. Registry verification must
+compare canonical IDs/refs/paths/digests, not file counts alone.
+
 For local artifact path identity, also run:
 
     .venv/bin/python -m pytest tests/test_responses_api.py -q -k "artifact_path_identity"
@@ -205,6 +219,17 @@ new validated frame can replace that adjudication. Active execution, hard
 terminal state, and unrelated open Closure checks retain their authority.
 
 For generic intent-obligation graph adequacy, run:
+
+    .venv/bin/python -m pytest tests/test_explicit_file_contract_preservation.py tests/test_inference_service.py tests/test_request_phase_graph_runtime.py tests/test_saved_file_consumer_path.py tests/test_saved_file_graph_rebuild.py tests/test_file_output_contract_boundaries.py -q
+
+The explicit-file slice must preserve all accepted named files before model
+output and across reduced detector/planner/response-graph results. Missing or
+wrong-identity files must not yield fulfilled Closure; a complete set may close.
+Keep JSON answer-format/source/negation boundaries, exact counts and identities,
+extra-derived-file behavior, explicit release states and saved-file dependencies.
+Plain-text semantic correctness remains separate from file-contract preservation.
+
+For the broader adequacy and runtime wiring boundary, also run:
 
     .venv/bin/python -m pytest tests/test_request_phase_graph_runtime.py tests/test_response_semantics_runtime.py tests/test_graph_repair_self_healing.py -q
 
@@ -250,6 +275,22 @@ preparation, byte/provenance equivalence, distinct media-file identities, change
 inputs/files, missing/corrupt repeated sidecars, and post-write verification
 failure. Snapshot preparation reuse must never suppress fresh integrity checks.
 
+For compaction-local child serialization reuse, include
+`tests/test_snapshot_serialization_reuse.py` as well. It covers exact input and
+normalization-policy matching, changed frame/sequence/source/epoch/map bindings,
+same-byte authority replacement, fresh media and CAS verification, missing or
+corrupt repeated sidecars, post-write failure, memory-budget fallback, immutable
+metadata and concurrent operation isolation. Reuse changes preparation only;
+root writes and every CAS check remain active.
+
+For compaction-local size preparation, include
+`tests/test_snapshot_size_preparation.py`. Only the pure JSON-safe byte-size
+calculation may reuse exact private typed input bytes; split eligibility, path,
+depth, sibling reservations, ref budgets, media provenance, occurrence metadata
+and CAS verification still run normally. The separate 8 MiB representation budget
+falls back to full preparation. Tests cover binding/policy/worker changes, unknown
+inputs, immutable results, memory exhaustion and fresh media/CAS failure handling.
+
 For epoch/map preparation changes, include
 `tests/test_response_frame_epoch_verification.py`. It checks exact versus changed
 entry bindings, relocated epochs, physical evidence changes during verification,
@@ -294,6 +335,27 @@ Use this before Ghost self-learning changes or larger response-frame, artifact, 
 
 The harness also covers the current learning/healing truth boundary: fake `/api/responses` payloads must expose `runtime.request_phase_graph.intent_obligations`, local producer-before-consumer dependency edges, and structural `intent_graph_adequacy`; accepted-learning hints may surface as soft decision-contract orientation but must not create executable graph repair proposals, graph patch lifecycle truth, staged patches, or applied patches by themselves.
 
+## Documentation and release static validation
+
+For prose-only work, check local Markdown links and fragments, repository owner
+paths, command flags and referenced config files against the current checkout.
+Distinguish generated runtime paths and illustrative placeholders from shipped
+files. Compare public references with `scripts/build_release_archive.py`:
+`PUBLIC_DOCS`, `PUBLIC_CONFIG_PATHS` and `RELEASE_SKILL_FILES` govern inclusion;
+a file existing in a development checkout does not prove it is packaged.
+
+The existing packaging/static checks mostly use temporary fixture source trees;
+one read-only check also compares the checkout’s public `examples/` files with
+the exact reference allowlist:
+
+    .venv/bin/python -m pytest tests/test_release_archive.py -q
+
+They validate allowlisting, exact manifest coverage, reproducibility and unsafe
+archive rejection. They do not certify current runtime behavior or reproduce a
+historical release. Inspect actual source selection as well when documenting
+packaging; do not build/upload a release or run inference merely to validate prose.
+No standalone repository-wide Markdown-link validator is currently provided.
+
 ## Naming, Schema, And Prompt-Wording Changes
 
 For docs-only public terminology cleanup, verify the glossary and active-doc search:
@@ -312,6 +374,17 @@ For prompt or injected policy wording changes that reach Ghost routing, the reso
     .venv/bin/python -m pytest tests/test_responses_api.py -q -k "ghost_route or ghost_auto or ghost_route_preview or execution_planner or planner_deferred or late_fill"
 
 When a local chat-capable runtime is available, also compare a small live set: plain chat, write-then-speak, describe-then-image, selected-reference follow-up, latest-artifact edit, and each compatibility `ghost_mode` variant that is still accepted at the API edge.
+
+For structural Late Fill telemetry extraction, also run:
+
+    .venv/bin/python -m pytest tests/test_late_fill_telemetry_extraction.py tests/test_saved_file_consumer_path.py -q
+
+The worker fixtures inject local lookup/finalizer/fake execution dependencies and
+check waves, publication order, availability identity, retry lineage, process/boot
+bindings, causal-sink failure and the unchanged legacy timing-log failure path.
+Save/read routing fixtures must explicitly mark their injected fake chat transport
+live; do not weaken the production liveness or saved-file evidence gates.
+Run API/E2E coverage in a disposable checkout as described above.
 
 For bounded handoff/transition observations, additionally run:
 

@@ -395,7 +395,9 @@ def test_public_reference_allowlist_matches_repository_files() -> None:
     actual = {
         path.relative_to(repository_root)
         for path in (repository_root / 'examples').rglob('*')
-        if path.is_file()
+        # Finder metadata is not source material; archive validation still
+        # rejects it if it reaches a staged/public tree.
+        if path.is_file() and path.name != '.DS_Store'
     }
     assert actual == set(release.RELEASE_REFERENCE_EXAMPLE_FILES)
 
@@ -536,7 +538,14 @@ def test_verify_only_rejects_non_public_documentation_path(
         release.verify_archive(archive_path)
 
 
-def test_other_hidden_release_metadata_remains_forbidden(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    'metadata_path',
+    ['.github/private.txt', '.DS_Store', 'examples/.DS_Store'],
+)
+def test_other_hidden_release_metadata_remains_forbidden(
+    tmp_path: Path,
+    metadata_path: str,
+) -> None:
     source = _make_release_source(tmp_path)
     result = release.build_release_archive(
         source_root=source,
@@ -544,7 +553,7 @@ def test_other_hidden_release_metadata_remains_forbidden(tmp_path: Path) -> None
     )
     staged_root = Path(str(result['staging_root']))
     (staged_root / release.MANIFEST_NAME).unlink()
-    _write(staged_root / '.github' / 'private.txt', 'not public\n')
+    _write(staged_root / metadata_path, 'not public\n')
     release.write_manifest(staged_root)
     archive_path = tmp_path / 'unexpected-hidden-metadata.tar.gz'
     release.write_deterministic_archive(staged_root, archive_path)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from pathlib import Path
 import re
@@ -3463,6 +3464,8 @@ def _text_artifact_request_branches(
                 if index != json_request_index
             ]
     next_phase_number = _next_phase_number(existing_branches)
+    occupied_branch_ids = {_clean_text(branch.get('branch_id')) for branch in existing_branches}
+    next_file_branch_number = 1
     local_visual_asset_binding_required = bool(analysis.get('local_visual_asset_requirement'))
     linked_image_phase_ids = [
         _clean_text(branch.get('phase_id'))
@@ -3472,6 +3475,10 @@ def _text_artifact_request_branches(
         and _clean_text(branch.get('contract_state')).lower() != 'reserved'
     ]
     for index, request in enumerate(remaining_requests, start=1):
+        while f'branch-text_artifact-{next_file_branch_number}' in occupied_branch_ids:
+            next_file_branch_number += 1
+        file_branch_id = f'branch-text_artifact-{next_file_branch_number}'
+        occupied_branch_ids.add(file_branch_id)
         extension = _clean_text(request.get('extension')).lower() or 'txt'
         source_name = _clean_text(request.get('source_name')) or f'generated-{extension}'
         source = _clean_text(request.get('source')) or 'explicit_text_artifact_request'
@@ -3523,7 +3530,7 @@ def _text_artifact_request_branches(
             **retained_input_contract,
         }
         branch_record = {
-            'branch_id': f'branch-text_artifact-{index}',
+            'branch_id': file_branch_id,
             'phase_id': phase_id,
             'capability': CAPABILITY_CHAT,
             'output_type': 'text',
@@ -5488,6 +5495,47 @@ def _downstream_phase_status(
     return 'pending' if response_payload else 'planned'
 
 
+def _accepted_current_turn_file_contracts(
+    prompt: str,
+    route: Mapping[str, Any],
+    response: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Retain runtime-accepted file promises, never model-derived request lists.
+
+    The existing intent ledger is authority. Exact current-turn prompt binding
+    excludes predecessor/history graphs. Newer records may update an existing
+    identity (including explicit waiver/supersession), but absence is not release.
+    """
+    obligations_by_id: dict[str, dict[str, Any]] = {}
+    branches_by_id: dict[str, dict[str, Any]] = {}
+    for runtime in (_mapping(route.get('route_runtime')), _mapping(response.get('runtime'))):
+        graph = _mapping(runtime.get('request_phase_graph'))
+        if graph.get('kind') != 'ollmo.request_phase_graph' or _clean_text(graph.get('prompt')) != prompt:
+            continue
+        obligations = [copy.deepcopy(dict(item)) for item in graph.get('intent_obligations') or []
+                       if isinstance(item, Mapping) and item.get('kind') == 'text_artifact'
+                       and item.get('source') == 'current_user_intent'
+                       and item.get('obligation_id')
+                       and item.get('target_name') and item.get('target_extension')]
+        for item in obligations:
+            previous = obligations_by_id.get(item['obligation_id'])
+            if previous and any(previous.get(key) != item.get(key)
+                                for key in ('target_name', 'target_extension')):
+                continue
+            obligations_by_id[item['obligation_id']] = item
+        for branch in graph.get('downstream_branches') or []:
+            if not isinstance(branch, Mapping) or _is_unpromoted_candidate_record(branch):
+                continue
+            artifact_request = _mapping(branch.get('artifact_request'))
+            if any(item.get('branch_id') == branch.get('branch_id')
+                   and item.get('phase_id') == branch.get('phase_id')
+                   and item['target_name'] == artifact_request.get('source_name')
+                   and item['target_extension'] == artifact_request.get('extension')
+                   for item in obligations_by_id.values()):
+                branches_by_id[branch['branch_id']] = copy.deepcopy(dict(branch))
+    return list(obligations_by_id.values()), list(branches_by_id.values())
+
+
 def build_request_phase_graph(
     prompt: str,
     *,
@@ -5519,6 +5567,15 @@ def build_request_phase_graph(
         normalized_prompt,
         source_available=_has_source_artifact_available(request, route, response),
     )
+    accepted_file_obligations, accepted_file_branches = _accepted_current_turn_file_contracts(
+        normalized_prompt, route, response,
+    )
+    for branch in accepted_file_branches:
+        accepted_request = branch['artifact_request']
+        if not any(all(item.get(key) == accepted_request.get(key)
+                       for key in ('source_name', 'extension', 'target_path'))
+                   for item in text_artifact_requests):
+            text_artifact_requests.append(copy.deepcopy(accepted_request))
     text_artifact_requests = _merge_text_artifact_requests(
         text_artifact_requests,
         _text_artifact_source_requests_from_history(
@@ -5591,6 +5648,20 @@ def build_request_phase_graph(
         response_payload=response,
         refinement_capabilities=refinement_capabilities,
     )
+    # Missing derived plans do not release accepted file work. Reuse its exact
+    # branch/phase/dependency contract rather than allocate a replacement owner.
+    for accepted_branch in accepted_file_branches:
+        planned_branch = next((branch for branch in downstream_branches
+                               if branch.get('branch_id') == accepted_branch.get('branch_id')), None)
+        if planned_branch is None:
+            downstream_branches.append(accepted_branch)
+        else:
+            for key in ('phase_id', 'depends_on', 'artifact_request', 'requires_artifact',
+                        'text_artifact_extension', 'text_artifact_source_name', 'text_artifact_source'):
+                if key in accepted_branch:
+                    planned_branch[key] = copy.deepcopy(accepted_branch[key])
+            if accepted_branch.get('status') in {'waived', 'superseded'}:
+                planned_branch['status'] = accepted_branch['status']
     _retain_counted_audio_variant_contracts(
         downstream_branches,
         prompt_analysis=prompt_analysis,
@@ -5643,6 +5714,10 @@ def build_request_phase_graph(
         text_artifact_requests=text_artifact_requests,
         downstream_branches=downstream_branches,
     )
+    accepted_by_id = {item['obligation_id']: item for item in accepted_file_obligations}
+    intent_obligations = [accepted_by_id.pop(item.get('obligation_id'), item)
+                          for item in intent_obligations]
+    intent_obligations.extend(accepted_by_id.values())
     audio_cardinality_block = _audio_cardinality_blocking_obligation(prompt_analysis)
     if audio_cardinality_block:
         intent_obligations.append(audio_cardinality_block)
@@ -5944,6 +6019,8 @@ def build_request_phase_graph(
         source = _clean_text(item.get('source'))
         if source:
             payload['source'] = source
+        if item.get('status') in {'waived', 'superseded'}:
+            payload['status'] = item['status']
         required = item.get('required')
         if isinstance(required, bool) or _clean_text(required):
             payload['required'] = required

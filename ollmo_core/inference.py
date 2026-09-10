@@ -1107,6 +1107,53 @@ def _json_text_artifact_manifest_sibling_line(value: str) -> bool:
     )
 
 
+def _text_artifact_filename_has_declaration_authority(
+    text: str, start: int, end: int,
+) -> bool:
+    """Carry a file-creation header across adjacent named file specifications.
+
+    A specification is a filename followed by its required content/format, not
+    a source mention or response-format instruction. Use the existing manifest
+    authority and negation rules; quoted payload punctuation is not a boundary.
+    """
+    masked, _ = _mask_json_text_artifact_quotes(str(text or ''))
+    filenames = list(_TEXT_ARTIFACT_EXTENSION_RE.finditer(masked))
+    filename_dots = {index for match in filenames
+                     for index in range(match.start(), match.end()) if masked[index] == '.'}
+    boundaries = [match.start() for match in re.finditer(r'[.;!?\n]', masked[:start])
+                  if match.start() not in filename_dots]
+    clause_start = boundaries[-1] + 1 if boundaries else 0
+
+    def specification(clause: str) -> bool:
+        filename = _TEXT_ARTIFACT_EXTENSION_RE.search(clause)
+        if not filename or clause[:filename.start()].strip(' \t`\"\''):
+            return False
+        if not re.match(r'\s*(?:must|shall|should|muss|soll)\s+'
+                        r'(?:contain|include|be|enthalten|beinhalten|sein)\b',
+                        clause[filename.end():], flags=re.IGNORECASE):
+            return False
+        negated, _ = _json_text_artifact_candidate_state(clause, filename.start(), filename.end())
+        return not negated
+
+    if not specification(masked[clause_start:]):
+        return False
+    # Only a contiguous run of specifications can inherit the preceding header.
+    # An intervening source, discussion, or independent command ends that scope.
+    previous_end = clause_start - 1
+    for boundary in reversed([-1, *boundaries[:-1]]):
+        clause = masked[boundary + 1:previous_end].strip()
+        previous_end = boundary
+        if not clause:
+            continue
+        if _json_text_artifact_manifest_header_has_output_authority(
+            clause + '.', allow_terminal_period=True,
+        ):
+            return True
+        if not specification(clause):
+            return False
+    return False
+
+
 def _json_text_artifact_filename_has_manifest_authority(
     text: str,
     start: int,
@@ -1123,6 +1170,8 @@ def _json_text_artifact_filename_has_manifest_authority(
         target_end,
     ):
         return False
+    if _text_artifact_filename_has_declaration_authority(prompt, target_start, target_end):
+        return True
     line_start = prompt.rfind('\n', 0, target_start) + 1
     line_end = prompt.find('\n', target_end)
     if line_end < 0:

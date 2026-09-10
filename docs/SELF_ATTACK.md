@@ -39,6 +39,14 @@ production preferences, operator authorization, or learning state. Fake model
 decisions are deterministic substitutes; this mode does not certify a live
 Ghost model's interpretation.
 
+The source release ships this guide, the harness/tests and two compact inputs:
+`config/self_attack_corpus.json` (the default adversarial corpus) and
+`config/graph_rebase_shadow_corpus.json`. Retained captures, local regression
+outputs and large forensic corpora under `state/` are generated evidence, not
+required release contents. See [Release Scope](RELEASE_SCOPE.md#source-selection-and-checksums).
+The [September 6 status report](SELF_ATTACK_STATUS_2026-09-06.md) is historical;
+it does not certify a changed checkout or expand representative live coverage.
+
 ## Five boundaries, in priority order
 
 1. **Commitment ↔ closure:** confident completion prose and status-only review

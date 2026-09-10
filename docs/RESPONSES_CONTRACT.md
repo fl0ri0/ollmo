@@ -45,6 +45,21 @@ Explicit inline/embedded implementation formats (for example embedded CSS or
 inline JavaScript) do not request additional file artifacts. An explicitly named
 separate stylesheet or script remains a separate output request.
 
+An affirmative file-creation header also governs adjacent named file
+specifications (for example, “Create two files. note.txt must contain notes.
+status.json must contain data.”). This is file authority, not JSON response
+formatting. Quoted examples, source/reference descriptions, negation and an
+intervening independent instruction do not acquire that authority.
+
+Accepted current-turn file promises remain in `request_phase_graph.intent_obligations`
+when a later detector, planner, or response graph contains fewer requests. Graph
+rebuilding retains their exact file and branch/phase/dependency identities from
+the same-prompt runtime graph; newer explicit waiver/supersession records remain
+visible. A smaller derived set is not a release. The composed Closure owner uses
+the existing terminal saved-file evidence check for accepted named obligations;
+counting other text artifacts cannot fulfill a missing filename/type. This does
+not add general semantic or literal-content validation for plain text files.
+
 A request to read a saved file and derive a named output from those read bytes
 is stronger than a dependency on preparation text. For a unique newly requested
 text producer and named text consumer, the bounded grammar builds
@@ -132,25 +147,27 @@ Frame ledger rules:
 - Persisted ledger rows are compact audit facts. Large internal snapshots such as full `runtime`, `working_frame`, request-phase graphs, context candidates, planner diagnostics, bulky semantic-review state, work trees, large request inputs, and oversized planning contracts may be moved into sidecar JSON files under `state/response_frames/snapshots/`. Sidecars are content-addressed by SHA-256, so separate semantic refs such as `runtime` and `current_state.runtime`, `planning.request_phase_graph` and `planning.artifact_flow.request_phase_graph`, or repeated work-tree projections may point at the same physical file when their payloads are byte-identical. Large nested runtime/working-frame subtrees are split into their own `*_snapshot_ref` entries rather than summarized; the parent snapshot keeps the ref structure, and the child sidecar keeps the full raw subtree. The ledger keeps machine-readable `*_snapshot_ref` / `external_snapshots` entries with path, SHA-256 digest, byte size, and JSON path. This preserves truth without duplicating multi-megabyte internal state in every successor row.
 - Successor ledger rows delta-log external snapshots against their parent frame. `external_snapshots.items` on a persisted successor contains only new or changed refs for that row; unchanged parent refs are listed under `external_snapshots.inheritance` and omitted from the row-local `items`. Recovery/replay merges the parent manifest before returning the current response view. When a recovered frame exposes both effective and row-local truth, `external_snapshots.items` is the effective merged manifest and `external_snapshots.delta_items` is the successor row's own diff.
 - Sidecar snapshots may themselves be compact CAS manifests. Large worthwhile child fields such as request-phase graph nodes/edges, context candidates, decision/semantic contracts, graph-closure reviews, dependency evidence, branch/result collections, and work-tree structures can be replaced inside the sidecar by child `*_snapshot_ref` entries when they exceed the split threshold. This is ref-splitting, not summarization: child sidecars keep the full content, and snapshot readers expand those refs for replay/recovery.
-- Recursive child splitting reuses the parent's private media-normalized JSON subtree within that snapshot write. Independent snapshot writes normalize their inputs anew. Every child still receives its own path/lineage metadata, serialization, content hash, and current sidecar-byte verification; this preparation reuse does not cache file integrity or change publication ordering.
+- Recursive child splitting reuses the parent's private media-normalized JSON subtree within that snapshot write. Independent snapshot writes normalize their inputs anew. Every child still receives its own path/lineage metadata, content hash, and current sidecar-byte verification. Within one compaction, recursive child writes may reuse immutable normalized/serialized bytes only after comparing the exact freshly split input and normalization policy and rechecking the same private frame, sequence, storage directory, ledger, and index bindings. Root snapshots still normalize/serialize independently. Changed or unprovable bindings, new inputs, and exhausted preparation memory use the full transformation path. This preparation reuse does not cache file integrity or change publication ordering.
+- Within one compaction, pure JSON byte-size preparation may also reuse exact typed, ordered private input bytes under the same frame/storage/policy/worker binding and a separate 8 MiB memory budget. This reuses only the size calculation: split eligibility, JSON path, depth, sibling reservations, ref budgets, media normalization and current CAS verification still execute. Unknown inputs or exhausted memory take the full preparation path.
 - `working_frame` ledger sidecars are logic-only vessels. They keep small orchestration state such as `status`, pending ids, closure/loop state, and compact route/request summaries inline, while graph, contract, prompt, input, context-candidate, and artifact-flow bodies are represented by child `*_snapshot_ref` entries. The child sidecars remain full diagnostic truth.
 - `outputs[]` and `output_slots[]` are handle projections. They keep `artifact_ref`, slot/status/type/order, and compact recovery fields, but must not inline artifact dossiers, prompts, provenance, metadata, `image_state`, paths, or nested `artifacts[]` once an artifact ref exists. Full artifact identity, provenance, metadata, and enrichments live in the artifact dossier snapshot and registry.
 - Diagnostic snapshot hashes exclude volatile timestamp keys such as `created_at`, `updated_at`, `started_at`, and `completed_at` for graph/contract/context/work-tree sidecars. Those timestamps are bookkeeping metadata, not diagnostic content identity; frame/index metadata remains the operational time source, while the snapshot hash represents stable diagnostic content.
 - Persisted frames are indexed by `state/response_frames/current_index.json` for current-state recovery. The index is an optimization only; the compact JSONL ledger remains durable recovery truth. A current verified index binds the complete response map to physical ledger EOF with its byte size, entry count, and stable map digest. Entry-local ledger sizes are historical append-time facts: an older byte offset remains usable after unrelated append-only rows are added, provided global freshness holds and the decoded row still validates the requested response and frame identity. A verified complete map can also prove an absent response id without scanning the ledger. Legacy, incomplete, stale, malformed, or corrupt indexes cannot prove absence and fall back to the ledger; a failed direct read does the same. Recovery then returns the latest valid frame for the requested response id, or truthful not-found/corrupt-ledger state rather than unrelated or older state.
+- Within one Index publication, a freshly read and coverage-verified map may supply privately owned normalized sibling entries to the updated map. The replacement entry is normalized independently, the complete updated map is hashed again, and publication uses that same prepared map without another normalization. Invalid coverage or ambiguous key normalization takes the full transformation path. No representation or verification result survives the update; the canonical bytes, atomic file publication, append locking, parent CAS and subsequent reader/epoch checks retain their existing semantics.
 - Complete epoch verification reuses its already verified map digest for the private rebound copy only when every entry's ledger path and name remain exactly unchanged. Any changed binding, including equivalent path spelling, gets a newly computed digest. The full ledger scan, final physical ledger/index checks, and subsequent selection, hydration and registry binding checks still execute; no verification result is cached across calls.
 - A complete legacy v1 map can cross that boundary only through the explicit operator command `.venv/bin/python scripts/attest_response_frame_index.py`. Use `--check-only` first when inspecting an existing ledger. Attestation streams the physical ledger one line at a time, requires the exact response-id set and exact latest frame id/sequence/byte offset/line length for every entry, preserves all response entries and effective snapshot manifests, and atomically adds only the v2 coverage fields. Malformed rows, mismatches, or moving ledger/index evidence reject without writing. This is an index attestation, not a ledger rewrite or read-path migration.
 
 Wire projection and canonical truth are deliberately separate:
 
-- Successful non-streaming `POST` responses and `GET` views `default`, `ui`, `status`, and `debug` are byte-budgeted public projections. The final serialized outer envelope is at most 8 MiB, including retry/control/status wrappers; each serialized Responses-style SSE event is held to the same ceiling. These paths never hydrate sidecars.
+- Successful non-streaming `POST` responses and `GET` views `default`, `ui`, `status`, and `debug` are byte-budgeted public projections. The final serialized outer envelope is at most 8 MiB, including retry/control/status wrappers; each serialized Responses-style SSE event is held to the same ceiling. The normal indexed POST/default/UI/status projection does not hydrate sidecars. Bounded debug reads may hydrate selected Closure/rebase observation sidecars; exceptional ledger recovery may reconstruct canonical state before projecting a bounded result.
 - Public compaction is byte-based, not a fixed character or item-count cut. Ordinary 5,000-character text and collections of 65 tiny records remain intact when they fit the budget. Bulky strings at or above 256 KiB and collections at or above 1 MiB may instead expose a bounded preview plus exact length/count, byte size, SHA-256, and an adjacent content-addressed `*_snapshot_ref` for the complete value.
 - `view=full`, `view=raw`, and `view=truth` are exact canonical reads. They may exceed the public wire budget because they recursively restore the complete content-addressed sidecar graph. Every authoritative ref is recursively validated for its declared CAS identity and content before it is exposed; a missing, malformed, or corrupt ref fails closed with HTTP 409 instead of returning partial canonical truth.
 
 This is truth by reference, not semantic summarization. The public wire may carry handles, previews, counts, and digests, while exact bytes remain recoverable from the referenced CAS graph without semantic loss.
 
-`GET /api/responses/<id>` returns the current UI response view by default. It may come from live lookup state or, after lookup TTL expiry/restart, from the latest valid persisted frame for that response id, but the default projection must stay frontend-safe: lifecycle/status truth, output handles, artifact cards, display text, and compact late fill state are included; raw `response_frame`, `runtime`, `working_frame`, work-tree, graph diagnostics, and large repair/debug payloads are not. Recovered default views still carry compact recovery provenance through status fields such as `status_lookup`, `frame_id`, `frame_sequence`, and `state_version`. If the ledger is missing or corrupt, the API must return a truthful not-found or corrupt-ledger error; it must not synthesize a successful response.
+`GET /api/responses/<id>` returns the current UI response view by default. It may come from live lookup state or, after lookup TTL expiry/restart, from the latest valid persisted frame for that response id, but the default projection must stay frontend-safe: lifecycle/status truth, output handles, artifact cards, display text, and compact late fill state are included; raw `response_frame`, `runtime`, `working_frame`, work-tree, graph diagnostics, and large repair/debug payloads are not. Recovered default views still carry compact recovery provenance through status fields such as `status_lookup`, `frame_id`, `frame_sequence`, and `state_version`. When no usable live record exists, missing or corrupt durable truth produces a not-found or corrupt-ledger error. An existing live record can still supply a bounded fallback; that does not establish durable recovery or permit invented fulfillment.
 
-Non-streaming `POST /api/responses` and `POST /v1/responses` persist canonical frame truth before serializing the successful response. Their normal wire result is then projected from the current indexed compact ledger row: public lifecycle/status, output handles, output slots/branches, artifact handles, display text, frame identity, and the effective content-addressed snapshot-ref manifest remain available, while hydrated `runtime`, `working_frame`, and repeated full-frame bodies are not copied onto the wire. This projection is read-only and performs no sidecar hydration. If the durable row is not yet available, a bounded in-memory fallback keeps small compatibility payloads inline and replaces large internal bodies with clearly audit-only digest identities; those digest-only identities do not claim replay authority. Explicit canonical reads remain available through the truth views below.
+Non-streaming `POST /api/responses` and `POST /v1/responses` attempt canonical frame persistence before serializing the response. The normal durable path completes that persistence first; ordinary persistence errors are currently logged and may leave a live fallback, so HTTP success is not a durability guarantee. Their normal wire result is then projected from the current indexed compact ledger row: public lifecycle/status, output handles, output slots/branches, artifact handles, display text, frame identity, and the effective content-addressed snapshot-ref manifest remain available, while hydrated `runtime`, `working_frame`, and repeated full-frame bodies are not copied onto the wire. This projection is read-only and performs no sidecar hydration. If the durable row is not yet available, a bounded in-memory fallback keeps small compatibility payloads inline and replaces large internal bodies with clearly audit-only digest identities; those digest-only identities do not claim replay authority. Explicit canonical reads remain available through the truth views below.
 
 `GET /api/responses/<id>?view=status` returns the compact observer view for an existing response. It is for polling and UI state updates, not artifact copying. It exposes canonical lifecycle truth, open late fill branch state, compact surface/recovery state, and a `state_version` that changes when the observable response state changes. Clients should poll this compact view while work is open, fetch the default UI view only when `state_version` changes or artifact/detail handles are needed, and never start a duplicate `/api/responses` request just to check whether the original work finished. File contents for copy/open/show-all actions should be resolved from artifact entries and targeted artifact endpoints, not by pulling raw response-frame debug truth.
 
@@ -163,6 +180,11 @@ When present, `status_lookup` is a compact status companion inside the response 
 Artifact registry split:
 
 - Response frames carry output refs and compact artifact dossiers for replay/recovery.
+- Output registration consumes the attached current response frame's accepted
+  `artifacts.output` identities, including an empty accepted set. Earlier
+  top-level projections and last-saved-path shortcuts cannot replace that set or
+  mint replacement refs. Without an attached frame, explicit artifact records
+  take precedence over compatibility shortcuts for the same saved path/type.
 - `state/artifact_registry.jsonl` is the durable lookup surface for concrete artifacts across modalities. New output artifacts from `artifacts[]`, `saved_text_path`, `saved_text_artifacts`, `saved_audio_path`, and `saved_image_path` are persisted with `roles = ["output"]`, `artifact_ref`, path, type, provenance, metadata, and linked response ids. True external user inputs are persisted with `roles = ["input"]`.
 - Reused Ollmo artifacts are references, not new inputs. Route reuse, selected reference artifacts, artifact bindings, and registry-known paths must carry stable refs/bindings and must not be re-materialized as fresh `input_artifacts`.
 - Modality-specific provenance wins over generic output provenance. For example, generated-image provenance remains attached to the image artifact and generic output registration may add lookup metadata or linked responses without downgrading that provenance.
@@ -211,6 +233,56 @@ Example compatibility split:
 
 Blocked naming note: runtime uses plain `blocked` as the canonical lifecycle value for blocked late fill/current-state lookup. Older docs or compatibility payloads may say `late_fill_blocked`; clients should treat that as a compatibility alias for blocked repair/control truth, not as active late fill execution.
 
+## Finalization and durable completion
+
+Semantic completion, durable persistence and response delivery are distinct
+boundaries. Closure compares saved outputs and exact dependency evidence with
+the preserved original obligations. It may repeat during reconciliation and
+repair. A frozen frame can record fulfilled, pending, blocked or failed work.
+
+The finalizer in `ollmo_webserver.py` constructs the frame and reconciles public
+artifact identities, then attempts Artifact Registry persistence from that
+frame's accepted output set. The frame writer in
+`ollmo_services/response_frames.py` prepares and verifies CAS sidecars, appends
+and flushes/fsyncs the Ledger row under the append lock, then atomically publishes
+the derived Index. Parent compare-and-swap checks remain mandatory where the
+successor path requires them. These stores are not one atomic transaction: an
+Index failure can occur after the Ledger row is durable, and canonical recovery
+must retain its ledger fallback.
+
+After frame persistence returns successfully, the finalizer may retain a relevant
+settled graph-rebase Readiness observation. This pass remains synchronous before
+finalizer return, but is after canonical durable persistence. A concurrent lookup
+can therefore see the durable terminal successor before Readiness or the finalizer
+finishes. Readiness failure is secondary evidence failure: it neither rolls back
+the frame nor grants or removes semantic completion. Its diagnostics and final
+completion timings do not retroactively rewrite the persisted frame.
+
+Current failure limitation: the ordinary finalizer catches and logs Artifact
+Registry and frame-persistence exceptions. `ResponseFrameParentCASMismatch`
+propagates, but other persistence failures can leave a returned live payload with
+completed lifecycle and an in-memory frame. Neither HTTP 200, `persist_effective`,
+a frame-shaped object nor lifecycle alone is a commit receipt. Durable-completion
+claims need the matching latest Ledger/frame identity, valid referenced CAS and
+saved artifact evidence; use freshness and error metadata to distinguish live
+projection from recovered durable truth. Fixing this failure propagation is a
+separate runtime change.
+
+Readiness's Epoch is a verified source binding, not an execution epoch or an
+incrementing permission token. The verifier binds the physical Ledger/Index,
+complete map, latest frame identities and source-row digests. Selection,
+hydration and registry append still check current bindings. Relocated archived
+epochs may contribute verified evidence through explicit retention/sync; they
+cannot authorize current execution. The evidence registry and trusted operator
+registry are different stores with different authority.
+
+A private, single-use Readiness observation may avoid a second JSON hydration
+only after rechecking the same response/frame/map/epoch, physical files, indexed
+row bytes and every consumed sidecar's current bytes and integrity. A changed,
+missing, corrupt, relocated, consumed or untrusted candidate takes the normal
+loader or fails its existing gate. This receipt is never persisted or exposed as
+public authority, and registry validation/deduplication still runs.
+
 ## Request Phase Graph
 
 `runtime.request_phase_graph` is the request obligation graph. Its user intent is anchored by Ghost and the current turn, but its state may be refined before freeze from runtime evidence.
@@ -241,7 +313,7 @@ When this happens, synthesized branch records may carry:
       "refinement_source": "assistant_output_claim"
     }
 
-This is a closure-safety mechanism: if model text explicitly says a downstream phase is pending or queued but the original graph was too thin, Ollmo can materialize the missing branch before the response is treated as final.
+This is a closure-safety mechanism for an already-promoted current-turn obligation. A pending/queued assistant claim can expose an underrepresented branch, but the claim alone cannot promote a reserved, negated or merely inferred modality. Runtime still validates authority and materialization before treating the obligation as fulfilled.
 
 ## Candidate Graph And Promotion Review
 
@@ -303,7 +375,7 @@ Core fields:
 - `error`: display-safe aggregate error text when the overall late fill failed or partially failed.
 - `skip_kind`, `skip_reason`, `skip_source`: present when `status == "skipped"` so "no work needed" is not confused with a failed or suppressed continuation.
 - `recovery_candidates[]`: branch-local recovery options discovered by failure analysis. Candidates are inert unless explicitly promoted.
-- `auto_recovery_enabled`: currently `false`; recovery state is visible, but no hidden repair loop may execute it.
+- `auto_recovery_enabled`: currently `false` for generic recovery candidates. This does not disable separately Closure-promoted auto-executable repairs or the named bounded image/TTS recovery policies; their exact contracts and gates still decide scheduling.
 - `repair_action` / `repair_actions`: optional Closure Repair classification for the active gap or pending repair branches.
 
 UI surfaces should treat `pending_branches`, `active_branches`, `completed_branches`, `failed_branches`, and `fill_results` as branch-state truth before older slot projections. Slots are still useful for layout and artifact identity, but a stale pending slot must not keep showing queued when the matching branch is completed or blocked.

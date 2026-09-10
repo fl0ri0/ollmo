@@ -64,6 +64,28 @@ Ollmo is currently organized around one main composition root plus a handful of 
 - `scripts/`
   Operator-facing scripts and utilities. This includes the Python `ollmoctl` entrypoint wrapper and compatibility/operator sync utilities.
 
+## Durable state, continuation and observer owners
+
+These owners refine the broad layers above; none is a second runtime authority:
+
+| Area | Current owner | Boundary |
+| --- | --- | --- |
+| Finalization composition | `ollmo_webserver.py` | Frame/output construction, Artifact Registry attempt, frame persistence, then secondary Readiness retention |
+| Ledger, Index, CAS and Epoch verification | `ollmo_services/response_frames.py` | Immutable frame lineage, exact recovery, private preparation reuse and fresh integrity checks |
+| Live/durable lookup arbitration | `ollmo_server/response_lookup_runtime.py` | Selects current bounded truth; live registries remain in `responses_runtime.py` |
+| Public wire projection | `ollmo_services/response_wire.py` | Byte-bounded handles/previews; never independent completion evidence |
+| Branch waves and callbacks | `ollmo_server/multi_materialization_runtime.py` | Preparation, worker/instance-lock execution, ordered callbacks and drain; Late Fill owns continuation decisions |
+| Late Fill telemetry | `ollmo_services/late_fill_telemetry.py` | Diagnostic metadata/adapters; `late_fill_runtime.py` retains scheduling, semantic gates, settlement and publication |
+| Exact saved-file evidence and identity | `ollmo_services/artifact_contracts.py` | Stable authorized byte reads and producer/consumer/digest binding; graph construction and Late Fill keep their own execution responsibilities |
+| Artifact Registry | `ollmo_services/artifact_registry.py` | Accepted frame artifact identities, lookup/provenance and saved-byte mirrors; distinct from the response Index |
+| Rebase Readiness | `ollmo_services/graph_rebase_rollout.py`, `ollmo_services/graph_rebase_readiness_registry.py` | Verified bounded evidence and append-only retention; no operator authority |
+| Rebase operator authority | `ollmo_services/graph_rebase_operator.py` | Exact trusted adjudication/stage/authorization chain, separate from Readiness evidence |
+| Observation sinks | `ollmo_services/events.py`, `ollmo_services/state_flow.py` | Bounded causal/transition/state-flow diagnostics; no execution or persistence decisions |
+
+For completion ordering and current failure limitations, use
+[Responses Contract](RESPONSES_CONTRACT.md#finalization-and-durable-completion).
+For competing projections and freshness, use [Truth Sources](TRUTH_SOURCES.md).
+
 ## Top-Level Ownership
 
 ### API and UI Boundary
@@ -318,7 +340,7 @@ These are the important durable/runtime roots:
 - `model_ports.json`
   Stable instance registry.
 - `state/runtime_status.json`
-  Live readiness, activity, and runtime-health layer.
+  Cached readiness, activity, and runtime-health observations; inspect freshness before treating them as current.
 - `state/chat_history/`
   Canonical durable chat/history store for the active UI and Responses workbench.
 - `state/response_frames/`
@@ -332,7 +354,7 @@ These are the important durable/runtime roots:
 - `logs/`
   Operational diagnostics only. Safe to clean when you want a fresh local runtime state.
 
-Canonical Responses payloads now include a mutable `working_frame` plus a frozen `response_frame`, and non-test runtime calls append final frames under `state/response_frames/`. The working frame is built by `ollmo_orchestration/working_frame.py` and carries the live goal stack, bounded loop metadata, artifact-flow plan, candidate graph, promotion review, review state, revision/self-heal journal, explicit `possibility_space`, and explicit `closure` state for the fluid middle. The frozen frame captures input, route decision, target endpoint or integration tunnel, runtime metadata, artifact states, memory deltas where available, errors, final normalized output, and the final `working_frame` snapshot. It also includes `planning.artifact_flow` from `ollmo_services/frame_planning.py`. When non-default effective controls matter, it includes `controls` from `ollmo_services/control_snapshots.py`; those snapshots are backend replay/diagnostic metadata and are not automatically promoted to user-visible settings artifacts. `ollmo_services/settings_artifacts.py` and `/api/settings_artifacts` provide the explicit promotion path for reusable JSON settings artifacts under `artifacts/settings/`. Response frames and event logs now carry the durable runtime truth that replaced the old compiled-memory-as-live-routing-authority model.
+Canonical Responses payloads now include a mutable `working_frame` plus a frozen `response_frame`, and non-test finalization attempts to append final frames under `state/response_frames/` when persistence is requested. The working frame is built by `ollmo_orchestration/working_frame.py` and carries the live goal stack, bounded loop metadata, artifact-flow plan, candidate graph, promotion review, review state, revision/self-heal journal, explicit `possibility_space`, and explicit `closure` state for the fluid middle. The frozen frame captures input, route decision, target endpoint or integration tunnel, runtime metadata, artifact states, memory deltas where available, errors, final normalized output, and the final `working_frame` snapshot. It also includes `planning.artifact_flow` from `ollmo_services/frame_planning.py`. When non-default effective controls matter, it includes `controls` from `ollmo_services/control_snapshots.py`; those snapshots are backend replay/diagnostic metadata and are not automatically promoted to user-visible settings artifacts. `ollmo_services/settings_artifacts.py` and `/api/settings_artifacts` provide the explicit promotion path for reusable JSON settings artifacts under `artifacts/settings/`. Response frames carry durable response truth; event logs support audit and diagnosis. Neither event prose nor compiled memory replaces current frame/artifact/runtime authority.
 
 Request-shape reminder:
 

@@ -234,6 +234,58 @@ Use for the fluid middle.
 The frozen auditable request image after execution/freeze.
 Use for replay, audit, and durable truth.
 
+### Closure and Graph Closure
+
+Closure proves the preserved original obligation contract against runtime
+execution and saved-artifact evidence. Graph Closure includes structural graph
+adequacy and fulfillment checks; required semantic reviews supply evidence through
+their own gates. Reviews may repeat after evidence, repair or reconciliation.
+A frozen blocked or incomplete frame is truthful state, not successful completion.
+
+### Ledger
+
+The append-only response-frame history, normally `responses.jsonl` under
+`state/response_frames/`. Successor facts preserve earlier frozen frames. Use
+“Artifact Registry” for the separate materialized artifact lookup surface; it is
+not an append-only response ledger.
+
+### Sidecar / CAS
+
+A sidecar stores referenced frame content. Content-addressed storage (CAS) binds
+its bytes by SHA-256; frame manifests retain semantic paths and lineage. Shared
+bytes do not share execution authority. In a parent-CAS gate, CAS instead means
+compare-and-swap against the exact current parent identity; distinguish the two
+uses explicitly when discussing mutation.
+
+### Index
+
+The derived response-frame `current_index.json`: latest-frame coordinates,
+effective snapshot manifests and verified complete-map coverage. It accelerates
+lookup and can prove absence only with fresh complete coverage. The Ledger and
+verified sidecar bytes remain durable truth.
+
+### Epoch
+
+A verified physical source binding for a response-frame Ledger and Index, their
+complete response map and frame-row identities. It is not a scheduler cycle,
+semantic review count or permission token. Archived epochs can supply verified
+historical evidence; current transitions still require fresh authority checks.
+
+### Readiness
+
+The graph-rebase evidence report and its rollout gates. Relevant settled
+observations can be retained after canonical frame persistence in a separate
+evidence-only registry. Readiness is not user-task completion or operator
+permission. Backend `readiness` labels are a different, cached availability
+surface and must carry freshness context.
+
+### Artifact Registry
+
+The durable artifact identity, path, provenance, metadata and enrichment index.
+It may merge/rewrite records; final saved files own artifact bytes and Closure
+owns fulfillment. It is separate from the response Index, Readiness registry and
+trusted graph-rebase operator registry.
+
 ### Control hints
 
 Post-route detail filling that maps user intent onto truthful runtime/session controls.
