@@ -7,8 +7,11 @@
 Ollmo is a local-first AI runtime substrate that turns requests into truthful,
 continuable work state instead of treating model prose as proof of success.
 
-**Status:** `0.1.0` release candidate — experimental, usable, and still
+**Status:** `0.1.1` release — experimental, usable, and still
 evolving within the `0.x` series.
+
+See the [0.1.1 release notes](docs/RELEASE_NOTES_0.1.1.md) for changes since
+August 1, upgrade guidance and the limits of the validation evidence.
 
 **Conceived, designed, created, built, and developed by
 [@fl0ri0](https://github.com/fl0ri0).**
@@ -47,7 +50,8 @@ state, intent-preserving block-resolution principle, cross-instance Late Fill
 and branch-local output binding within one canonical response, evidence-gated
 closure review, durable response-frame design, or evaluation artifacts
 contribute to research or a published system, cite the software and repository using
-[`CITATION.cff`](CITATION.cff).
+[`CITATION.cff`](CITATION.cff). Include the version and commit used for a
+reproduction; historical reference runs retain their original recorded identities.
 
 The intent-preserving block-resolution principle means that a block is not
 permission to rewrite the request. Its solution is its own verified
@@ -65,7 +69,7 @@ it does not imply that every response uses more than one instance.
 For research collaboration, replications, talks, panels, or work around Ollmo,
 use the public contact methods on
 [@fl0ri0's GitHub profile](https://github.com/fl0ri0), with no guaranteed
-response time. Ollmo 0.1.0 is published for inspection, use, research, and
+response time. Ollmo is published for inspection, use, research, and
 independent forks. Public issues and pull requests are not currently solicited
 or promised review; [`CONTRIBUTING.md`](CONTRIBUTING.md) records that capacity
 boundary.
@@ -82,7 +86,7 @@ Useful public context:
 The primary tested environment is a recent macOS release on Apple Silicon with
 Python 3.11 or newer. Local capabilities require their corresponding Ollama,
 MLX, or llama.cpp backend and model. Windows, Linux, Intel Mac, remote hosting,
-and multi-user operation are outside the 0.1.0 support promise.
+and multi-user operation are outside the 0.1.1 support promise.
 
 ## Install and Start
 
@@ -206,7 +210,7 @@ Ollmo can promote bounded relevant context for a referential turn, but does not
 create a persistent provider session. Model selection is automatic,
 and the exact GPT variant is not exposed to Ollmo; model self-descriptions are
 not runtime proof. Direct API-key management and other external providers are
-outside the 0.1.0 contract.
+outside the 0.1.1 contract.
 
 ## Release and Safety Notes
 

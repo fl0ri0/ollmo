@@ -6,6 +6,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import build_release_archive as release
 
@@ -868,3 +869,34 @@ def test_output_directory_cannot_contain_source_root(tmp_path: Path) -> None:
             source_root=source,
             output_dir=tmp_path,
         )
+
+
+def test_current_release_metadata_and_notes_match_public_selection() -> None:
+    repository_root = Path(__file__).resolve().parent.parent
+    version = release.read_source_version(repository_root)
+    citation = yaml.safe_load((repository_root / 'CITATION.cff').read_text())
+    assert citation['cff-version'] == '1.2.0'
+    assert citation['type'] == 'software'
+    assert citation['version'] == version
+    assert citation['title'] == 'Ollmo'
+    assert citation['authors'] == [{'name': 'fl0ri0'}]
+    assert citation['repository-code'] == 'https://github.com/fl0ri0/ollmo'
+    assert citation['license'] == 'Apache-2.0'
+    changelog = (repository_root / 'CHANGELOG.md').read_text()
+    assert f'## [{version}] - ' in changelog
+    release_label = 'release'
+    if f'## [{version}] - Unreleased' in changelog:
+        release_label = 'release candidate'
+        assert 'date-released' not in citation
+    else:
+        from datetime import date
+        released = date.fromisoformat(str(citation['date-released']))
+        assert f'## [{version}] - {released.isoformat()}' in changelog
+    selected = release.discover_release_files(repository_root)
+    notes = Path('docs') / f'RELEASE_NOTES_{version}.md'
+    assert notes in selected
+    assert f'# Ollmo {version}' in selected[notes].read_text()
+    assert f'`{version}` {release_label} —' in (repository_root / 'README.md').read_text()
+    assert f'Ollmo {version} is an experimental {release_label},' in (
+        repository_root / 'site' / 'index.html'
+    ).read_text()

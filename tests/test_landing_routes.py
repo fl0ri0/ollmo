@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from ollmo_webserver import app
+from ollmo_core.version import __version__
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -217,8 +218,13 @@ def test_landing_leads_with_runtime_truth_before_current_product_body():
         'runtime truth, work with canonical outputs, and execute requests through Ollmo'
     ) in html
     assert 'Codex' not in visible_text
+    release_label = (
+        'release candidate'
+        if f'## [{__version__}] - Unreleased' in (REPO_ROOT / 'CHANGELOG.md').read_text()
+        else 'release'
+    )
     assert (
-        'Ollmo 0.1.0 is an experimental release candidate, tested on macOS on '
+        f'Ollmo {__version__} is an experimental {release_label}, tested on macOS on '
         'Apple Silicon with Python 3.11 or newer.'
     ) in html
     assert (

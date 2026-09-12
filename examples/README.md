@@ -10,6 +10,15 @@ materialization contract, saved artifacts, and bundle checks agree. Media-specif
 integrity evidence and clearly labelled user observations may supplement that
 runtime truth.
 
+## Evidence included with 0.1.1
+
+The five packages below retain their original August/September execution dates,
+response/frame identities, artifacts and manifests. Inclusion in 0.1.1 does not
+make them fresh 0.1.1 live runs. Release preparation rechecks the publication
+copies and their checksums; it does not regenerate the media or replay the prompts.
+See the [release notes](../docs/RELEASE_NOTES_0.1.1.md#validation-and-reference-evidence)
+for the distinction between current checks, historical live coverage and benchmarks.
+
 ## Curated Examples
 
 - [Echoes of the Pass](reference-runs/2026-08-31-echoes-of-the-pass/README.md) — a

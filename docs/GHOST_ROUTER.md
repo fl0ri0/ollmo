@@ -199,6 +199,7 @@ Current execution safeguard:
 - workload tasks are recursive branch contracts: each task can prepare, gather dependency evidence, execute, verify against review criteria, then repair or freeze before its dependents consume it
 - reserved output/materialization candidates, such as "keep an image as an option" or "maybe later", remain non-executable until a later current turn explicitly promotes them
 - selected-candidate requests, such as "generate only the second", promote only the selected candidate and leave sibling candidates reserved or unpromoted
+- explicit pronoun or ordinal reservations, such as "keep it as an option" or "keep the first and third as options", survive commas and adjacent sentence boundaries; the nearest named artifact category limits their scope
 - if required fields are missing, the backend returns structured `missing_session_controls` metadata instead of a vague downstream failure
 - if a chat-mode execution path reaches a truthful text completion for a non-chat downstream request before the real artifact arrives, `/api/responses` freezes that valid chat moment with `late_fill.status = pending`
 - late fill execution uses the promoted branch contract rather than the full root prompt: capability, output type, dependencies, `execution_contract`, `content_payload`, `artifact_prompt`, `stage_direction`, selected/reference artifacts, and runtime evidence are the branch-local task

@@ -356,6 +356,12 @@ historical release. Inspect actual source selection as well when documenting
 packaging; do not build/upload a release or run inference merely to validate prose.
 No standalone repository-wide Markdown-link validator is currently provided.
 
+Monitor entrypoint checks always exercise the packaged public script from a
+separate working directory. The additional legacy local-state shim check runs
+only when that development-only shim exists; public packages intentionally omit
+it and report that one check as skipped. Do not add runtime state to a release
+to satisfy the legacy compatibility check.
+
 ## Naming, Schema, And Prompt-Wording Changes
 
 For docs-only public terminology cleanup, verify the glossary and active-doc search:

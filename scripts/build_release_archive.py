@@ -69,6 +69,7 @@ PUBLIC_DOCS = frozenset(
         'PATTERNS.md',
         'PRINCIPLES.md',
         'RELEASE_SCOPE.md',
+        'RELEASE_NOTES_0.1.1.md',
         'RESPONSES_CONTRACT.md',
         'SELF_ATTACK.md',
         'SELF_ATTACK_STATUS_2026-09-06.md',

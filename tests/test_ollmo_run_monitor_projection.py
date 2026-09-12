@@ -185,15 +185,22 @@ def test_monitor_legacy_frameless_report_remains_response_scoped(
     assert len((state_dir / 'reports.jsonl').read_text().splitlines()) == 1
 
 
+@pytest.mark.parametrize('relative_entrypoint', [
+    'scripts/ollmo_run_monitor.py',
+    pytest.param(
+        'state/ollmo_run_monitor/monitor_once.py',
+        marks=pytest.mark.skipif(
+            not (Path(__file__).resolve().parents[1]
+                 / 'state/ollmo_run_monitor/monitor_once.py').is_file(),
+            reason='Local compatibility shim is intentionally absent from public source packages',
+        ),
+    ),
+])
 def test_monitor_compatibility_entrypoint_imports_from_any_working_directory(
     tmp_path: Path,
+    relative_entrypoint: str,
 ) -> None:
-    entrypoint = (
-        Path(__file__).resolve().parents[1]
-        / 'state'
-        / 'ollmo_run_monitor'
-        / 'monitor_once.py'
-    )
+    entrypoint = Path(__file__).resolve().parents[1] / relative_entrypoint
 
     result = subprocess.run(
         [sys.executable, str(entrypoint), '--help'],

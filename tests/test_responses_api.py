@@ -12938,6 +12938,9 @@ class ResponsesApiTests(unittest.TestCase):
         mock_prepare_late_fill_branch_plan,
         mock_execute_prepared_late_fill_branch,
     ):
+        artifact_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(artifact_temp.cleanup)
+        artifact_root = Path(artifact_temp.name)
         response_id = "resp_runtime_scheduling_guard_image_text_files"
         request_prompt = (
             "Create exactly three image assets plus exactly two local files: index.html and styles.css. "
@@ -12968,7 +12971,7 @@ class ResponsesApiTests(unittest.TestCase):
                     "extension": "html",
                     "source": "explicit_filename",
                     "source_name": "index",
-                    "target_path": "/tmp/runtime-scheduling-guard/index.html",
+                    "target_path": str(artifact_root / "index.html"),
                 },
             },
             {
@@ -12985,7 +12988,7 @@ class ResponsesApiTests(unittest.TestCase):
                     "extension": "css",
                     "source": "explicit_filename",
                     "source_name": "styles",
-                    "target_path": "/tmp/runtime-scheduling-guard/styles.css",
+                    "target_path": str(artifact_root / "styles.css"),
                 },
             },
         ]
@@ -13067,7 +13070,7 @@ class ResponsesApiTests(unittest.TestCase):
                     "2": "moss-lit-archive-hall.png",
                     "3": "copper-music-pool.png",
                 }
-                image_path = Path(f"/tmp/runtime-scheduling-guard/{image_names.get(suffix, f'asset-{suffix}.png')}")
+                image_path = artifact_root / image_names.get(suffix, f"asset-{suffix}.png")
                 image_path.parent.mkdir(parents=True, exist_ok=True)
                 image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
                 return {
@@ -13102,15 +13105,15 @@ class ResponsesApiTests(unittest.TestCase):
             for request in requests:
                 extension = str(request.get("extension") or "txt").strip()
                 source_name = str(request.get("source_name") or f"{branch_id}-{extension}").strip()
-                text_path = Path(f"/tmp/runtime-scheduling-guard/{source_name}.{extension}")
+                text_path = artifact_root / f"{source_name}.{extension}"
                 text_path.parent.mkdir(parents=True, exist_ok=True)
                 if extension == "html":
                     artifact_text = (
                         "<!doctype html><html><body>"
-                        '<link rel="stylesheet" href="/tmp/runtime-scheduling-guard/styles.css">'
-                        '<img src="/tmp/runtime-scheduling-guard/glass-observatory-exterior.png" alt="glass observatory exterior">'
-                        '<img src="/tmp/runtime-scheduling-guard/moss-lit-archive-hall.png" alt="moss-lit archive hall">'
-                        '<img src="/tmp/runtime-scheduling-guard/copper-music-pool.png" alt="copper music pool">'
+                        '<link rel="stylesheet" href="styles.css">'
+                        '<img src="glass-observatory-exterior.png" alt="glass observatory exterior">'
+                        '<img src="moss-lit-archive-hall.png" alt="moss-lit archive hall">'
+                        '<img src="copper-music-pool.png" alt="copper music pool">'
                         "</body></html>"
                     )
                 elif extension == "css":
@@ -17489,6 +17492,7 @@ class ResponsesApiTests(unittest.TestCase):
                             "infer_result": {
                                 "mode": "chat",
                                 "saved_text_path": str(index_path),
+                                "output_text": index_path.read_text(encoding="utf-8"),
                                 "text_artifact_extension": "html",
                                 "text_artifact_source_name": "index",
                             },
@@ -28509,7 +28513,9 @@ A high-tech preservation laboratory where damaged cultural records are reconstru
             )
 
         self.assertIsNotNone(error)
-        self.assertEqual(error['code'], 'TEXT_ARTIFACT_NOT_PERSISTED')
+        self.assertEqual(error['code'], 'TEXT_ARTIFACT_REPAIR_OUTPUT_MISSING')
+        self.assertEqual(error['target_path'], str(index_path))
+        self.assertTrue(error['retryable'])
         self.assertFalse(index_path.exists())
 
     def test_target_path_authoritative_repair_rejects_dirty_candidate_without_write(self):

@@ -1,6 +1,6 @@
 # Project Participation
 
-Ollmo 0.1.0 is published so people can inspect it, use it, study it, reproduce
+Ollmo is published so people can inspect it, use it, study it, reproduce
 results, and make independent forks. It is not currently operated as a managed
 community project.
 

@@ -1,10 +1,14 @@
-# Ollmo 0.1.0 Release Scope
+# Ollmo 0.1.1 Release Scope
 
-Ollmo 0.1.0 is the first public release candidate of Ollmo's local-first AI
-runtime and control plane. It is experimental software: useful enough to run
-and inspect, but still allowed to evolve within the `0.x` series.
+Ollmo 0.1.1 is a stabilization release following the August 1
+0.1.0 release of Ollmo's local-first AI runtime and control plane. It remains
+experimental software: useful enough to run and inspect, but still allowed to
+evolve within the `0.x` series.
 
-## What 0.1.0 Provides
+The [release notes](RELEASE_NOTES_0.1.1.md) describe the changes, upgrade
+boundary and validation scope. Release date: September 12, 2026; tag: `v0.1.1`.
+
+## What 0.1.1 Provides
 
 - A local Flask control plane and browser interface.
 - A standalone static repository landing page, packaged with all of its local
@@ -84,7 +88,7 @@ separate actions.
 The primary tested environment is a recent macOS release on Apple Silicon
 with Python 3.11 or newer. Individual local capabilities additionally require
 their own backend and model packages. Other operating systems and processor
-architectures are not part of the 0.1.0 support promise.
+architectures are not part of the 0.1.1 support promise.
 
 Ollmo is intended for local, single-user use and binds its web control plane
 to `127.0.0.1` by default. Remote and multi-user deployment are outside this
@@ -121,7 +125,7 @@ cloud path:
   silently resumed.
 
 Direct provider API-key management and other external providers are not part of
-0.1.0.
+0.1.1.
 
 ## Compatibility
 

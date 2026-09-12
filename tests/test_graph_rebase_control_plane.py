@@ -383,6 +383,7 @@ class GraphRebaseControlPlaneTests(unittest.TestCase):
             source_frame='c' * 64,
             source_epoch={'source_epoch_id': 'epoch-current'},
             verified_epoch=verified_epoch,
+            _observation_candidate=None,
             frames_dir=ollmo_webserver.RESPONSE_FRAMES_DIR,
             registry_path=ollmo_webserver.GRAPH_REBASE_READINESS_REGISTRY_PATH,
         )

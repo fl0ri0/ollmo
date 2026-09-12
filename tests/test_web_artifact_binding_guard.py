@@ -8,12 +8,14 @@ from ollmo_server.late_fill_runtime import LateFillRuntimeOwner
 from ollmo_server.responses_request_runtime import ResponsesRequestRuntimeOwner
 from ollmo_server.responses_runtime import late_fill_has_actionable_repair_work
 from ollmo_services.responses import build_canonical_response_artifacts
+from ollmo_webserver import _normalize_late_fill_branches
 
 
 class WebArtifactBindingGuardTests(unittest.TestCase):
     def _owner(self):
         owner = object.__new__(LateFillRuntimeOwner)
         owner.build_canonical_response_artifacts = build_canonical_response_artifacts
+        owner.normalize_late_fill_branches = _normalize_late_fill_branches
         owner.branch_id = lambda item: str(item.get('branch_id') or item.get('phase_id') or '').strip()
         return owner
 

@@ -2796,12 +2796,47 @@ def _prompt_reserves_materialization_capability(
             r'[.,;!?\n]|(?=\b(?:keep|leave|hold|reserve)\s+(?!(?:it|them|this|that)\b))',
             prompt_text, flags=re.IGNORECASE,
         )
-        return any(
+        if any(
             _RESERVED_IMAGE_MATERIALIZATION_RE.search(clause)
             or (_IMAGE_CANDIDATE_CONTEXT_RE.search(clause)
                 and _RESERVED_OPTION_ONLY_RE.search(clause))
             for clause in clauses
+        ):
+            return True
+        # A comma or sentence break must not erase an explicit "keep it" or
+        # "keep the first and third" reservation. Resolve only an anaphoric
+        # object, against the nearest sentence's last named artifact category.
+        ordinal = '|'.join(_ORDINAL_INDEXES)
+        anaphoric_reservation = re.compile(
+            r'^\s*(?:keep|leave|hold|reserve|note|remember|halte|behalte|merke|reserviere)\s+'
+            r'(?:it|them|this|that|es|sie|dieses|diese|'
+            rf'(?:the|die|den|das)\s+(?:{ordinal})'
+            rf'(?:\s+(?:and|und)\s+(?:(?:the|die|den|das)\s+)?(?:{ordinal}))*)'
+            r'\s+(?:(?:only|just|nur|as|als|a|an|eine|reserved|reservierte)\s+)*'
+            r'(?:options?|optionen|candidates?|kandidaten)(?:\s+fest)?\s*$',
+            re.IGNORECASE,
         )
+        artifact_category = re.compile(
+            r'\b(?:images?|pictures?|bild(?:er)?|bildideen?|bildkandidaten?|'
+            r'audio|speech|transcripts?|svg|html|css|json|javascript|text|files?|dateien?)\b',
+            re.IGNORECASE,
+        )
+        previous_sentence = ''
+        for sentence in re.split(r'[.;!?\n]', prompt_text):
+            parts = sentence.split(',')
+            for index, clause in enumerate(parts):
+                if not anaphoric_reservation.fullmatch(clause):
+                    continue
+                antecedent = ','.join(parts[:index]).strip() or previous_sentence
+                categories = list(artifact_category.finditer(antecedent))
+                if categories and re.fullmatch(
+                    r'images?|pictures?|bild(?:er)?|bildideen?|bildkandidaten?',
+                    categories[-1].group(), re.IGNORECASE,
+                ):
+                    return True
+            if sentence.strip():
+                previous_sentence = sentence
+        return False
     return False
 
 

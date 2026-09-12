@@ -3,7 +3,10 @@ message: "If Ollmo, its state-substrate architecture, possibility space and sele
 title: "Ollmo"
 authors:
   - name: "fl0ri0"
-version: "0.1.0"
+type: software
+version: "0.1.1"
+date-released: "2026-09-12"
+abstract: "A local-first AI runtime and control plane with work graphs, durable response frames, materialized artifacts, and evidence-gated closure."
 repository-code: "https://github.com/fl0ri0/ollmo"
 license: "Apache-2.0"
 keywords:

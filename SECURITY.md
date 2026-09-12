@@ -1,6 +1,6 @@
 # Security Policy
 
-Ollmo 0.1.0 is experimental, local-first software intended for one trusted
+Ollmo 0.1.1 is experimental, local-first software intended for one trusted
 user on one machine.
 
 ## Local Boundary
@@ -8,7 +8,7 @@ user on one machine.
 The web control plane binds to `127.0.0.1` by default. Do not expose it through
 a public interface, reverse proxy, tunnel, or shared host without a separate
 security review and an authentication/authorization layer. Remote and
-multi-user deployment are not supported in 0.1.0.
+multi-user deployment are not supported in 0.1.1.
 
 Runtime state, prompts, history, logs, and generated artifacts can contain
 sensitive information. Keep the Ollmo directory private and review files

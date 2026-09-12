@@ -47,6 +47,11 @@ required release contents. See [Release Scope](RELEASE_SCOPE.md#source-selection
 The [September 6 status report](SELF_ATTACK_STATUS_2026-09-06.md) is historical;
 it does not certify a changed checkout or expand representative live coverage.
 
+For the 0.1.1 release, see [release validation and evidence](RELEASE_NOTES_0.1.1.md#validation-and-reference-evidence).
+Packaging or owner-test success is not a fresh full Self-Attack campaign. The
+dated live summary and full-live INCOMPLETE verdict remain unchanged unless a
+separately authorized run supplies new evidence.
+
 ## Five boundaries, in priority order
 
 1. **Commitment ↔ closure:** confident completion prose and status-only review

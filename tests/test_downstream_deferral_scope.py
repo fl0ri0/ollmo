@@ -7,11 +7,25 @@ import pytest
 
 from ollmo_core.inference import detect_text_artifact_requests, extract_text_artifact_payloads
 from ollmo_g.intent import analyze_prompt_intent, materialization_is_deferred
-from ollmo_g.request_phase_graph import build_request_phase_graph
+from ollmo_g.request_phase_graph import build_request_phase_graph, _prompt_reserves_materialization_capability
 from tests.test_generated_image_artifact_routing import semantics
 from tests import test_explicit_file_contract_preservation as files
 
 EXCLUSIONS = 'Do not create images, SVG, JavaScript, audio, bundles, web requests, external resources or other deliverables.'
+
+
+@pytest.mark.parametrize('prompt,reserved', [
+    ('Plan an image, keep it as an option.', True),
+    ('Wenn ein Bild sinnvoll wäre, halte es nur als reservierte Option fest.', True),
+    ('Plan three image ideas, generate only the second. Keep the first and third as options.', True),
+    ('Generate one PNG image, keep the SVG as a reserved option.', False),
+    ('Plan an image and an audio clip, keep it as an option.', False),
+    ('Plan image ideas. Plan audio candidates. Keep the first and third as options.', False),
+])
+def test_image_reservation_pronouns_keep_their_nearest_artifact_scope(prompt, reserved):
+    assert _prompt_reserves_materialization_capability(
+        analyze_prompt_intent(prompt), 'image_generation',
+    ) is reserved
 
 
 def pending(owner, prompt):
