@@ -51,6 +51,16 @@ status.json must contain data.”). This is file authority, not JSON response
 formatting. Quoted examples, source/reference descriptions, negation and an
 intervening independent instruction do not acquire that authority.
 
+Materialization deferral is category-scoped. The compatibility field
+`prompt_intent.explicit_defer_materialization` records the presence of a defer
+instruction; it is not by itself a global stop. `materialization_defer_scope`
+retains global materialization, generic file, and canonical text-extension scope.
+Image/audio decisions retain their existing category fields. An exclusion of SVG
+or audio cannot stop unrelated requested text files or remove saved-file dependency
+edges. Matching deferred file obligations retain their identities and unresolved
+Closure checks; they are not silently waived or fulfilled. Older graphs without
+scoped evidence retain their compatibility interpretation until rebuilt.
+
 Accepted current-turn file promises remain in `request_phase_graph.intent_obligations`
 when a later detector, planner, or response graph contains fewer requests. Graph
 rebuilding retains their exact file and branch/phase/dependency identities from
@@ -275,6 +285,19 @@ hydration and registry append still check current bindings. Relocated archived
 epochs may contribute verified evidence through explicit retention/sync; they
 cannot authorize current execution. The evidence registry and trusted operator
 registry are different stores with different authority.
+
+On a pre-append physical epoch mismatch, `readiness_epoch_moved` includes bounded
+`epoch_retention` diagnostics: expected/observed Ledger and Index device, inode,
+size in bytes, and mtime/ctime in nanoseconds, plus every changed-field reason.
+Paths and available frame/verified-epoch identities are metadata only; oversized
+identity/path values are omitted explicitly. The retained Index entry is labeled
+`verified_index_entry`, never presented as a fresh current entry. Current byte
+equality and mutation attribution remain `unknown` without bound evidence.
+The existing error log carries the detail, with best-effort causal telemetry and
+observer process-boot identity when available. The guard reuses its stat captures;
+after a Ledger mismatch it also captures the otherwise short-circuited Index stat.
+It performs no diagnostic content reads or hashes. Diagnostic failure preserves
+the same rejection, and successful retention emits no mismatch diagnostic.
 
 A private, single-use Readiness observation may avoid a second JSON hydration
 only after rechecking the same response/frame/map/epoch, physical files, indexed

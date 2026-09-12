@@ -14,6 +14,8 @@ from helpers.model_capabilities import (
 )
 from ollmo_core.inference import (
     _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE,
+    _TEXT_ARTIFACT_FORMAT_RE,
+    normalize_text_artifact_extension,
     explicit_svg_artifact_request_spans,
 )
 from ollmo_g.text_artifact_revision_intent import classify_named_text_revision_intent
@@ -292,7 +294,7 @@ _EXPLICIT_DEFER_MATERIALIZATION_RE: list[re.Pattern[str]] = [
     re.compile(
         r"\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b"
         r"(?:(?!\b(?:do not|don't|dont|not yet|not now|hold off on|wait before)\b)[^.;!?\n]){0,96}\b"
-        r'(?:generate|create|make|render|produce|materiali[sz]e|show|display|read(?:\s+\w+){0,3}\s+aloud|'
+        r'(?:generate|create|make|render|produce|materiali[sz]e|save|show|display|read(?:\s+\w+){0,3}\s+aloud|'
         r'speak|turn(?:\s+\w+){0,3}\s+into)\b',
         re.IGNORECASE,
     ),
@@ -1796,16 +1798,17 @@ def _is_meta_execution_explanation_request(prompt: str, normalized_prompt: str) 
     return has_example_hint or has_quoted_example
 
 
-def _has_explicit_materialization_deferal(
+def _materialization_defer_scope(
     prompt: str,
     normalized_prompt: str,
     *,
     mentions_materialization_targets: bool,
-) -> bool:
+) -> dict[str, Any]:
     raw_prompt = str(prompt or '').strip()
     normalized = str(normalized_prompt or '').strip()
-    if not raw_prompt or not normalized or not mentions_materialization_targets:
-        return False
+    scope: dict[str, Any] = {'global': False, 'files': False, 'text_extensions': []}
+    if not raw_prompt or not normalized:
+        return scope
     clause_safe_normalized = normalize_intent_text(
         re.sub(r'[\r\n]+', '. ', raw_prompt)
     )
@@ -1842,8 +1845,78 @@ def _has_explicit_materialization_deferal(
                     local_end,
                 ):
                     continue
-                return True
-    return False
+                # Keep the object of each accepted constraint. A format list is
+                # not authority to stop every downstream artifact category.
+                target = local_prompt
+                boundary = _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE.search(target, local_end)
+                if boundary:
+                    target = target[:boundary.start()]
+                extensions = {
+                    normalize_text_artifact_extension(m.group('format'))
+                    for m in _TEXT_ARTIFACT_FORMAT_RE.finditer(target)
+                } - {None}
+                visual = bool(_VISUAL_ACTION_TARGET_RE.search(target))
+                audio = bool(_AUDIO_NEGATION_TARGET_RE.search(target))
+                if not extensions and not visual and not audio and re.search(
+                    r"\b(?:it|them|this|that)\b", target[local_end:]
+                ):
+                    # Resolve a deferred pronoun only within its own clause.
+                    prior_parts = _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE.split(source[:match.start()])
+                    prior = next((part for part in reversed(prior_parts) if part.strip()), '')
+                    extensions = {
+                        normalize_text_artifact_extension(m.group('format'))
+                        for m in _TEXT_ARTIFACT_FORMAT_RE.finditer(prior)
+                    } - {None}
+                    visual = bool(_VISUAL_ACTION_TARGET_RE.search(prior))
+                    audio = bool(_AUDIO_NEGATION_TARGET_RE.search(prior))
+                scope['text_extensions'] = sorted(set(scope['text_extensions']) | extensions)
+                typed = bool(extensions or visual or audio)
+                if not typed and re.search(r'\b(?:files?|datei(?:en)?)\b', target):
+                    scope['files'] = True
+                if not typed and (
+                    re.search(r'\b(?:downstream|artifacts?|artefacts?|artefakte?)\b', target)
+                    or re.search(r'\bmateriali[sz]e\b', target)
+                    or (mentions_materialization_targets and re.search(
+                        r'\b(?:only|nur|later|reserved|zuruck|zurück)\b', target
+                    ))
+                ):
+                    scope['global'] = True
+                if typed or scope['files'] or scope['global']:
+                    scope['matched'] = True
+    if re.search(r"\b(?:do\s+not|don't|dont)\s+(?:continue|execute|run)\s+downstream\b", normalized):
+        scope['global'] = True
+        scope['matched'] = True
+    return scope
+
+
+def materialization_is_deferred(analysis: dict[str, Any], branch: Optional[dict[str, Any]] = None) -> bool:
+    """Apply accepted deferral evidence to an exact category, never its siblings."""
+    scope = analysis.get('materialization_defer_scope')
+    if not isinstance(scope, dict) or 'global' not in scope:
+        # Older persisted graphs retain their compatibility behavior.
+        return bool(analysis.get('explicit_defer_materialization') and not (
+            analysis.get('requests_audio_output') or analysis.get('requests_visual_output')
+            or analysis.get('requests_speech_to_text_output')
+            or analysis.get('has_audio_follow_up_request') or analysis.get('has_visual_follow_up_request')
+            or analysis.get('text_preparation_before_audio_output')
+            or analysis.get('text_preparation_before_visual_output')
+        ))
+    if scope.get('global'):
+        return True
+    if branch is None:
+        return False
+    request = branch.get('artifact_request') or {}
+    extension = normalize_text_artifact_extension(
+        branch.get('text_artifact_extension') or request.get('extension') or ''
+    )
+    if extension:
+        return bool(scope.get('files') or extension in scope.get('text_extensions', []))
+    capability = branch.get('capability')
+    if capability == CAPABILITY_IMAGE_GENERATION:
+        return bool(scope.get('files') or analysis.get('explicit_visual_defer_materialization'))
+    if capability == CAPABILITY_TEXT_TO_SPEECH:
+        return bool(scope.get('files') or analysis.get('explicit_audio_defer_materialization'))
+    return bool(scope.get('files') and branch.get('requires_artifact'))
 
 
 def _materialization_defer_match_local_prompt(
@@ -1854,7 +1927,9 @@ def _materialization_defer_match_local_prompt(
     prompt_text = str(prompt or '')
     candidate_start = max(0, int(start or 0))
     candidate_end = len(prompt_text)
-    following_boundary = re.search(r'[.;!?\n]', prompt_text[max(candidate_start, end):])
+    following_boundary = _TEXT_ARTIFACT_FORMAT_SCOPE_BOUNDARY_RE.search(
+        prompt_text[max(candidate_start, end):]
+    )
     if following_boundary:
         candidate_end = max(candidate_start, end) + following_boundary.start()
     return prompt_text[candidate_start:candidate_end]
@@ -2266,11 +2341,12 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         or has_visual_follow_up_request
         or _MATERIALIZATION_TARGET_RE.search(command_text)
     )
-    explicit_defer_materialization = _has_explicit_materialization_deferal(
+    materialization_defer_scope = _materialization_defer_scope(
         raw_command_text,
         command_text,
         mentions_materialization_targets=mentions_materialization_targets,
     )
+    explicit_defer_materialization = bool(materialization_defer_scope.get('matched'))
     if answer_as_audio_delivery_deferred:
         explicit_defer_materialization = True
     latest_affirmative_visual_action_start = (
@@ -2289,6 +2365,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
     explicit_visual_defer_materialization = bool(
         explicit_defer_materialization
         and not affirmative_visual_action_overrides_defer
+        and (latest_explicit_visual_defer_end >= 0 or materialization_defer_scope['global'])
         and re.search(
             r'\b(?:image(?:s)?|picture(?:s)?|photo(?:s)?|illustration(?:s)?|bild(?:er)?|foto(?:s)?|animation(?:en)?|png|jpe?g)\b',
             visual_command_text,
@@ -2522,6 +2599,7 @@ def analyze_prompt_intent(prompt: str) -> dict[str, Any]:
         'direct_audio_materialization_request': direct_audio_materialization_request,
         'negated_audio_output_request': has_audio_output_negation,
         'explicit_defer_materialization': explicit_defer_materialization,
+        'materialization_defer_scope': materialization_defer_scope,
         'explicit_visual_defer_materialization': explicit_visual_defer_materialization,
         'explicit_audio_defer_materialization': explicit_audio_defer_materialization,
         'visual_artifact_preservation_without_regeneration': (

@@ -20,9 +20,11 @@ from ollmo_core.inference import (
     _json_text_artifact_intent,
     _text_artifact_format_match_is_negated,
     detect_text_artifact_requests,
+    _text_artifact_format_match_is_negated,
     normalize_text_artifact_extension,
 )
 from ollmo_g.intent import (
+    materialization_is_deferred,
     analyze_prompt_intent,
     intent_span_is_literal_payload,
     mask_intent_literal_payloads,
@@ -2578,15 +2580,7 @@ def _downstream_capabilities(
     request_payload: Mapping[str, Any],
     route_payload: Mapping[str, Any],
 ) -> list[str]:
-    if bool(prompt_analysis.get('explicit_defer_materialization')) and not (
-        bool(prompt_analysis.get('requests_audio_output'))
-        or bool(prompt_analysis.get('requests_visual_output'))
-        or bool(prompt_analysis.get('requests_speech_to_text_output'))
-        or bool(prompt_analysis.get('has_audio_follow_up_request'))
-        or bool(prompt_analysis.get('has_visual_follow_up_request'))
-        or bool(prompt_analysis.get('text_preparation_before_audio_output'))
-        or bool(prompt_analysis.get('text_preparation_before_visual_output'))
-    ):
+    if materialization_is_deferred(prompt_analysis):
         return []
     wants_audio_follow_up = bool(
         prompt_analysis.get('requests_audio_output')
@@ -2982,15 +2976,7 @@ def _prompt_reserves_entire_materialization_capability(
 def _post_artifact_continuation_sequence(prompt_analysis: Mapping[str, Any]) -> list[str]:
     """Return explicit dependent phase order requested by the current prompt."""
 
-    if bool(prompt_analysis.get('explicit_defer_materialization')) and not (
-        bool(prompt_analysis.get('requests_audio_output'))
-        or bool(prompt_analysis.get('requests_visual_output'))
-        or bool(prompt_analysis.get('requests_speech_to_text_output'))
-        or bool(prompt_analysis.get('has_audio_follow_up_request'))
-        or bool(prompt_analysis.get('has_visual_follow_up_request'))
-        or bool(prompt_analysis.get('text_preparation_before_audio_output'))
-        or bool(prompt_analysis.get('text_preparation_before_visual_output'))
-    ):
+    if materialization_is_deferred(prompt_analysis):
         return []
     if bool(prompt_analysis.get('meta_execution_explanation_request')):
         return []
@@ -3677,8 +3663,11 @@ def _guard_unbound_saved_file_consumers(
                 and consumer['artifact_request'].get('source_name')
                 and consumer.get('stage_direction') == 'materialize_requested_text_artifact'
                 and consumer.get('depends_on') in (['phase-1'], [producer_candidates[0]['phase_id']])
-                and not any(re.search(r'\b(?:save|store|write|create|generate|build|read|reread|speichere|schreibe|erstelle|erzeuge|generiere|lies|lese)\b', tail, re.IGNORECASE)
-                            for tail in clauses[clause_index + 1:])):
+                and not any(
+                    not _text_artifact_format_match_is_negated(tail, action)
+                    for tail in clauses[clause_index + 1:]
+                    for action in re.finditer(r'\b(?:save|store|write|create|generate|build|read|reread|speichere|schreibe|erstelle|erzeuge|generiere|lies|lese)\b', tail, re.IGNORECASE)
+                )):
             producer = producer_candidates[0]
             producer_request = dict(producer['artifact_request'])
             consumer_request = dict(consumer['artifact_request'])
@@ -6141,6 +6130,7 @@ def build_request_phase_graph(
         'primary_capability': normalize_capability(prompt_analysis.get('primary_capability')),
         'direct_audio_materialization_request': bool(prompt_analysis.get('direct_audio_materialization_request')),
         'explicit_defer_materialization': bool(prompt_analysis.get('explicit_defer_materialization')),
+        'materialization_defer_scope': copy.deepcopy(prompt_analysis.get('materialization_defer_scope') or {}),
         'explicit_visual_defer_materialization': bool(prompt_analysis.get('explicit_visual_defer_materialization')),
         'explicit_audio_defer_materialization': bool(prompt_analysis.get('explicit_audio_defer_materialization')),
         'visual_artifact_preservation_without_regeneration': bool(

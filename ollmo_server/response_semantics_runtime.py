@@ -36,7 +36,7 @@ from ollmo_g.execution_planner import (
     split_visible_image_payload,
     split_visible_tts_payload,
 )
-from ollmo_g.intent import analyze_prompt_intent
+from ollmo_g.intent import analyze_prompt_intent, materialization_is_deferred
 from ollmo_g.intent_obligations import (
     required_intent_obligations,
     summarize_required_intent_obligations,
@@ -5757,6 +5757,8 @@ class ResponseSemanticsRuntimeOwner:
             if isinstance(request_phase_graph.get('prompt_intent'), Mapping)
             else {}
         )
+        if isinstance(prompt_intent.get('materialization_defer_scope'), dict):
+            return materialization_is_deferred(prompt_intent)
         if bool(prompt_intent.get('explicit_defer_materialization')) and not (
             bool(prompt_intent.get('requests_audio_output'))
             or bool(prompt_intent.get('requests_visual_output'))
@@ -6063,7 +6065,7 @@ class ResponseSemanticsRuntimeOwner:
             prompt_intent.get('visual_artifact_execution_suppressed_by_preservation')
         )
         if (
-            prompt_intent.get('explicit_defer_materialization')
+            materialization_is_deferred(prompt_intent)
             and not explicit_visual_defer
             and not explicit_audio_defer
         ):
@@ -6575,7 +6577,7 @@ class ResponseSemanticsRuntimeOwner:
             else:
                 expected_counts[output_type] = expected_count
         generic_materialization_defer = bool(
-            prompt_intent.get('explicit_defer_materialization')
+            materialization_is_deferred(prompt_intent)
             and not prompt_intent.get('explicit_visual_defer_materialization')
             and not prompt_intent.get('explicit_audio_defer_materialization')
         )
@@ -10456,6 +10458,7 @@ class ResponseSemanticsRuntimeOwner:
             else route_request_phase_graph
         )
         defer_downstream_execution = self._request_graph_defers_downstream_execution(request_phase_graph)
+        prompt_intent = (request_phase_graph or {}).get('prompt_intent') or {}
         execution_planner = (
             route_runtime.get('execution_planner')
             if isinstance(route_runtime.get('execution_planner'), dict)
@@ -10475,6 +10478,7 @@ class ResponseSemanticsRuntimeOwner:
                 continue
             if (
                 defer_downstream_execution
+                or materialization_is_deferred(prompt_intent, raw_branch)
                 or self._branch_record_is_non_executable_candidate(raw_branch)
                 or self._branch_record_is_terminally_fulfilled(raw_branch)
             ):
@@ -10526,6 +10530,7 @@ class ResponseSemanticsRuntimeOwner:
         for candidate in downstream_phase_records(request_phase_graph or {}):
             if (
                 defer_downstream_execution
+                or materialization_is_deferred(prompt_intent, candidate)
                 or self._branch_record_is_non_executable_candidate(candidate)
                 or self._branch_record_is_terminally_fulfilled(candidate)
             ):
@@ -10579,6 +10584,7 @@ class ResponseSemanticsRuntimeOwner:
                 continue
             if (
                 defer_downstream_execution
+                or materialization_is_deferred(prompt_intent, candidate)
                 or self._branch_record_is_non_executable_candidate(candidate)
                 or self._branch_record_is_terminally_fulfilled(candidate)
             ):
@@ -10631,7 +10637,7 @@ class ResponseSemanticsRuntimeOwner:
                 }
             )
         if not candidates:
-            if not defer_downstream_execution:
+            if not defer_downstream_execution and not prompt_intent.get('explicit_defer_materialization'):
                 for candidate in normalize_capability_list(execution_planner.get('deferred_capabilities')):
                     if candidate in completed_capabilities:
                         continue

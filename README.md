@@ -387,7 +387,6 @@ Current Ghost/Auto behavior:
 - Auto preview and final execution share the same resolver/control-hint/runtime path so the UI sees the same required-field truth the backend will execute
 - Auto/Ghost preview and route selection are read-only planning surfaces. They must not start models, load providers, or turn route choice into runtime load feedback. Model lifecycle starts require an explicit lifecycle source such as a frontend play/start action.
 - embedding helpers remain internal Ghost tools; they can attach routing-context hints and narrow tie-break signals for anchored follow-ups, and those audits remain visible in runtime metadata
-- the old single-turn route-rating and learned-policy system is retired from the live runtime path
 - explicit low-level direct contracts such as direct `instance_id` requests or `batch_prompts` remain explicit exceptions; they are not the normal Ghost path
 - Ghost now exposes file-backed semantic roles as advisory decision lenses. Any valid `ollmo_g/semantic_roles/*.md` role definition becomes part of the role catalog.
 - `ghost_mode` remains only a bounded API-edge compatibility hint (`repair`, `worker`, `explorer`, `improviser`) and is immediately projected into `semantic_role_profile`; it is not the internal thinking model.

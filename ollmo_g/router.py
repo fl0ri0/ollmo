@@ -22,6 +22,7 @@ from helpers.model_capabilities import (
 from ollmo_services.chat_history import read_chat_history
 from ollmo_g.intent import (
     analyze_prompt_intent,
+    materialization_is_deferred,
     normalize_intent_text,
     prompt_has_self_contained_direct_tts_source,
 )
@@ -2265,7 +2266,7 @@ def validate_route_decision(
 def _is_image_generation_intent(text: str) -> bool:
     normalized = normalize_intent_text(text)
     analysis = analyze_prompt_intent(text)
-    if analysis.get('explicit_defer_materialization'):
+    if materialization_is_deferred(analysis, {'capability': CAPABILITY_IMAGE_GENERATION}):
         return False
     if _DRAW_UP_RE.search(normalized):
         return False
@@ -2691,7 +2692,7 @@ def build_route_hint(context: dict[str, Any]) -> dict[str, Any]:
     )
     allow_artifact_reuse = not fresh_task_requested or explicit_selected_reference
     prompt_intent = analyze_prompt_intent(prompt)
-    explicit_defer_materialization = bool(prompt_intent.get('explicit_defer_materialization'))
+    explicit_defer_materialization = materialization_is_deferred(prompt_intent)
     text_revision_turn = bool(prompt_intent.get('text_revision_turn'))
     direct_audio_materialization_request = bool(prompt_intent.get('direct_audio_materialization_request'))
     text_preparation_before_audio_output = bool(prompt_intent.get('text_preparation_before_audio_output'))
@@ -2728,7 +2729,9 @@ def build_route_hint(context: dict[str, Any]) -> dict[str, Any]:
     artifact_path = None
     confidence = 0.62
 
-    if explicit_defer_materialization and (
+    if (explicit_defer_materialization or (
+        prompt_intent.get('explicit_defer_materialization') and not materialization_intent_active
+    )) and (
         materialization_intent_active
         or explicit_file_kind in {'', 'text'}
     ):

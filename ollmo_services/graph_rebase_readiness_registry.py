@@ -18,8 +18,10 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Any, Optional
 
+from ollmo_services.events import causal_event
 from ollmo_services.graph_rebase_rollout import (
     GRAPH_REBASE_READINESS_OBSERVATION_KIND,
     build_graph_rebase_readiness_report,
@@ -53,6 +55,8 @@ GRAPH_REBASE_READINESS_REGISTRY_VERSION = 1
 _REGISTRY_LOCK = threading.RLock()
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 _MAX_OBSERVATION_BYTES = 2 * 1024 * 1024
+_EPOCH_DIAGNOSTIC_ID_CHARS = 192
+_EPOCH_DIAGNOSTIC_PATH_CHARS = 1024
 _RECORD_KEYS = {
     'kind',
     'version',
@@ -145,6 +149,94 @@ def _file_state(path: Path) -> Optional[dict[str, int]]:
         'mtime_ns': int(stat_result.st_mtime_ns),
         'ctime_ns': int(stat_result.st_ctime_ns),
     }
+
+
+def _readiness_epoch_mismatch_details(
+    projection: Mapping[str, Any],
+    verified: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    observed: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe captured stat comparisons only; never read or reverify content."""
+    omitted: list[str] = []
+
+    def identity(value: Any, field: str, limit: int = _EPOCH_DIAGNOSTIC_ID_CHARS):
+        if value is None or type(value) is int:
+            return value
+        if isinstance(value, str) and len(value) <= limit:
+            return value
+        omitted.append(field)
+        return None
+
+    fields = ('device', 'inode', 'size_bytes', 'mtime_ns', 'ctime_ns')
+    reasons: list[str] = []
+    files = {}
+    for name, path in paths.items():
+        expected = verified.get(f'{name}_file_state')
+        actual = observed[name]
+        if actual is None:
+            reasons.append(f'{name}_unavailable')
+        else:
+            for field in fields:
+                if expected.get(field) != actual.get(field):
+                    suffix = {'size_bytes': 'size', 'mtime_ns': 'mtime', 'ctime_ns': 'ctime'}.get(field, field)
+                    reasons.append(f'{name}_{suffix}_changed')
+        files[name] = {
+            'path': identity(str(path), f'{name}.path', _EPOCH_DIAGNOSTIC_PATH_CHARS),
+            'expected': {key: identity(expected.get(key), f'{name}.expected.{key}') for key in fields},
+            'observed': (
+                {key: identity(actual.get(key), f'{name}.observed.{key}') for key in fields}
+                if actual is not None else None
+            ),
+            'bytes_unchanged': 'unknown',
+        }
+    response_id = projection.get('response_id')
+    index = verified.get('index_state') or {}
+    entry = (index.get('responses') or {}).get(response_id) or {}
+    anchor = verified.get('epoch_anchor') or {}
+    detail = {
+        'kind': 'ollmo.readiness_epoch_retention_mismatch',
+        'runtime_effect': 'none',
+        'reasons': reasons,
+        'files': files,
+        'response_id': identity(response_id, 'response_id'),
+        'frame_id': identity(projection.get('frame_id'), 'frame_id'),
+        'frame_sequence': identity(projection.get('ledger_sequence'), 'frame_sequence'),
+        'monotonic_ns': time.monotonic_ns(),
+        'mutation_actor': 'unknown',
+        # These identities belong to the retained verification, not a new read.
+        'verified_epoch': {
+            key: identity(verified.get(key), f'verified_epoch.{key}')
+            for key in ('ledger_sha256', 'index_sha256', 'response_map_digest')
+        },
+        'verified_epoch_anchor': {
+            key: identity(anchor.get(key), f'verified_epoch_anchor.{key}')
+            for key in ('response_id', 'frame_id', 'frame_sequence', 'source_frame_sha256')
+        },
+        'verified_index_entry': {
+            key: identity(entry.get(key), f'verified_index_entry.{key}')
+            for key in ('response_id', 'latest_frame_id', 'latest_frame_sequence')
+        },
+        'current_index_entry_identity': 'unknown',
+        'omitted_fields': omitted,
+    }
+    return detail
+
+
+def _emit_readiness_epoch_mismatch(detail: dict[str, Any]) -> None:
+    """Best-effort existing telemetry; error details also reach the normal log."""
+    try:
+        event = causal_event(
+            'readiness.epoch_retention', 'diagnostic',
+            target={key: detail[key] for key in ('response_id', 'frame_id')},
+            status='rejected', epoch_retention=detail,
+        )
+        if event:
+            # Observer identity is not mutation attribution.
+            detail['observer_process_id'] = event['process_id']
+            detail['observer_process_boot_id'] = event['process_boot_id']
+    except Exception:
+        pass
 
 
 def _record_error(code: str, message: str, **details: Any) -> dict[str, Any]:
@@ -765,13 +857,41 @@ def append_graph_rebase_readiness_observation(
             or not paths_match
             or ledger_file_state is None
             or index_file_state is None
-            or _file_state(expected_ledger_path) != dict(ledger_file_state)
-            or _file_state(expected_index_path) != dict(index_file_state)
         ):
             raise GraphRebaseReadinessRegistryError(
                 'readiness_epoch_moved',
                 'Preverified response-frame epoch is no longer current.',
             )
+        observed = {}
+
+        def file_matches(name, path, expected):
+            observed[name] = _file_state(path)
+            return observed[name] == dict(expected)
+
+        if (
+            not file_matches('ledger', expected_ledger_path, ledger_file_state)
+            or not file_matches('index', expected_index_path, index_file_state)
+        ):
+            error = GraphRebaseReadinessRegistryError(
+                'readiness_epoch_moved',
+                'Preverified response-frame epoch is no longer current.',
+            )
+            try:
+                # Preserve short-circuit rejection. Only after it is decided,
+                # capture the other cheap stat if Ledger comparison skipped it.
+                if 'index' not in observed:
+                    observed['index'] = _file_state(expected_index_path)
+                detail = _readiness_epoch_mismatch_details(
+                    projection, verified,
+                    {'ledger': expected_ledger_path, 'index': expected_index_path},
+                    observed,
+                )
+                error.details['epoch_retention'] = detail
+                _emit_readiness_epoch_mismatch(detail)
+            except Exception:
+                # Diagnostics must never replace the original rejection.
+                pass
+            raise error
     if verified.get('ok') is not True:
         error = (
             verified.get('error')
